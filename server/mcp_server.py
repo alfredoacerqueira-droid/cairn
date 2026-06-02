@@ -3,6 +3,11 @@
 This module exposes the semantic search and context assembly capabilities as
 native MCP tools, allowing Claude Code and OpenCode to use the gateway directly
 without needing to route through OpenAI-compatible endpoints.
+
+Supports both single-repo and workspace modes:
+  - SINGLE: CAIRN_PROJECT points to a repo with .cairn/ directory
+  - WORKSPACE: CAIRN_PROJECT points to a parent directory with indexed child repos
+  - UNBOUND: No valid binding found
 """
 
 from __future__ import annotations
@@ -14,6 +19,7 @@ from pathlib import Path
 from mcp.server import FastMCP
 
 from server.context_assembler import ContextAssembler
+from server.workspace_router import WorkspaceRouter
 
 logger = logging.getLogger(__name__)
 
@@ -21,32 +27,65 @@ logger = logging.getLogger(__name__)
 _PROJECT_PATH: Path | None = None
 _BIND_ERROR: str | None = None
 _assembler: ContextAssembler | None = None
+_router: WorkspaceRouter | None = None
 
 
-def _resolve_project_path() -> tuple[Path | None, str | None]:
-    """Resolve project path from environment or return (None, error_msg) if unbound.
+def _classify_binding() -> tuple[str, Path | None, str | None]:
+    """Classify CAIRN_PROJECT/GATEWAY_PROJECT as SINGLE, WORKSPACE, or UNBOUND.
 
     Returns:
-        (Path, None) if bound, or (None, error_msg) if unbound.
-        A project is bound if CAIRN_PROJECT or GATEWAY_PROJECT is set,
-        the path exists, and it contains a .cairn/ directory.
+        (mode, path, error) where:
+          - SINGLE: path has .cairn/, error is None
+          - WORKSPACE: path has no .cairn/ but children do, error is None
+          - UNBOUND: path is None, error is an explanatory message
     """
     env_path = os.getenv("CAIRN_PROJECT") or os.getenv("GATEWAY_PROJECT")
     if not env_path:
-        return None, (
-            "Cairn MCP server has no bound project. Set CAIRN_PROJECT to an "
-            "indexed repo (a dir containing .cairn/)."
+        return (
+            "UNBOUND",
+            None,
+            (
+                "Cairn MCP server has no bound project. Set CAIRN_PROJECT to an "
+                "indexed repo (a dir containing .cairn/) or a workspace root."
+            ),
         )
 
     path = Path(env_path).resolve()
     if not path.exists():
-        return None, f"CAIRN_PROJECT path does not exist: {env_path}"
+        return "UNBOUND", None, f"CAIRN_PROJECT path does not exist: {env_path}"
 
+    # Check for SINGLE mode: this path itself has .cairn/
     cairn_dir = path / ".cairn"
-    if not cairn_dir.exists():
-        return None, (f"CAIRN_PROJECT path has no .cairn/ directory (not indexed): {env_path}")
+    if cairn_dir.exists():
+        return "SINGLE", path, None
 
-    return path, None
+    # Check for WORKSPACE mode: this path has children with .cairn/
+    discovered = WorkspaceRouter.discover_repos(path)
+    if discovered:
+        return "WORKSPACE", path, None
+
+    # Neither SINGLE nor WORKSPACE
+    return (
+        "UNBOUND",
+        None,
+        f"CAIRN_PROJECT path is neither indexed (no .cairn/) nor a workspace "
+        f"(no indexed child repos): {env_path}",
+    )
+
+
+def _resolve_project_path() -> tuple[Path | None, str | None]:
+    """Resolve project path from environment (SINGLE mode only).
+
+    Deprecated: use _classify_binding() for full mode detection.
+    Kept for backward compatibility in tests.
+
+    Returns:
+        (Path, None) if bound, or (None, error_msg) if unbound.
+    """
+    mode, path, error = _classify_binding()
+    if mode == "SINGLE":
+        return path, None
+    return None, error or "Unbound project"
 
 
 def _get_assembler() -> ContextAssembler | None:
@@ -77,6 +116,10 @@ def search_code(query: str, top_k: int = 5) -> str:
     try:
         if _BIND_ERROR is not None:
             return _BIND_ERROR
+        # If workspace router is bound, delegate to it
+        if _router is not None:
+            return _router.search(query, top_k=top_k)
+        # Otherwise single-repo mode
         assembler = _get_assembler()
         if assembler is None:
             return (
@@ -135,6 +178,10 @@ def assemble_context(query: str) -> str:
     try:
         if _BIND_ERROR is not None:
             return _BIND_ERROR
+        # If workspace router is bound, delegate to it
+        if _router is not None:
+            return _router.assemble(query)
+        # Otherwise single-repo mode
         assembler = _get_assembler()
         if assembler is None:
             return (
@@ -153,6 +200,8 @@ def set_profile(profile_name: str) -> str:
     Profiles determine which retrieval legs are active and whether embeddings
     are enabled. Options: 'iac', 'dotnet', 'python', 'code', 'shell', 'auto'.
 
+    Note: set_profile requires a single-repo binding (not a workspace).
+
     Args:
         profile_name: The profile to set ('iac', 'dotnet', 'python', 'code',
                       'shell', or 'auto' for detection)
@@ -163,6 +212,9 @@ def set_profile(profile_name: str) -> str:
     try:
         if _BIND_ERROR is not None:
             return _BIND_ERROR
+        # set_profile only works in single-repo mode
+        if _router is not None:
+            return "set_profile requires a single-repo binding, not a workspace."
         if _PROJECT_PATH is None:
             return (
                 "Cairn MCP server has no bound project. Set CAIRN_PROJECT to an "
@@ -218,13 +270,31 @@ def set_profile(profile_name: str) -> str:
 
 
 def run_stdio() -> None:
-    """Run the MCP server over stdio (for Claude Code / OpenCode)."""
-    global _PROJECT_PATH, _BIND_ERROR
-    _PROJECT_PATH, _BIND_ERROR = _resolve_project_path()
-    if _BIND_ERROR:
+    """Run the MCP server over stdio (for Claude Code / OpenCode).
+
+    Resolves the binding mode (SINGLE, WORKSPACE, or UNBOUND) from
+    CAIRN_PROJECT/GATEWAY_PROJECT and initializes accordingly.
+    """
+    global _PROJECT_PATH, _BIND_ERROR, _router
+    mode, path, error = _classify_binding()
+
+    if mode == "SINGLE":
+        _PROJECT_PATH = path
+        _BIND_ERROR = None
+        logger.info("Cairn MCP bound to single repo: %s", _PROJECT_PATH)
+    elif mode == "WORKSPACE":
+        _router = WorkspaceRouter(path)
+        discovered_names = [p.name for p in _router.repo_paths]
+        logger.info(
+            "Cairn MCP bound to workspace %s (%d repos: %s)",
+            path,
+            len(_router.repo_paths),
+            ", ".join(discovered_names),
+        )
+    else:  # UNBOUND
+        _BIND_ERROR = error
         logger.error("Cairn MCP: %s", _BIND_ERROR)
-    else:
-        logger.info("Cairn MCP bound to %s", _PROJECT_PATH)
+
     mcp.run()
 
 

@@ -459,11 +459,20 @@ memory.md
             f"    This project is in a monorepo with "
             f"{len(workspace_siblings)} sibling git repo(s)."
         )
-        click.echo("    OpenCode resolves MCP config from the WORKSPACE ROOT.")
-        click.echo("    Consider placing opencode.json at the workspace root instead:")
-        parent = project_path.parent
         click.echo()
-        click.echo(f"    cp {opencode_path.name} {parent}/opencode.json")
+        click.echo("    For a SINGLE workspace router (one MCP server, all repos):")
+        click.echo("    Index all repos with 'cairn init', then at workspace root:")
+        click.echo()
+        parent = project_path.parent
+        workspace_router_config = {
+            "type": "local",
+            "command": [cairn_cmd] + cairn_args,
+            "enabled": True,
+            "env": {"CAIRN_PROJECT": str(parent.resolve())},
+        }
+        click.echo(f"    {_json.dumps(workspace_router_config, indent=6)}")
+        click.echo()
+        click.echo("    This single server routes each query to the best-matching repo.")
         click.echo()
 
     # Write .mcp.json (Claude Code format: command + args as separate fields)

@@ -31,3 +31,22 @@ def _preserve_cwd_and_env():
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+@pytest.fixture(autouse=True)
+def _reset_reranker_singleton():
+    """Reset the FlashRank reranker singleton between tests.
+
+    pipeline.retrieval.reranker caches a module-level `_ranker` / `_ranker_failed`.
+    Tests that force the reranker to fail (offline-resilience) would otherwise
+    leave it disabled for every test that runs afterwards, making the suite
+    order-dependent (e.g. router routing then fail-closes spuriously).
+    """
+    import pipeline.retrieval.reranker as _rr
+
+    before = (_rr._ranker, _rr._ranker_failed)
+    _rr._ranker, _rr._ranker_failed = None, False
+    try:
+        yield
+    finally:
+        _rr._ranker, _rr._ranker_failed = before

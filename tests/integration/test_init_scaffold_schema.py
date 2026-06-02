@@ -134,8 +134,8 @@ class TestWorkspaceDetectionWarning:
         # Should suggest placing opencode.json at workspace root
         assert "workspace root" in result.output.lower() or "parent" in result.output.lower()
 
-    def test_workspace_detection_shows_copy_suggestion(self, tmp_path):
-        """Test that init provides a copy suggestion for workspace root."""
+    def test_workspace_detection_suggests_router_at_workspace_root(self, tmp_path):
+        """In a workspace, init suggests a single router server bound to the root."""
         runner = CliRunner()
 
         workspace = make_workspace(tmp_path)
@@ -147,10 +147,14 @@ class TestWorkspaceDetectionWarning:
         result = runner.invoke(main, ["init", "--no-index"])
         assert result.exit_code == 0
 
-        # Should contain a copy command suggestion
+        # The suggested config binds CAIRN_PROJECT to the WORKSPACE ROOT (not the
+        # sub-repo) and explains it routes queries to the right repo.
         assert (
-            "cp " in result.output and "opencode.json" in result.output
-        ), f"Expected copy suggestion in output:\n{result.output}"
+            str(workspace.resolve()) in result.output
+        ), f"Expected workspace-root CAIRN_PROJECT in output:\n{result.output}"
+        assert (
+            "routes each query" in result.output.lower() or "best-matching" in result.output
+        ), f"Expected router explanation in output:\n{result.output}"
 
     def test_no_workspace_warning_in_single_repo(self, tmp_path):
         """Test that init does NOT warn for a standalone repo."""
