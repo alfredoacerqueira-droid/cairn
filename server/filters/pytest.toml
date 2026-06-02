@@ -1,0 +1,26 @@
+# Pytest output compression filter
+# Show only failures and summary lines
+
+[filters.pytest-output]
+description = "Compress pytest output to failures only"
+strip_lines_matching = [
+    "^\\s*PASSED",
+    "^\\s*SKIPPED",
+    "^\\s*\\.",
+    "^=+\\s+test session starts\\s+=+",
+    "^platform\\s+",
+    "^rootdir:",
+    "^plugins:",
+    "^collected\\s+",
+    "^cachedir:",
+]
+keep_lines_matching = [
+    "FAILED",
+    "ERROR",
+    "=+.*=+",
+    "^E\\s+",
+    "passed\\b",
+    "failed\\b",
+    "warnings\\b",
+]
+max_lines = 50

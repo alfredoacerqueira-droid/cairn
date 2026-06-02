@@ -1,0 +1,102 @@
+# ── Cairn — Full Stack ───────────────────────────
+#
+# Brings up Ollama, the gateway, and the background janitor.
+#
+# GPU passthrough (Linux):
+#   1. Install nvidia-container-toolkit
+#   2. Uncomment the `deploy` section below in the ollama service
+#
+# Start:  docker compose up -d
+# Logs:   docker compose logs -f gateway
+# Stop:   docker compose down
+
+version: "3.9"
+
+services:
+  gateway:
+    build: .
+    image: cairn:latest
+    container_name: cairn
+    ports:
+      - "8000:8000"
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_EMBED_MODEL=nomic-embed-text
+      - OLLAMA_GENERATE_MODEL=qwen2.5-coder:3b
+      - CLOUD_API_KEY=${CLOUD_API_KEY:-}
+      - CLOUD_API_BASE=${CLOUD_API_BASE:-https://api.deepseek.com/v1}
+      - CLOUD_MODEL_NAME=${CLOUD_MODEL_NAME:-deepseek-chat}
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - ${PROJECT_PATH:-.}:/workspace
+    working_dir: /workspace
+
+  janitor:
+    build: .
+    image: cairn:latest
+    container_name: cairn-janitor
+    command: ["python", "-c", "\
+import time, os, sys;\
+sys.path.insert(0, '/app');\
+from core.config import load_config;\
+from core.repo import RepoManager;\
+from pipeline.ast_parser import ASTParser;\
+from pipeline.queue import PriorityJobQueue;\
+from pipeline.indexer import VectorIndexer;\
+from pipeline.watcher import FileWatcher;\
+from throttle.cpu import CPUThrottler;\
+from throttle.memory import MemoryManager;\
+from throttle.vram import VRAMPriority;\
+cfg = load_config();\
+repo = RepoManager();\
+indexer = VectorIndexer(chroma_path=repo.get_chroma_path());\
+cpu = CPUThrottler(cfg.resources.max_cpu_percent);\
+mem = MemoryManager(cfg.resources.max_memory_mb);\
+vram = VRAMPriority();\
+queue = PriorityJobQueue(cpu, mem, vram);\
+def handler(fp):\
+    try:\
+        ast = ASTParser().parse_file(fp);\
+        indexer.index_ast(ast);\
+    except: pass;\
+watcher = FileWatcher(on_change=lambda fp: queue.add_job(handler, (fp,)));\
+queue.start();\
+watcher.start();\
+while True: time.sleep(10)\
+"]
+    depends_on:
+      - gateway
+    restart: unless-stopped
+    volumes:
+      - ${PROJECT_PATH:-.}:/workspace
+    working_dir: /workspace
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+
+  ollama:
+    image: ollama/ollama:0.6.7
+    container_name: cairn-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    # GPU passthrough (uncomment if you have nvidia-container-toolkit):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  ollama_data:

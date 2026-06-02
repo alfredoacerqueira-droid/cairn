@@ -1,0 +1,36 @@
+{
+  "ast_parser": {
+    "xsmall": {
+      "functions": 10,
+      "mean_ms": 0.54,
+      "median_ms": 0.24,
+      "p95_ms": 3.23,
+      "min_ms": 0.24,
+      "max_ms": 3.23
+    },
+    "small": {
+      "functions": 100,
+      "mean_ms": 2.45,
+      "median_ms": 2.41,
+      "p95_ms": 2.66,
+      "min_ms": 2.35,
+      "max_ms": 2.66
+    },
+    "medium": {
+      "functions": 500,
+      "mean_ms": 12.45,
+      "median_ms": 12.42,
+      "p95_ms": 13.02,
+      "min_ms": 12.06,
+      "max_ms": 13.02
+    },
+    "large": {
+      "functions": 2000,
+      "mean_ms": 54.55,
+      "median_ms": 54.32,
+      "p95_ms": 56.05,
+      "min_ms": 53.86,
+      "max_ms": 56.05
+    }
+  }
+}

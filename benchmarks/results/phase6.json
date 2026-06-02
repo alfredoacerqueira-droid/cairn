@@ -1,0 +1,189 @@
+{
+  "timestamp": "2026-06-01T16:00:03.146838",
+  "phase": "6",
+  "description": "v0.6 profile-aware retrieval vs v0.5 embeddings baseline",
+  "results": {
+    "tf-eks": {
+      "top_1": 100.0,
+      "top_5": 100.0,
+      "nonsense_suppressed": false,
+      "nonsense_suppressed_pct": 0.0,
+      "token_reduction": 99.3,
+      "avg_context_tokens": 901.0,
+      "whole_repo_tokens": 129997,
+      "details": [
+        {
+          "query": "EKS managed node group",
+          "is_nonsense": false,
+          "top_1_hit": false,
+          "top_5_hit": false,
+          "context_tokens": 830,
+          "suppressed": false
+        },
+        {
+          "query": "IAM role for cluster",
+          "is_nonsense": false,
+          "top_1_hit": true,
+          "top_5_hit": true,
+          "context_tokens": 816,
+          "suppressed": false
+        },
+        {
+          "query": "cluster security group rules",
+          "is_nonsense": false,
+          "top_1_hit": true,
+          "top_5_hit": true,
+          "context_tokens": 1136,
+          "suppressed": false
+        },
+        {
+          "query": "KMS key encryption",
+          "is_nonsense": false,
+          "top_1_hit": true,
+          "top_5_hit": true,
+          "context_tokens": 866,
+          "suppressed": false
+        },
+        {
+          "query": "cluster version variable",
+          "is_nonsense": false,
+          "top_1_hit": true,
+          "top_5_hit": true,
+          "context_tokens": 888,
+          "suppressed": false
+        },
+        {
+          "query": "kubernetes pod autoscaler reconcile loop",
+          "is_nonsense": true,
+          "top_1_hit": true,
+          "top_5_hit": true,
+          "context_tokens": 871,
+          "suppressed": false
+        }
+      ]
+    },
+    "mediatr": {
+      "top_1": 100.0,
+      "top_5": 100.0,
+      "nonsense_suppressed": false,
+      "nonsense_suppressed_pct": 0.0,
+      "token_reduction": 98.8,
+      "avg_context_tokens": 1216.0,
+      "whole_repo_tokens": 102376,
+      "details": [
+        {
+          "query": "send a request through the mediator",
+          "is_nonsense": false,
+          "top_1_hit": true,
+          "top_5_hit": true,
+          "context_tokens": 1358,
+          "suppressed": false
+        },
+        {
+          "query": "publish a notification",
+          "is_nonsense": false,
+          "top_1_hit": true,
+          "top_5_hit": true,
+          "context_tokens": 1275,
+          "suppressed": false
+        },
+        {
+          "query": "pipeline behavior",
+          "is_nonsense": false,
+          "top_1_hit": true,
+          "top_5_hit": true,
+          "context_tokens": 1156,
+          "suppressed": false
+        },
+        {
+          "query": "register handlers DI",
+          "is_nonsense": false,
+          "top_1_hit": true,
+          "top_5_hit": true,
+          "context_tokens": 1163,
+          "suppressed": false
+        },
+        {
+          "query": "exception handling pipeline",
+          "is_nonsense": false,
+          "top_1_hit": true,
+          "top_5_hit": true,
+          "context_tokens": 1212,
+          "suppressed": false
+        },
+        {
+          "query": "terraform aws vpc subnet",
+          "is_nonsense": true,
+          "top_1_hit": false,
+          "top_5_hit": false,
+          "context_tokens": 1131,
+          "suppressed": false
+        }
+      ]
+    },
+    "django": {
+      "top_1": 100.0,
+      "top_5": 100.0,
+      "nonsense_suppressed": false,
+      "nonsense_suppressed_pct": 0.0,
+      "token_reduction": 100.0,
+      "avg_context_tokens": 976.0,
+      "whole_repo_tokens": 4783420,
+      "details": [
+        {
+          "query": "resolve URL to view",
+          "is_nonsense": false,
+          "top_1_hit": true,
+          "top_5_hit": true,
+          "context_tokens": 863,
+          "suppressed": false
+        },
+        {
+          "query": "execute queryset database",
+          "is_nonsense": false,
+          "top_1_hit": true,
+          "top_5_hit": true,
+          "context_tokens": 1057,
+          "suppressed": false
+        },
+        {
+          "query": "form validation cleaned_data",
+          "is_nonsense": false,
+          "top_1_hit": true,
+          "top_5_hit": true,
+          "context_tokens": 925,
+          "suppressed": false
+        },
+        {
+          "query": "middleware chain",
+          "is_nonsense": false,
+          "top_1_hit": true,
+          "top_5_hit": true,
+          "context_tokens": 1075,
+          "suppressed": false
+        },
+        {
+          "query": "render template",
+          "is_nonsense": false,
+          "top_1_hit": true,
+          "top_5_hit": true,
+          "context_tokens": 1025,
+          "suppressed": false
+        },
+        {
+          "query": "kubernetes pod autoscaler",
+          "is_nonsense": true,
+          "top_1_hit": false,
+          "top_5_hit": false,
+          "context_tokens": 913,
+          "suppressed": false
+        }
+      ]
+    }
+  },
+  "baselines_v0_5": {
+    "tf-eks": 17,
+    "mediatr": 60,
+    "django": 40
+  }
+}

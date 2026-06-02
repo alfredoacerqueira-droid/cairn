@@ -1,0 +1,21 @@
+# Python code compression filter
+# Strip common noise patterns from Python source code
+
+[filters.python-boilerplate]
+description = "Remove Python boilerplate (imports, decorators, main guards)"
+strip_lines_matching = [
+    "^\\s*import\\s+",
+    "^\\s*from\\s+.*\\s+import\\s+",
+    "^\\s*@\\w+",
+    "^\\s*if\\s+__name__\\s*==\\s*",
+    "^\\s*#\\s+(?!TODO|FIXME|XXX|HACK|NOTE|BUG)",
+    "^\\s*$",
+]
+max_lines = 100
+
+[filters.python-docstrings]
+description = "Remove Python docstrings"
+strip_lines_matching = [
+    "^\"" "\"\"",
+    "^\'\'\'",
+]

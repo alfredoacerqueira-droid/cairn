@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cairn-context"  # PyPI dist ('cairn' is taken); CLI command + brand are 'cairn'
+version = "0.6.0"  # keep in sync with core/version.py:CAIRN_VERSION
+description = "Cairn — a local-first semantic code context engine for AI coding agents"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    "chromadb>=0.4.0",
+    "tree-sitter>=0.20.0",
+    "tree-sitter-python>=0.20.0",
+    "watchdog>=3.0.0",
+    "httpx>=0.24.0",
+    "pydantic>=2.0.0",
+    "psutil>=5.9.0",
+    "pyyaml>=6.0.0",
+    "click>=8.1.0",
+    "mcp>=1.0.0",
+    "flashrank>=0.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0,<1.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.5.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["server*", "pipeline*", "core*", "throttle*", "cli*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml", "*.json", "*.md"]
+
+[project.scripts]
+cairn = "cli.main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+[[tool.mypy.overrides]]
+# flashrank ships no type stubs / py.typed marker — ignore its missing types.
+module = ["flashrank", "flashrank.*"]
+ignore_missing_imports = true

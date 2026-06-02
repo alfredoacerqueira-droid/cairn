@@ -1,0 +1,70 @@
+{
+  "baseline_tokens": 67067,
+  "agent_baseline_tokens": 15927,
+  "median_reduction_pct": 95.8,
+  "recall_at_10": 1.0,
+  "mrr": 1.0,
+  "per_query": [
+    {
+      "query": "Race condition in ID generation with sleep between read and increment",
+      "baseline_tokens": 67067,
+      "gateway_tokens": 731,
+      "reduction_pct": 98.9,
+      "reduction_vs_agent_pct": 95.4,
+      "gold_hit": true,
+      "recall_at_10": 1.0,
+      "mrr": 1.0
+    },
+    {
+      "query": "Memory leak in request logging unbounded list",
+      "baseline_tokens": 67067,
+      "gateway_tokens": 635,
+      "reduction_pct": 99.1,
+      "reduction_vs_agent_pct": 96.0,
+      "gold_hit": true,
+      "recall_at_10": 1.0,
+      "mrr": 1.0
+    },
+    {
+      "query": "Missing tax calculation in order total",
+      "baseline_tokens": 67067,
+      "gateway_tokens": 713,
+      "reduction_pct": 98.9,
+      "reduction_vs_agent_pct": 95.5,
+      "gold_hit": true,
+      "recall_at_10": 1.0,
+      "mrr": 1.0
+    },
+    {
+      "query": "Inefficient linear search no pagination O(n)",
+      "baseline_tokens": 67067,
+      "gateway_tokens": 631,
+      "reduction_pct": 99.1,
+      "reduction_vs_agent_pct": 96.0,
+      "gold_hit": true,
+      "recall_at_10": 1.0,
+      "mrr": 1.0
+    },
+    {
+      "query": "Stock deduction rollback transaction",
+      "baseline_tokens": 67067,
+      "gateway_tokens": 685,
+      "reduction_pct": 99.0,
+      "reduction_vs_agent_pct": 95.7,
+      "gold_hit": true,
+      "recall_at_10": 1.0,
+      "mrr": 1.0
+    },
+    {
+      "query": "Admin endpoint missing authentication",
+      "baseline_tokens": 67067,
+      "gateway_tokens": 671,
+      "reduction_pct": 99.0,
+      "reduction_vs_agent_pct": 95.8,
+      "gold_hit": true,
+      "recall_at_10": 1.0,
+      "mrr": 1.0
+    }
+  ],
+  "note": "Token counts use ~4-char/token approximation"
+}

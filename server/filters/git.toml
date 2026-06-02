@@ -1,0 +1,17 @@
+# Git output compression filter
+# Compact git command output
+
+[filters.git-output]
+description = "Compress git command output"
+strip_lines_matching = [
+    "^\\s*$",
+    "^remote:",
+    "^Enumerating",
+    "^Counting",
+    "^Compressing",
+    "^Writing",
+    "^Total",
+    "^Delta",
+    "^\\*\\s+",
+]
+max_lines = 30
