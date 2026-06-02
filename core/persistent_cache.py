@@ -13,7 +13,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,7 @@ class PersistentCache:
         cache_dir: Path,
         max_entries: int = 100,
         ttl_seconds: int = 300,
+        time_fn: Callable[[], float] | None = None,
     ):
         """Initialize persistent cache.
 
@@ -33,11 +34,14 @@ class PersistentCache:
             cache_dir: Directory to store cache files (created if missing).
             max_entries: Max entries before LRU eviction (by mtime).
             ttl_seconds: Time-to-live for each entry.
+            time_fn: Optional callable for getting current time (default: time.time).
+                Used for testing/injection.
         """
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.max_entries = max_entries
         self.ttl_seconds = ttl_seconds
+        self.time_fn = time_fn or time.time
         self._hits = 0
         self._misses = 0
 
@@ -74,7 +78,7 @@ class PersistentCache:
 
         # Check expiry
         timestamp = data.get("ts", 0)
-        if time.time() - timestamp > self.ttl_seconds:
+        if self.time_fn() - timestamp > self.ttl_seconds:
             self._misses += 1
             try:
                 cache_file.unlink()
@@ -92,7 +96,7 @@ class PersistentCache:
 
         data = {
             "value": value,
-            "ts": time.time(),
+            "ts": self.time_fn(),
         }
 
         # Atomic write: write to tmp, then replace

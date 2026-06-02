@@ -102,14 +102,26 @@ ollama serve &
 
 ## Step 2: Install the Gateway
 
-### 2.1 Via pipx (Recommended — Global, Isolated)
+### 2.1 Via uv (Recommended — PEP 668 & Corporate CA Support)
+
+For systems with PEP 668 restrictions (uv respects them) or corporate root CA requirements:
+
+```bash
+# Install globally from local path, respecting system certificates
+uv tool install . --force --system-certs
+```
+
+The `--system-certs` flag is essential when behind corporate proxies (e.g., Zscaler) that inject custom
+CA certificates. This tells uv to use the system's certificate bundle for HTTPS validation.
+
+### 2.2 Via pipx (Global, Isolated)
 
 ```bash
 # Install once globally
 pipx install .
 ```
 
-### 2.2 Via venv (Development)
+### 2.3 Via venv (Development)
 
 ```bash
 python3 -m venv .venv
@@ -117,7 +129,7 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-**⚠️ DO NOT use `pip install --break-system-packages`** on system Python. Use `pipx` or a venv.
+**⚠️ DO NOT use `pip install --break-system-packages`** on system Python. Use `uv`, `pipx`, or a venv.
 
 ### 2.3 Verify Installation
 

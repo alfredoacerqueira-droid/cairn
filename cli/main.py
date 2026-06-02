@@ -56,6 +56,65 @@ def _get_embeddings_enabled(cfg: Config) -> bool:
     return cfg.embeddings_enabled and cfg.local_llm.enabled
 
 
+def _select_worker_model(installed: list[str], free_vram_mib: int | None, current: str) -> str:
+    """Select the best installed qwen2.5-coder model based on available VRAM.
+
+    Pure function (no I/O) for deterministic unit testing.
+
+    Args:
+        installed: List of installed model names (from OllamaClient.list_models()).
+        free_vram_mib: Free VRAM in MiB, or None if unknown.
+        current: Current compaction_model setting (fallback if no better candidate).
+
+    Returns:
+        Selected model name: prefer 7b if VRAM>6000 MiB, else largest installed
+        qwen2.5-coder variant, else current (never fails/raises).
+    """
+    # Filter to qwen2.5-coder models only (ignore other model types)
+    coder_models = [m for m in installed if "qwen2.5-coder" in m.lower()]
+
+    if not coder_models:
+        # No coder models installed; keep current
+        return current
+
+    # Extract size from model name: "qwen2.5-coder:7b" -> "7b"
+    # Handle both tagged ("name:tag") and untagged formats
+    def get_size_key(model: str) -> tuple[int, str]:
+        """Extract size as (priority_int, model_name) for sorting.
+
+        Larger models prioritized; if same size, keep first occurrence.
+        Returns (priority, model_name) where priority is:
+          7b -> (7000, ...)
+          3b -> (3000, ...)
+          1.5b -> (1500, ...)
+          others -> (0, ...)
+        """
+        name_lower = model.lower()
+        if "7b" in name_lower:
+            return (7000, model)
+        elif "3b" in name_lower:
+            return (3000, model)
+        elif "1.5b" in name_lower:
+            return (1500, model)
+        else:
+            return (0, model)
+
+    # If VRAM unknown or insufficient (<6000 MiB), choose largest available
+    if free_vram_mib is None or free_vram_mib < 6000:
+        # Return the largest by size_key
+        largest = max(coder_models, key=get_size_key)
+        return largest
+
+    # VRAM >= 6000: prefer 7b if installed, else largest available
+    size_7b = [m for m in coder_models if "7b" in m.lower()]
+    if size_7b:
+        return size_7b[0]  # First 7b variant found
+
+    # No 7b; fall back to largest available
+    largest = max(coder_models, key=get_size_key)
+    return largest
+
+
 @click.group()
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging")
 def main(verbose: bool):
@@ -262,6 +321,59 @@ def init(no_index: bool, yes: bool, force: bool, offline: bool):
     if offline:
         cfg.retrieval.offline = True
         click.echo("  Offline mode: reranker disabled")
+
+    # A8: VRAM-aware worker model selection (only if local_llm enabled)
+    if cfg.local_llm.enabled:
+        try:
+            from server.ollama_client import OllamaClient
+
+            installed_models = None
+            free_vram_mib = None
+
+            # Best-effort: probe installed models
+            try:
+                ollama = OllamaClient(
+                    base_url=cfg.local_llm.base_url,
+                    generate_model=cfg.local_llm.model,
+                )
+                installed_models = ollama.list_models()
+            except Exception:
+                pass  # Non-fatal; will skip model selection
+
+            # Best-effort: read free VRAM via nvidia-smi
+            try:
+                import subprocess
+
+                result = subprocess.run(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=memory.free",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=5.0,
+                )
+                if result.returncode == 0:
+                    free_vram_mib = int(result.stdout.strip().split("\n")[0])
+            except Exception:
+                pass  # Non-fatal; treat as unknown VRAM
+
+            # Select model if we probed installed models
+            if installed_models:
+                selected = _select_worker_model(
+                    installed_models, free_vram_mib, cfg.memory.compaction_model
+                )
+                if selected != cfg.memory.compaction_model:
+                    cfg.memory.compaction_model = selected
+                    vram_info = (
+                        f" (VRAM: {free_vram_mib} MiB)"
+                        if free_vram_mib is not None
+                        else " (VRAM: unknown)"
+                    )
+                    click.echo(f"  Selected worker model: {selected}{vram_info}")
+        except Exception:
+            pass  # Non-fatal; keep existing compaction_model
 
     # Ensure expanded exclude_patterns (migration support)
     default_config = Config()
