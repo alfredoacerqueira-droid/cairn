@@ -1,6 +1,7 @@
 """Per-repo data management."""
 
 import fnmatch
+import hashlib
 import json
 import logging
 import time
@@ -8,6 +9,123 @@ from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+def project_id(project_root: str | Path) -> str:
+    """Compute a short stable hash of the resolved absolute path.
+
+    Used to namespace ChromaDB collections and add provenance metadata to indexed
+    records, enabling multi-repo isolation. The hash is deterministic: the same
+    project root always yields the same ID.
+
+    Args:
+            project_root: Path to the project (can be relative or absolute).
+
+    Returns:
+            First 12 chars of SHA1 hash of the resolved absolute path.
+    """
+    resolved = str(Path(project_root).resolve())
+    return hashlib.sha1(resolved.encode()).hexdigest()[:12]
+
+
+def detect_infra_markers(
+    project_path: Path,
+    source_roots: list[str] | None = None,
+) -> bool:
+    """Detect if a project is explicitly marked as infrastructure/IaC.
+
+    Checks for:
+    1. Chart.yaml (Helm)
+    2. kustomization.yaml or kustomization.yml (Kustomize)
+    3. YAML files containing Kubernetes manifest markers (kind: + apiVersion:)
+
+    This is CHEAP: only scans ~200 YAML files, reads first 4KB of each, and
+    returns early on first match.
+
+    Args:
+        project_path: Root directory of the project.
+        source_roots: Subdirectories to scan (e.g., ["src"]).
+                      If None, scans the entire project.
+
+    Returns:
+        True if infrastructure markers are found, False otherwise.
+    """
+    project_path = Path(project_path)
+
+    if source_roots is None:
+        source_roots = ["."]
+
+    # Check for explicit chart/kustomization files
+    for root_str in source_roots:
+        root_path = project_path / root_str
+        if not root_path.exists():
+            continue
+
+        # Helm: Chart.yaml
+        chart_path = root_path / "Chart.yaml"
+        if chart_path.exists():
+            return True
+
+        # Kustomize: kustomization.yaml or kustomization.yml
+        kustomize_yaml = root_path / "kustomization.yaml"
+        kustomize_yml = root_path / "kustomization.yml"
+        if kustomize_yaml.exists() or kustomize_yml.exists():
+            return True
+
+    # Scan YAML files for Kubernetes manifest markers (kind: + apiVersion:)
+    yaml_files_scanned = 0
+    max_yaml_files_to_scan = 200
+
+    for root_str in source_roots:
+        root_path = project_path / root_str
+        if not root_path.exists():
+            continue
+
+        for yaml_file in root_path.rglob("*.yaml"):
+            if yaml_files_scanned >= max_yaml_files_to_scan:
+                # Bounded scan; if we haven't found a marker by now, assume it's not there
+                return False
+
+            if not yaml_file.is_file():
+                continue
+
+            yaml_files_scanned += 1
+
+            try:
+                # Read first 4KB to look for markers
+                content = yaml_file.read_text(errors="ignore")[:4096]
+
+                # Check for Kubernetes manifest markers: both kind: and apiVersion:
+                has_kind = "kind:" in content
+                has_api_version = "apiVersion:" in content
+
+                if has_kind and has_api_version:
+                    return True
+            except Exception:
+                # Silently skip unreadable files
+                continue
+
+        # Also check .yml files
+        for yml_file in root_path.rglob("*.yml"):
+            if yaml_files_scanned >= max_yaml_files_to_scan:
+                return False
+
+            if not yml_file.is_file():
+                continue
+
+            yaml_files_scanned += 1
+
+            try:
+                content = yml_file.read_text(errors="ignore")[:4096]
+                has_kind = "kind:" in content
+                has_api_version = "apiVersion:" in content
+
+                if has_kind and has_api_version:
+                    return True
+            except Exception:
+                continue
+
+    return False
 
 
 def census_extensions(

@@ -12,7 +12,7 @@ import click
 
 from core.config import Config, load_config
 from core.profiles import detect_profile, get_profile
-from core.repo import census_extensions
+from core.repo import census_extensions, detect_infra_markers
 
 if TYPE_CHECKING:
     from server.ollama_client import OllamaClient
@@ -25,6 +25,35 @@ def _setup_logging(verbose: bool = False):
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+
+
+def _detect_workspace_siblings(project_path: Path) -> list[Path]:
+    """Detect if project is in a workspace by finding sibling git repos.
+
+    A workspace is detected if the parent directory contains multiple
+    sibling directories that are git repositories (contain .git/).
+
+    Args:
+        project_path: The current project path.
+
+    Returns:
+        List of sibling directories that contain .git/ (empty if not in workspace).
+    """
+    parent = project_path.parent
+    siblings = []
+    try:
+        for sibling in parent.iterdir():
+            if sibling.is_dir() and sibling != project_path:
+                if (sibling / ".git").exists():
+                    siblings.append(sibling)
+    except Exception:
+        pass
+    return siblings
+
+
+def _get_embeddings_enabled(cfg: Config) -> bool:
+    """Get effective embeddings flag: both config and local_llm must be enabled."""
+    return cfg.embeddings_enabled and cfg.local_llm.enabled
 
 
 @click.group()
@@ -103,7 +132,12 @@ def _run_preflight_checks(skip_ollama: bool = False) -> bool:
 @click.option("--no-index", is_flag=True, help="Skip indexing step (fast config-only setup)")
 @click.option("-y", "--yes", is_flag=True, help="Auto-pull missing models, no prompt")
 @click.option("--force", is_flag=True, help="Re-detect and rebuild index, overwriting config")
-def init(no_index: bool, yes: bool, force: bool):
+@click.option(
+    "--offline",
+    is_flag=True,
+    help="Disable reranker (FlashRank); use in corporate/proxy environments",
+)
+def init(no_index: bool, yes: bool, force: bool, offline: bool):
     """One-command setup: detect layout, write config, build index.
 
     Similar to 'git init' — prepares the current repo for cairn.
@@ -171,7 +205,8 @@ def init(no_index: bool, yes: bool, force: bool):
     # STEP 3b: Detect profile and retrieval strategy
     click.echo("3b. Detecting repository profile:")
     ext_census = census_extensions(project_path, source_roots=detected_roots)
-    detected_profile_name = detect_profile(ext_census)
+    has_infra_markers = detect_infra_markers(project_path, source_roots=detected_roots)
+    detected_profile_name = detect_profile(ext_census, has_infra_markers=has_infra_markers)
     detected_profile = get_profile(detected_profile_name)
     click.echo(f"  Detected profile: {detected_profile_name}")
     click.echo(f"  Retrieval strategy: {detected_profile.retrieval_mode}")
@@ -223,6 +258,11 @@ def init(no_index: bool, yes: bool, force: bool):
             cfg.indexing.embedding_model = detected_profile.embedding_model
         click.echo("  Created new config with profile settings")
 
+    # Apply --offline flag if set (disables reranker)
+    if offline:
+        cfg.retrieval.offline = True
+        click.echo("  Offline mode: reranker disabled")
+
     # Ensure expanded exclude_patterns (migration support)
     default_config = Config()
     old_patterns = set(cfg.indexing.exclude_patterns)
@@ -262,12 +302,22 @@ memory.md
     import json as _json
     import shutil as _shutil
 
-    gateway_cmd = _shutil.which("cairn") or "cairn"
+    # Resolve cairn binary path (OpenCode 1.15+ requires command as array)
+    cairn_cmd = _shutil.which("cairn")
+    if not cairn_cmd:
+        # Fallback: use sys.executable -m cairn
+        cairn_cmd = sys.executable
+        cairn_args = ["-m", "cairn", "mcp"]
+    else:
+        cairn_args = ["mcp"]
+
     project_abs_path = str(project_path.resolve())
-    mcp_entry = {
+
+    # OpenCode 1.15+ format: command is array, enabled is true
+    opencode_mcp_entry = {
         "type": "local",
-        "command": gateway_cmd,
-        "args": ["mcp"],
+        "command": [cairn_cmd] + cairn_args,
+        "enabled": True,
         "env": {"CAIRN_PROJECT": project_abs_path},
     }
 
@@ -281,14 +331,30 @@ memory.md
 
         if "mcp" not in opencode_data:
             opencode_data["mcp"] = {}
-        opencode_data["mcp"]["cairn"] = mcp_entry
+        opencode_data["mcp"]["cairn"] = opencode_mcp_entry
 
         opencode_path.write_text(_json.dumps(opencode_data, indent=2))
         click.echo("  ✓ Wrote opencode.json (MCP config)")
     except Exception as e:
         click.echo(f"  [!] opencode.json: {e}")
 
-    # Write .mcp.json
+    # Detect if in workspace (parent has multiple sibling git repos)
+    workspace_siblings = _detect_workspace_siblings(project_path)
+    if workspace_siblings:
+        click.echo()
+        click.echo("  ⚠ Workspace detected:")
+        click.echo(
+            f"    This project is in a monorepo with "
+            f"{len(workspace_siblings)} sibling git repo(s)."
+        )
+        click.echo("    OpenCode resolves MCP config from the WORKSPACE ROOT.")
+        click.echo("    Consider placing opencode.json at the workspace root instead:")
+        parent = project_path.parent
+        click.echo()
+        click.echo(f"    cp {opencode_path.name} {parent}/opencode.json")
+        click.echo()
+
+    # Write .mcp.json (Claude Code format: command + args as separate fields)
     mcp_path = project_path / ".mcp.json"
     try:
         if mcp_path.exists():
@@ -299,8 +365,8 @@ memory.md
         if "mcpServers" not in mcp_data:
             mcp_data["mcpServers"] = {}
         mcp_data["mcpServers"]["cairn"] = {
-            "command": gateway_cmd,
-            "args": ["mcp"],
+            "command": cairn_cmd,
+            "args": cairn_args,
             "env": {"CAIRN_PROJECT": project_abs_path},
         }
 
@@ -317,7 +383,7 @@ memory.md
         repo = RepoManager(project_path)
         parser = ASTParser()
         indexer = VectorIndexer(
-            chroma_path=repo.get_chroma_path(), embeddings_enabled=cfg.embeddings_enabled
+            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
         )
         freshness = DBFreshness(
             project_path,
@@ -485,7 +551,7 @@ def status():
     repo = RepoManager(project_path)
     try:
         indexer = VectorIndexer(
-            chroma_path=repo.get_chroma_path(), embeddings_enabled=cfg.embeddings_enabled
+            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
         )
         click.echo(f"Indexed functions: {indexer.count()}")
     except Exception as e:
@@ -574,38 +640,86 @@ def doctor():
     click.echo(f"[{'✓' if py_ok else '✗'}] Python: {vi.major}.{vi.minor}.{vi.micro} (need ≥3.10)")
     ok = ok and py_ok
 
-    # Ollama
-    try:
-        from server.ollama_client import OllamaClient
+    # Local LLM status (informational)
+    cfg = load_config(Path.cwd())
+    if cfg.local_llm.enabled:
+        click.echo(f"[i] Local LLM: enabled ({cfg.local_llm.backend})")
 
-        ollama = OllamaClient()
-        if ollama.health_check():
-            click.echo("[✓] Ollama: reachable")
-            models = ollama.list_models()
-            embed_ok = any(
-                "nomic-embed-text" in name or "embed" in name.lower() for name in models
-            ) or any("embed" in name.lower() for name in models)
-            gen_ok = len(models) > 0
-            click.echo(
-                f"[{'✓' if embed_ok else '✗'}] Embedding model (nomic-embed-text or similar): "
-                f"{'found' if embed_ok else 'NOT FOUND'}"
-            )
-            if not embed_ok:
-                click.echo("   → Run: ollama pull nomic-embed-text   (or set OLLAMA_EMBED_MODEL)")
-                ok = False
-            click.echo(f"[{'✓' if gen_ok else '✗'}] Generation models: {len(models)} available")
-            if not gen_ok:
-                click.echo(
-                    "   → Run: ollama pull qwen2.5-coder:3b   (or set OLLAMA_GENERATE_MODEL)"
+        # Health check the configured backend
+        try:
+            if cfg.local_llm.backend == "openai_compatible":
+                from server.ollama_client import OpenAICompatibleClient
+
+                if not cfg.local_llm.base_url:
+                    click.echo("[!] OpenAI-compatible backend: base_url not set")
+                else:
+                    client = OpenAICompatibleClient(
+                        base_url=cfg.local_llm.base_url,
+                        model=cfg.local_llm.model,
+                        embed_model=cfg.local_llm.embed_model,
+                    )
+                    if client.health_check():
+                        click.echo("[✓] OpenAI-compatible server: reachable")
+                    else:
+                        click.echo("[✗] OpenAI-compatible server: NOT REACHABLE")
+                        click.echo(f"   → Check: {cfg.local_llm.base_url}")
+            else:
+                # Ollama backend
+                from server.ollama_client import OllamaClient
+
+                ollama = OllamaClient(
+                    base_url=cfg.local_llm.base_url,
+                    generate_model=cfg.local_llm.model,
+                    embed_model=cfg.local_llm.embed_model,
                 )
+                if ollama.health_check():
+                    click.echo("[✓] Ollama: reachable")
+                else:
+                    click.echo("[✗] Ollama: NOT REACHABLE")
+                    click.echo("   → Start Ollama: ollama serve")
+        except Exception as e:
+            click.echo(f"[!] LLM health check error: {e}")
+    else:
+        click.echo("[i] Local LLM: disabled (lexical/structural + cross-encoder only)")
+
+    # Ollama check (only if embeddings+llm are enabled)
+    if cfg.embeddings_enabled and cfg.local_llm.enabled and cfg.local_llm.backend == "ollama":
+        try:
+            from server.ollama_client import OllamaClient
+
+            ollama = OllamaClient(
+                base_url=cfg.local_llm.base_url,
+                generate_model=cfg.local_llm.model,
+                embed_model=cfg.local_llm.embed_model,
+            )
+            if ollama.health_check():
+                models = ollama.list_models()
+                embed_ok = any(
+                    "nomic-embed-text" in name or "embed" in name.lower() for name in models
+                ) or any("embed" in name.lower() for name in models)
+                gen_ok = len(models) > 0
+                click.echo(
+                    f"[{'✓' if embed_ok else '✗'}] Embedding model (nomic-embed-text or similar): "
+                    f"{'found' if embed_ok else 'NOT FOUND'}"
+                )
+                if not embed_ok:
+                    click.echo(
+                        "   → Run: ollama pull nomic-embed-text   (or set OLLAMA_EMBED_MODEL)"
+                    )
+                    ok = False
+                click.echo(f"[{'✓' if gen_ok else '✗'}] Generation models: {len(models)} available")
+                if not gen_ok:
+                    click.echo(
+                        "   → Run: ollama pull qwen2.5-coder:3b   (or set OLLAMA_GENERATE_MODEL)"
+                    )
+                    ok = False
+            else:
+                click.echo("[✗] Ollama: NOT REACHABLE")
+                click.echo("   → Start Ollama: ollama serve")
                 ok = False
-        else:
-            click.echo("[✗] Ollama: NOT REACHABLE")
-            click.echo("   → Start Ollama: ollama serve")
+        except Exception:
+            click.echo("[✗] Ollama: error connecting")
             ok = False
-    except Exception:
-        click.echo("[✗] Ollama: error connecting")
-        ok = False
 
     # Disk space
     usage = shutil.disk_usage(Path.cwd())
@@ -664,25 +778,87 @@ def doctor():
         click.echo("[i] ripgrep: NOT found — using in-memory BM25 fallback")
         click.echo("   → Install: apt install ripgrep")
 
-    # Reranker (flashrank availability)
+    # Reranker (flashrank availability and loadability with timeout)
     try:
         import importlib.util
+        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import TimeoutError as FuturesTimeoutError
 
         flashrank_spec = importlib.util.find_spec("flashrank")
-        if flashrank_spec is not None:
-            click.echo("[✓] Reranker (flashrank): available (ms-marco-MiniLM-L-12-v2)")
-        else:
-            click.echo(
-                "[✗] Reranker (flashrank): NOT available — cross-encoder reranking " "disabled"
-            )
+        if flashrank_spec is None:
+            click.echo("[✗] Reranker (flashrank): NOT installed — cross-encoder reranking disabled")
             click.echo("   → Retrieval quality + nonsense-rejection degraded. Install with:")
             click.echo("   → pip install flashrank")
-            click.echo("   → Note: ensure cairn symlink uses the venv Python, not system")
+        else:
+            # Flashrank is importable; now try to load the model with a short timeout
+            # to detect if it hangs (e.g., proxy stall during HuggingFace download)
+            def _test_load():
+                try:
+                    from flashrank import Ranker
+
+                    Ranker(model_name="ms-marco-MiniLM-L-12-v2")
+                    return True
+                except Exception as e:
+                    return str(e)
+
+            try:
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(_test_load)
+                    result = future.result(timeout=5)  # 5s timeout for model load
+
+                if result is True:
+                    click.echo("[✓] Reranker (flashrank): model loadable (ms-marco-MiniLM-L-12-v2)")
+                else:
+                    click.echo(f"[✗] Reranker (flashrank): model failed to load: {result}")
+                    ok = False
+            except FuturesTimeoutError:
+                click.echo("[✗] Reranker (flashrank): model load TIMED OUT (blocked by proxy?)")
+                click.echo("   → Solution: use cairn init --offline, or fix proxy/CA bundle")
+                ok = False
+            except Exception as e:
+                click.echo(f"[✗] Reranker (flashrank): error during test load: {e}")
+                ok = False
     except Exception:
-        click.echo("[✗] Reranker (flashrank): NOT available — cross-encoder reranking " "disabled")
-        click.echo("   → Retrieval quality + nonsense-rejection degraded. Install with:")
-        click.echo("   → pip install flashrank")
-        click.echo("   → Note: ensure cairn symlink uses the venv Python, not system")
+        click.echo("[✗] Reranker (flashrank): error checking availability")
+        ok = False
+
+    # CA bundle configuration (useful for corporate proxies)
+    cfg = load_config(Path.cwd())
+    ca_bundle = (
+        cfg.retrieval.ca_bundle
+        or os.environ.get("CAIRN_CA_BUNDLE")
+        or os.environ.get("REQUESTS_CA_BUNDLE")
+        or os.environ.get("SSL_CERT_FILE")
+    )
+    if ca_bundle:
+        click.echo(f"[i] CA bundle: {ca_bundle}")
+    else:
+        click.echo("[i] CA bundle: not set (using system default)")
+
+    # Offline mode check
+    if cfg.retrieval.offline:
+        click.echo("[i] Offline mode: ENABLED (reranker disabled)")
+
+    # Project path and ChromaDB collection info
+    project_path = Path.cwd()
+    click.echo(f"[i] Project path: {project_path.resolve()}")
+
+    try:
+        from core.repo import RepoManager, project_id
+
+        repo = RepoManager(project_path)
+        from pipeline.indexer import VectorIndexer
+
+        indexer = VectorIndexer(
+            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
+        )
+        collection_name = indexer.collection.name if indexer.collection else "unknown"
+        pid = project_id(project_path)
+        click.echo(f"[i] Collection: {collection_name}")
+        if pid:
+            click.echo(f"[i] Project ID: {pid}")
+    except Exception as e:
+        click.echo(f"[i] Collection: error ({e})")
 
     # VRAM tip: on small GPUs the embedder + worker model contend for memory,
     # causing slow cold reloads when they swap. Keeping >=2 models resident helps.
@@ -842,7 +1018,7 @@ def _start_all_impl(
         info = freshness.check_freshness()
         repo = RepoManager(Path.cwd())
         idx = VectorIndexer(
-            chroma_path=repo.get_chroma_path(), embeddings_enabled=cfg.embeddings_enabled
+            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
         )
 
         if info["last_indexed_commit"] is None:
@@ -897,7 +1073,7 @@ def _start_all_impl(
         repo = RepoManager(project_path)
         parser = ASTParser()
         indexer = VectorIndexer(
-            chroma_path=repo.get_chroma_path(), embeddings_enabled=cfg.embeddings_enabled
+            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
         )
 
         cpu = CPUThrottler(max_cpu_percent=cfg.resources.max_cpu_percent)
@@ -992,7 +1168,7 @@ def _run_quick_reindex(cfg, freshness):
     repo = RepoManager(Path.cwd())
     parser = ASTParser()
     indexer = VectorIndexer(
-        chroma_path=repo.get_chroma_path(), embeddings_enabled=cfg.embeddings_enabled
+        chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
     )
     total = 0
 
@@ -1027,7 +1203,7 @@ def _print_status(cfg):
         from pipeline.indexer import VectorIndexer
 
         idx = VectorIndexer(
-            chroma_path=repo.get_chroma_path(), embeddings_enabled=cfg.embeddings_enabled
+            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
         )
         count = idx.count()
     except Exception:
@@ -1115,7 +1291,7 @@ def reindex(mode: str):
 
     parser = ASTParser()
     indexer = VectorIndexer(
-        chroma_path=repo.get_chroma_path(), embeddings_enabled=cfg.embeddings_enabled
+        chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
     )
 
     if mode == "full":
@@ -1199,7 +1375,7 @@ def janitor_start(debounce: float | None):
     repo = RepoManager(project_path)
     parser = ASTParser()
     indexer = VectorIndexer(
-        chroma_path=repo.get_chroma_path(), embeddings_enabled=cfg.embeddings_enabled
+        chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
     )
 
     cpu = CPUThrottler(max_cpu_percent=cfg.resources.max_cpu_percent)

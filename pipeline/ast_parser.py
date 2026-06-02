@@ -2,12 +2,16 @@
 
 """Deterministic AST parsing using tree-sitter (Python/HCL/YAML/C#/bash) + regex (others)."""
 
+import concurrent.futures
+import logging
 import re
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 import tree_sitter_python as tspython
 from tree_sitter import Language, Node, Parser
+
+logger = logging.getLogger(__name__)
 
 try:
     from tree_sitter_language_pack import get_parser as _get_parser
@@ -185,8 +189,34 @@ class FileAST:
 
 
 class ASTParser:
+    def __init__(
+        self,
+        max_file_kb: int = 0,
+        parse_timeout_s: float = 10.0,
+    ):
+        """Initialize parser with optional size and timeout limits.
+
+        Args:
+            max_file_kb: Maximum file size in KB before skipping. 0 = unlimited.
+            parse_timeout_s: Maximum parse time in seconds per file. 0 = no timeout.
+        """
+        self.max_file_kb = max_file_kb
+        self.parse_timeout_s = parse_timeout_s
+
     def parse_file(self, filepath: str | Path) -> FileAST:
         filepath = Path(filepath)
+
+        # SIZE LIMIT: check file size before reading
+        if self.max_file_kb > 0:
+            file_size_bytes = filepath.stat().st_size
+            file_size_kb = file_size_bytes / 1024
+            if file_size_kb > self.max_file_kb:
+                logger.warning(
+                    f"Skipping {filepath}: {file_size_kb:.1f}KB exceeds "
+                    f"max_file_kb={self.max_file_kb}"
+                )
+                return FileAST(str(filepath))
+
         # Always decode as UTF-8 (the de-facto encoding for source). Without an
         # explicit encoding, read_text() uses the platform locale (cp1252 on native
         # Windows), which mojibakes any non-ASCII identifier/comment and yields a
@@ -203,6 +233,23 @@ class ASTParser:
         if lang == "unknown":
             lang = "python"
 
+        # PARSE TIMEOUT: wrap the parse operation with a timeout if configured
+        if self.parse_timeout_s > 0:
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(self._parse_impl, code, filepath, lang)
+                    return future.result(timeout=self.parse_timeout_s)
+            except concurrent.futures.TimeoutError:
+                logger.warning(f"Parse timeout ({self.parse_timeout_s}s) on {filepath}; skipping")
+                return FileAST(filepath)
+        else:
+            return self._parse_impl(code, filepath, lang)
+
+    def _parse_impl(self, code: str, filepath: str, lang: str) -> FileAST:
+        """Internal parse implementation (language routing).
+
+        This is extracted to be called either directly or via timeout wrapper.
+        """
         # Route to appropriate parser
         if lang == "python":
             return self._tree_sitter_parse(code, filepath)

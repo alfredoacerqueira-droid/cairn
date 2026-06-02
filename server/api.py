@@ -201,11 +201,24 @@ async def _stop_background_sync() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _assembler, _PROJECT_PATH
-    _PROJECT_PATH = Path(
-        os.getenv("CAIRN_PROJECT") or os.getenv("GATEWAY_PROJECT") or "."
-    ).resolve()
+    # Fail-closed: strict project resolution without fallback to cwd.
+    env_path = os.getenv("CAIRN_PROJECT") or os.getenv("GATEWAY_PROJECT")
+    if not env_path:
+        raise RuntimeError(
+            "Gateway cannot start: CAIRN_PROJECT or GATEWAY_PROJECT not set. "
+            "Set CAIRN_PROJECT to an indexed repo (a dir containing .cairn/)."
+        )
+    _PROJECT_PATH = Path(env_path).resolve()
+    if not _PROJECT_PATH.exists():
+        raise RuntimeError(f"Gateway cannot start: CAIRN_PROJECT path does not exist: {env_path}")
+    cairn_dir = _PROJECT_PATH / ".cairn"
+    if not cairn_dir.exists():
+        raise RuntimeError(f"Gateway cannot start: no .cairn/ directory (not indexed): {env_path}")
     _assembler = ContextAssembler(project_path=_PROJECT_PATH)
-    logger.info("Semantic Gateway started, project: %s", _PROJECT_PATH)
+    from core.repo import project_id
+
+    pid = project_id(_PROJECT_PATH)
+    logger.info("Semantic Gateway bound to %s (id=%s)", _PROJECT_PATH, pid)
 
     # Auto-create index if missing
     _ensure_index_exists(_PROJECT_PATH)

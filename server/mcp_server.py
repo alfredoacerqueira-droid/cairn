@@ -7,6 +7,7 @@ without needing to route through OpenAI-compatible endpoints.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -14,15 +15,46 @@ from mcp.server import FastMCP
 
 from server.context_assembler import ContextAssembler
 
-# Bind project path from environment or use cwd
-_PROJECT_PATH = Path(os.getenv("CAIRN_PROJECT") or os.getenv("GATEWAY_PROJECT") or ".").resolve()
+logger = logging.getLogger(__name__)
+
+# Fail-closed project binding: strict resolution without fallback to cwd.
+_PROJECT_PATH: Path | None = None
+_BIND_ERROR: str | None = None
 _assembler: ContextAssembler | None = None
 
 
-def _get_assembler() -> ContextAssembler:
-    """Get or create the shared ContextAssembler instance."""
-    global _assembler
-    if _assembler is None:
+def _resolve_project_path() -> tuple[Path | None, str | None]:
+    """Resolve project path from environment or return (None, error_msg) if unbound.
+
+    Returns:
+        (Path, None) if bound, or (None, error_msg) if unbound.
+        A project is bound if CAIRN_PROJECT or GATEWAY_PROJECT is set,
+        the path exists, and it contains a .cairn/ directory.
+    """
+    env_path = os.getenv("CAIRN_PROJECT") or os.getenv("GATEWAY_PROJECT")
+    if not env_path:
+        return None, (
+            "Cairn MCP server has no bound project. Set CAIRN_PROJECT to an "
+            "indexed repo (a dir containing .cairn/)."
+        )
+
+    path = Path(env_path).resolve()
+    if not path.exists():
+        return None, f"CAIRN_PROJECT path does not exist: {env_path}"
+
+    cairn_dir = path / ".cairn"
+    if not cairn_dir.exists():
+        return None, (f"CAIRN_PROJECT path has no .cairn/ directory (not indexed): {env_path}")
+
+    return path, None
+
+
+def _get_assembler() -> ContextAssembler | None:
+    """Get or create the shared ContextAssembler instance, or None if unbound."""
+    global _assembler, _PROJECT_PATH, _BIND_ERROR
+    if _BIND_ERROR is not None:
+        return None
+    if _assembler is None and _PROJECT_PATH is not None:
         _assembler = ContextAssembler(project_path=_PROJECT_PATH)
     return _assembler
 
@@ -43,7 +75,14 @@ def search_code(query: str, top_k: int = 5) -> str:
         A formatted string with matched functions, their locations, and code.
     """
     try:
+        if _BIND_ERROR is not None:
+            return _BIND_ERROR
         assembler = _get_assembler()
+        if assembler is None:
+            return (
+                "Cairn MCP server has no bound project. Set CAIRN_PROJECT to an "
+                "indexed repo (a dir containing .cairn/)."
+            )
         # apply_guard=True so off-topic queries return "no confident matches"
         # rather than low-confidence noise (same gate as assemble_context).
         results = assembler.semantic_search(query, top_k=top_k, apply_guard=True)
@@ -94,7 +133,14 @@ def assemble_context(query: str) -> str:
         The assembled context as markdown, token-compressed.
     """
     try:
+        if _BIND_ERROR is not None:
+            return _BIND_ERROR
         assembler = _get_assembler()
+        if assembler is None:
+            return (
+                "Cairn MCP server has no bound project. Set CAIRN_PROJECT to an "
+                "indexed repo (a dir containing .cairn/)."
+            )
         return assembler.assemble_context(query)
     except Exception as e:
         return f"Context assembly error: {str(e)}"
@@ -115,9 +161,16 @@ def set_profile(profile_name: str) -> str:
         Confirmation message with the set profile and its strategy.
     """
     try:
+        if _BIND_ERROR is not None:
+            return _BIND_ERROR
+        if _PROJECT_PATH is None:
+            return (
+                "Cairn MCP server has no bound project. Set CAIRN_PROJECT to an "
+                "indexed repo (a dir containing .cairn/)."
+            )
         from core.config import load_config, save_config
         from core.profiles import PROFILES, detect_profile, get_profile
-        from core.repo import census_extensions
+        from core.repo import census_extensions, detect_infra_markers, detect_source_layout
 
         if profile_name not in PROFILES and profile_name != "auto":
             return (
@@ -129,11 +182,10 @@ def set_profile(profile_name: str) -> str:
 
         if profile_name == "auto":
             # Auto-detect
-            from core.repo import detect_source_layout
-
             detected_roots, _ = detect_source_layout(_PROJECT_PATH)
             ext_census = census_extensions(_PROJECT_PATH, source_roots=detected_roots)
-            detected_name = detect_profile(ext_census)
+            has_infra_markers = detect_infra_markers(_PROJECT_PATH, source_roots=detected_roots)
+            detected_name = detect_profile(ext_census, has_infra_markers=has_infra_markers)
             profile = get_profile(detected_name)
             cfg.profile = detected_name
             result_msg = (
@@ -167,6 +219,12 @@ def set_profile(profile_name: str) -> str:
 
 def run_stdio() -> None:
     """Run the MCP server over stdio (for Claude Code / OpenCode)."""
+    global _PROJECT_PATH, _BIND_ERROR
+    _PROJECT_PATH, _BIND_ERROR = _resolve_project_path()
+    if _BIND_ERROR:
+        logger.error("Cairn MCP: %s", _BIND_ERROR)
+    else:
+        logger.info("Cairn MCP bound to %s", _PROJECT_PATH)
     mcp.run()
 
 

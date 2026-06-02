@@ -16,17 +16,33 @@ from core.cache import SessionCache
 from core.config import load_config
 from core.persistent_cache import PersistentCache
 from core.profiles import get_profile
-from core.repo import RepoManager
+from core.repo import RepoManager, project_id
 from pipeline.indexer import VectorIndexer
 from pipeline.retrieval.ast_rank import ASTRankRetriever
 from pipeline.retrieval.bm25 import BM25Retriever
 from pipeline.retrieval.embeddings import EmbeddingRetriever
 from pipeline.retrieval.hybrid import HybridRetriever
 from pipeline.retrieval.reranker import Reranker
-from server.ollama_client import OllamaClient
+from server.ollama_client import OllamaClient, make_llm_client
 from server.token_compressor import FilterLevel, Language, TokenCompressor
 
 logger = logging.getLogger(__name__)
+
+
+def _is_foreign_path(filepath: str, project_root: str) -> bool:
+    """True if an ABSOLUTE filepath points outside ``project_root``.
+
+    Result filepaths may carry a ``:symbol`` suffix (e.g. ``values.yaml:replicaCount``);
+    we look only at the path portion. Relative paths are assumed in-repo (the
+    legs that emit them are already scoped to this project).
+    """
+    if not filepath:
+        return False
+    head = filepath.split(":", 1)[0]
+    if not os.path.isabs(head):
+        return False
+    head = os.path.realpath(head)
+    return head != project_root and not head.startswith(project_root + os.sep)
 
 
 class ContextAssembler:
@@ -38,7 +54,6 @@ class ContextAssembler:
         cache: Optional[SessionCache] = None,
     ):
         self.project_path = project_path or Path.cwd()
-        self.ollama = ollama_client or OllamaClient()
         self.repo = RepoManager(self.project_path)
         self.top_k = top_k
 
@@ -63,12 +78,19 @@ class ContextAssembler:
                 ttl_seconds=cfg.cache.ttl_seconds,
             )
 
+        # Use factory to build client based on local_llm config
+        self.ollama = ollama_client or make_llm_client(cfg.local_llm)
+
+        # Effective embeddings flag: only enable if both config and local LLM are enabled
+        emb_enabled = cfg.embeddings_enabled and cfg.local_llm.enabled
         self.vector_indexer = VectorIndexer(
             chroma_path=self.repo.get_chroma_path(),
             ollama_client=self.ollama,
             cache=self.cache,
-            embeddings_enabled=cfg.embeddings_enabled,
+            embeddings_enabled=emb_enabled,
+            project_root=self.project_path,
         )
+        self.project_id: str | None = project_id(self.project_path)
 
         self._retrieval_mode = cfg.retrieval.mode
         self._retrieval_weights = cfg.retrieval.weights
@@ -98,9 +120,10 @@ class ContextAssembler:
         cfg = load_config(self.project_path)
         profile = get_profile(cfg.profile)
 
-        # Only build embeddings retriever if profile enables embeddings
+        # Only build embeddings retriever if config, profile, AND local LLM all enable embeddings
         emb = None
-        if cfg.embeddings_enabled and profile.embedding_enabled:
+        emb_enabled = cfg.embeddings_enabled and cfg.local_llm.enabled and profile.embedding_enabled
+        if emb_enabled:
             emb = EmbeddingRetriever(self.vector_indexer, cache=self.cache)
 
         bm25 = BM25Retriever()
@@ -115,14 +138,16 @@ class ContextAssembler:
         # Typed Any: FlashRank Reranker and LLMReranker share a duck-typed
         # .rerank(query, candidates, top_k) interface.
         reranker: Any = None
-        if cfg.retrieval.rerank_enabled:
+        if cfg.retrieval.rerank_enabled and not cfg.retrieval.offline:
             rtype = getattr(cfg.retrieval, "reranker_type", "cross_encoder")
             if rtype == "llm":
                 from pipeline.retrieval.llm_reranker import LLMReranker
 
                 reranker = LLMReranker(ollama_client=self.ollama)
             elif rtype != "none":
-                reranker = Reranker()
+                reranker = Reranker(
+                    ca_bundle=cfg.retrieval.ca_bundle, offline=cfg.retrieval.offline
+                )
 
         # Lexical leg: ripgrep over the live working tree (fresh, exact-match),
         # falling back to in-memory BM25 over the loaded function texts when rg
@@ -161,9 +186,17 @@ class ContextAssembler:
         return self._retriever
 
     def _load_function_texts(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Load all indexed functions as (id, text, name) pairs from ChromaDB."""
+        """Load all indexed functions as (id, text, name) pairs from ChromaDB.
+
+        Scoped to this project: when a project_id is bound, only this project's
+        records are loaded so the lexical/structural legs can never surface a
+        foreign record that happens to share the collection.
+        """
+        where = {"project_id": self.project_id} if self.project_id is not None else None
         try:
-            data = self.vector_indexer.collection.get(include=["metadatas", "documents"])
+            data = self.vector_indexer.collection.get(
+                where=where, include=["metadatas", "documents"]
+            )
         except Exception:
             return [], []
 
@@ -250,6 +283,32 @@ class ContextAssembler:
 
             if self.cache:
                 self.cache.set(results, *cache_key)
+
+        # Final assertion: reject any result provably from a DIFFERENT project,
+        # then normalize provenance on what we keep. Two leg-agnostic checks:
+        #   1. a NON-None project_id that mismatches (foreign vector record), or
+        #   2. an absolute filepath outside this repo (foreign file from any leg).
+        # Lexical/structural/ripgrep results are repo-scoped by construction and
+        # carry no project_id, so we keep them and stamp the bound id.
+        if self.project_id is not None:
+            proj_root = str(self.project_path.resolve())
+            filtered = []
+            for result in results:
+                result_pid = result.get("project_id")
+                fp = result.get("filepath") or ""
+                if (result_pid is not None and result_pid != self.project_id) or _is_foreign_path(
+                    fp, proj_root
+                ):
+                    logger.warning(
+                        "Dropped cross-project result: %s (got %s, expected %s)",
+                        fp,
+                        result_pid,
+                        self.project_id,
+                    )
+                    continue
+                result["project_id"] = self.project_id  # normalize provenance
+                filtered.append(result)
+            results = filtered
 
         # Apply the confidence guard so CLI search + MCP search_code reject
         # off-topic queries (not just the assemble path). Cache stores the raw

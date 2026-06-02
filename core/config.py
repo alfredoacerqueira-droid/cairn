@@ -79,6 +79,12 @@ class IndexingConfig(BaseModel):
     source_roots: list[str] = ["."]
     batch_size: int = 50
     delay_ms: int = 500
+    # Maximum file size in KB before skipping parse. Set to 0 to disable the limit.
+    # Files exceeding this limit are skipped with a warning log.
+    max_file_kb: int = 0
+    # Maximum time in seconds to spend parsing a single file. If exceeded, the file
+    # is skipped with a warning log. Set to 0 to disable (no timeout).
+    parse_timeout_s: float = 10.0
     # Embedding model for semantic code search via Ollama.
     # Default "nomic-embed-text" is a general-purpose embedder.
     # For better code retrieval discrimination, use a code-trained model
@@ -166,6 +172,13 @@ class RetrievalConfig(BaseModel):
     # For small/specialized repos, hybrid mode may help; override via config.
     # Set 0.0 to disable the guard entirely.
     min_confidence: float = 0.82
+    # Offline mode: disable reranker entirely (skip FlashRank load).
+    # Useful behind corporate proxies where model download fails/hangs.
+    offline: bool = False
+    # Custom CA bundle path for HTTPS certificate validation (e.g., corporate proxies).
+    # If set, overrides CAIRN_CA_BUNDLE / REQUESTS_CA_BUNDLE / SSL_CERT_FILE.
+    # Passed to flashrank via os.environ before model load.
+    ca_bundle: str | None = None
 
 
 class CompressionConfig(BaseModel):
@@ -175,6 +188,23 @@ class CompressionConfig(BaseModel):
     enabled: bool = True
     # Compression level: "none" (0%), "minimal" (20-40%), "aggressive" (60-90%)
     level: str = "minimal"
+
+
+class LocalLLMConfig(BaseModel):
+    # Whether to use a local LLM for embeddings and text generation.
+    # When disabled, Cairn operates without any LLM (lexical/structural + cross-encoder only).
+    enabled: bool = False
+    # Backend type: "ollama" (Ollama) or "openai_compatible" (LM Studio, llama.cpp, etc.)
+    backend: str = "ollama"  # ollama | openai_compatible
+    # Base URL for the backend (e.g., http://127.0.0.1:11434 for Ollama,
+    # http://127.0.0.1:8000 for LM Studio). If None, uses backend defaults.
+    base_url: str | None = None
+    # Model name for text generation (summarization, etc.).
+    # For Ollama: qwen2.5-coder:1.5b (default). For OpenAI-compatible: model ID.
+    model: str | None = None
+    # Model name for embeddings (semantic search).
+    # For Ollama: nomic-embed-text (default). For OpenAI-compatible: model ID.
+    embed_model: str | None = None
 
 
 class Config(BaseModel):
@@ -192,6 +222,7 @@ class Config(BaseModel):
     cache: CacheConfig = CacheConfig()
     retrieval: RetrievalConfig = RetrievalConfig()
     compression: CompressionConfig = CompressionConfig()
+    local_llm: LocalLLMConfig = LocalLLMConfig()
 
 
 def load_config(project_path: Optional[Path] = None) -> Config:
