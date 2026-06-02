@@ -17,8 +17,9 @@ in-memory BM25 fallback throughout — Cairn degraded gracefully (doctor flags i
 - **Two real bugs were found and fixed** (below) that synthetic fixtures never exposed.
 - **Multi-repo isolation + workspace routing is solid on real, overlapping IaC repos**
   (5/5 correct routing, zero cross-repo leakage, fail-closed on nonsense).
-- **The local LLM is not worth it for IaC retrieval** (embeddings = identical results to
-  lexical, 11× slower) but **clearly helps memory summaries**.
+- **The local LLM is not worth it for retrieval** — embeddings were identical to lexical on
+  IaC and only marginally better on Python (1 of 6 results), at 9–11× the index cost — but it
+  **clearly helps memory summaries**.
 
 ---
 
@@ -87,14 +88,16 @@ Models: embeddings `qwen3-embedding:4b` (dim 2560), worker `qwen2.5-coder:3b`. O
 ### Embeddings A/B — does the LLM help retrieval?
 | Repo | Lexical index | Embeddings index | Retrieval delta |
 |---|---|---|---|
-| terraform-eks (1,259 blocks) | 14.9s | **160.4s** (qwen3-embedding:4b) | **none — identical top results** |
-| django (8,684 blocks) | 134.2s | _see below_ | _pending_ |
+| terraform-eks (1,259 blocks) | 14.9s | **160.4s** (11×) | **none — identical top results** |
+| django (8,684 blocks) | 134.2s | **1,252.8s** (~9×) | **marginal** — 2/3 queries identical; for "url routing" embeddings surfaced the correct `urls/resolvers.py` vs lexical's `decorators.py` (1 better result of 6) |
 
 For terraform-eks the embeddings leg returned the **exact same** files as lexical for all
-three queries, at **11× the index cost**. Extrapolated, efcore (36,532 blocks) would take
-~80 min to embed — **impractical**. Conclusion: **for IaC, embeddings add no value**; the
-lexical + structural + cross-encoder stack already nails it. This empirically validates the
-`iac` profile shipping with embeddings OFF.
+three queries. For django (Python — where semantic matching should help most), embeddings
+improved exactly **one of six** results, at ~9× the index cost. Extrapolated, efcore (36,532
+blocks) would take ~80 min to embed — **impractical**. Conclusion: **embeddings add little to
+no retrieval value** even for code; the lexical + structural + cross-encoder stack already
+nails it. This empirically validates the `iac` profile shipping with embeddings OFF, and
+suggests embeddings aren't worth enabling for large repos generally on this hardware.
 
 ### Memory summaries — LLM vs deterministic
 On a real commit diff:
