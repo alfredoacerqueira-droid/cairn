@@ -233,14 +233,12 @@ class VectorIndexer:
         if filepath_prefix:
             where_filter = {"filepath": {"$startswith": filepath_prefix}}
 
-        # If project_id is set, add it to the where filter for multi-repo isolation.
-        # This prevents cross-project leakage at the ChromaDB level.
-        if self.project_id is not None:
-            project_filter = {"project_id": self.project_id}
-            if where_filter:
-                where_filter = {"$and": [where_filter, project_filter]}
-            else:
-                where_filter = project_filter
+        # NOTE: we deliberately do NOT add a {"project_id": ...} metadata filter to
+        # the query. The collection is already namespaced per project
+        # (functions_<id>), and on large repos a project_id where-clause makes
+        # Chroma build a SQL `IN (...)` over every id, hitting SQLite's
+        # "too many SQL variables" limit. Isolation is instead enforced by the
+        # per-collection namespace + the in-memory drop of foreign ids below.
 
         results = self.collection.query(  # type: ignore[arg-type]  # ChromaDB v1.x stubs
             query_embeddings=[query_embedding],

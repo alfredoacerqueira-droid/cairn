@@ -192,18 +192,34 @@ class ContextAssembler:
         records are loaded so the lexical/structural legs can never surface a
         foreign record that happens to share the collection.
         """
-        where = {"project_id": self.project_id} if self.project_id is not None else None
-        try:
-            data = self.vector_indexer.collection.get(
-                where=where, include=["metadatas", "documents"]
-            )
-        except Exception:
-            return [], []
-
-        ids: list[str] = list(data.get("ids") or [])
-        raw_metas = data.get("metadatas") or []
-        metadatas: list[dict[str, Any]] = [dict(m) for m in raw_metas]  # type: ignore[arg-type]
-        documents: list[str] = list(data.get("documents") or [])
+        # Fetch ALL rows in PAGES. A single unbounded get(include=["metadatas",...])
+        # makes Chroma bind one SQL variable per row and blows SQLite's
+        # "too many SQL variables" limit (~32k) on large repos — silently
+        # returning nothing (retrieval dies). We also do NOT pass a
+        # where={"project_id": ...} filter (same blow-up); the collection is
+        # already namespaced per project, and we drop any provably-foreign record
+        # in-memory below.
+        ids: list[str] = []
+        metadatas: list[dict[str, Any]] = []
+        documents: list[str] = []
+        page = 2000
+        offset = 0
+        while True:
+            try:
+                data = self.vector_indexer.collection.get(
+                    include=["metadatas", "documents"], limit=page, offset=offset
+                )
+            except Exception:
+                break
+            batch_ids = list(data.get("ids") or [])
+            if not batch_ids:
+                break
+            ids.extend(batch_ids)
+            metadatas.extend(dict(m) for m in (data.get("metadatas") or []))  # type: ignore[arg-type]
+            documents.extend(data.get("documents") or [])
+            offset += len(batch_ids)
+            if len(batch_ids) < page:
+                break
 
         bm25_items: list[dict[str, Any]] = []
         ast_items: list[dict[str, Any]] = []
@@ -212,6 +228,12 @@ class ContextAssembler:
             meta = metadatas[i] if i < len(metadatas) else {}
             doc = documents[i] if i < len(documents) else ""
             doc_id = ids[i]
+
+            # Project isolation (in-memory): skip a record only if it is provably
+            # from a different project. None == legacy/un-stamped → keep.
+            rec_pid = meta.get("project_id")
+            if self.project_id is not None and rec_pid is not None and rec_pid != self.project_id:
+                continue
 
             bm25_items.append({"id": doc_id, "text": doc})
             ast_items.append(

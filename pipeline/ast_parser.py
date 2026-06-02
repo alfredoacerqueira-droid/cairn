@@ -127,6 +127,7 @@ EXTENSION_MAP: dict[str, str] = {
     ".yml": "yaml",
     ".tf": "hcl",
     ".tfvars": "hcl",
+    ".hcl": "hcl",  # Terragrunt (terragrunt.hcl, root.hcl, account.hcl, ...)
     ".json": "json",
     ".toml": "toml",
     ".cfg": "toml",
