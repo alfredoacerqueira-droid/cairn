@@ -23,6 +23,7 @@ from pipeline.retrieval.bm25 import BM25Retriever
 from pipeline.retrieval.embeddings import EmbeddingRetriever
 from pipeline.retrieval.hybrid import HybridRetriever
 from pipeline.retrieval.reranker import Reranker
+from pipeline.store.chroma_store import ChromaStore
 from server.ollama_client import OllamaClient, make_llm_client
 from server.token_compressor import FilterLevel, Language, TokenCompressor
 
@@ -90,6 +91,8 @@ class ContextAssembler:
             embeddings_enabled=emb_enabled,
             project_root=self.project_path,
         )
+        # Wrap the indexer in ChromaStore for the read path
+        self.store = ChromaStore(self.vector_indexer)
         self.project_id: str | None = project_id(self.project_path)
 
         self._retrieval_mode = cfg.retrieval.mode
@@ -124,7 +127,7 @@ class ContextAssembler:
         emb = None
         emb_enabled = cfg.embeddings_enabled and cfg.local_llm.enabled and profile.embedding_enabled
         if emb_enabled:
-            emb = EmbeddingRetriever(self.vector_indexer, cache=self.cache)
+            emb = EmbeddingRetriever(self.store, cache=self.cache)
 
         bm25 = BM25Retriever()
         ast_rank = ASTRankRetriever()
@@ -192,56 +195,23 @@ class ContextAssembler:
         records are loaded so the lexical/structural legs can never surface a
         foreign record that happens to share the collection.
         """
-        # Fetch ALL rows in PAGES. A single unbounded get(include=["metadatas",...])
-        # makes Chroma bind one SQL variable per row and blows SQLite's
-        # "too many SQL variables" limit (~32k) on large repos — silently
-        # returning nothing (retrieval dies). We also do NOT pass a
-        # where={"project_id": ...} filter (same blow-up); the collection is
-        # already namespaced per project, and we drop any provably-foreign record
-        # in-memory below.
-        ids: list[str] = []
-        metadatas: list[dict[str, Any]] = []
-        documents: list[str] = []
-        page = 2000
-        offset = 0
-        while True:
-            try:
-                data = self.vector_indexer.collection.get(
-                    include=["metadatas", "documents"], limit=page, offset=offset
-                )
-            except Exception:
-                break
-            batch_ids = list(data.get("ids") or [])
-            if not batch_ids:
-                break
-            ids.extend(batch_ids)
-            metadatas.extend(dict(m) for m in (data.get("metadatas") or []))  # type: ignore[arg-type]
-            documents.extend(data.get("documents") or [])
-            offset += len(batch_ids)
-            if len(batch_ids) < page:
-                break
-
         bm25_items: list[dict[str, Any]] = []
         ast_items: list[dict[str, Any]] = []
 
-        for i in range(len(ids)):
-            meta = metadatas[i] if i < len(metadatas) else {}
-            doc = documents[i] if i < len(documents) else ""
-            doc_id = ids[i]
-
-            # Project isolation (in-memory): skip a record only if it is provably
-            # from a different project. None == legacy/un-stamped → keep.
-            rec_pid = meta.get("project_id")
-            if self.project_id is not None and rec_pid is not None and rec_pid != self.project_id:
-                continue
+        # Iterate through all blocks using the store's paginated iter_blocks().
+        # Project isolation is already handled inside iter_blocks, so we just
+        # collect and build the two item lists.
+        for block in self.store.iter_blocks():
+            doc_id = block["id"]
+            doc = block["text"]
 
             bm25_items.append({"id": doc_id, "text": doc})
             ast_items.append(
                 {
                     "id": doc_id,
                     "text": doc,
-                    "name": meta.get("function", ""),
-                    "filepath": meta.get("filepath", ""),
+                    "name": block.get("function", ""),
+                    "filepath": block.get("filepath", ""),
                 }
             )
 
@@ -293,8 +263,8 @@ class ContextAssembler:
             results = cached
         else:
             if self._retrieval_mode == "embeddings":
-                results = self.vector_indexer.search(query, top_k=top_k)
-                # VectorIndexer.search returns real cosine in 'similarity'; mirror
+                results = self.store.search(query, top_k=top_k)
+                # Store.search returns real cosine in 'similarity'; mirror
                 # it into 'raw_cosine' so the confidence guard has one field.
                 for r in results:
                     r.setdefault("raw_cosine", r.get("similarity", 0.0))
@@ -410,8 +380,15 @@ class ContextAssembler:
     def get_repo_map(self) -> dict:
         return self.repo.load_repo_map()
 
-    def get_memory(self, last_n: int = 10) -> str:
-        return self.repo.load_memory(last_n)
+    def get_memory(self, last_n: int = 10, max_tokens: int | None = None) -> str:
+        if max_tokens is None:
+            # Use config's tool_max_tokens as the default memory cap
+            try:
+                cfg = load_config(self.project_path)
+                max_tokens = cfg.budget.tool_max_tokens
+            except Exception:
+                max_tokens = 8000
+        return self.repo.load_memory(last_n, max_tokens)
 
     def _maybe_compress(self, text: str) -> str:
         """Compress context using RTK-style token compressor.

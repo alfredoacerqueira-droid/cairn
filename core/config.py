@@ -97,6 +97,7 @@ class IndexingConfig(BaseModel):
     #   4. Re-measure RetrievalConfig.min_confidence on the new model's cosine scale
     #      (different models have different output distributions)
     embedding_model: str = "nomic-embed-text"
+    store_backend: str = "chroma"  # chroma | lance — flips to lance after benchmark
 
 
 class StaleDBConfig(BaseModel):
@@ -121,6 +122,16 @@ class CacheConfig(BaseModel):
     enabled: bool = True
     ttl_seconds: int = 300
     max_entries: int = 100
+
+
+class BudgetConfig(BaseModel):
+    # Token budget for what Cairn injects at session start (memory + repo map +
+    # MCP outputs).
+    session_window: int = 200_000  # standard (non-1M) Sonnet context window
+    session_pct: float = 0.18  # cap Cairn's session-start contribution at 18%
+    # -> 36k tokens
+    tool_max_tokens: int = 8_000  # per-MCP-tool output cap
+    tokenizer_model: str = "claude"  # passed to core.tokens (cl100k_base proxy)
 
 
 class RetrievalConfig(BaseModel):
@@ -205,6 +216,22 @@ class LocalLLMConfig(BaseModel):
     # Model name for embeddings (semantic search).
     # For Ollama: nomic-embed-text (default). For OpenAI-compatible: model ID.
     embed_model: str | None = None
+    # The local model's true context window (tokens).
+    context_window: int = 8192
+    # Usable input budget per local call (context minus output reserve).
+    max_local_tokens: int = 6000
+    # Tokens reserved for a map/reduce answer.
+    reduce_reserve_tokens: int = 1024
+    # 10-15% sliding-window overlap between chunks.
+    chunk_overlap_pct: float = 0.12
+    # work <= one_shot_threshold * max_local_tokens -> single call
+    one_shot_threshold: float = 0.75
+    # Embedder type: "ollama" | "fastembed" | "none"
+    embedder: str = "ollama"
+    # In-process ONNX embedder for the no-LLM mode.
+    fastembed_model: str = "BAAI/bge-small-en-v1.5"
+    # Parallel local-LLM map calls (1-2 on 6GB VRAM).
+    map_concurrency: int = 1
 
 
 class Config(BaseModel):
@@ -220,6 +247,7 @@ class Config(BaseModel):
     memory: MemoryConfig = MemoryConfig()
     routing: RoutingConfig = RoutingConfig()
     cache: CacheConfig = CacheConfig()
+    budget: BudgetConfig = BudgetConfig()
     retrieval: RetrievalConfig = RetrievalConfig()
     compression: CompressionConfig = CompressionConfig()
     local_llm: LocalLLMConfig = LocalLLMConfig()

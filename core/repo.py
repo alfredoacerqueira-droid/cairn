@@ -465,6 +465,9 @@ class RepoManager:
     def get_chroma_path(self) -> Path:
         return self.data_dir / "chroma"
 
+    def get_lance_path(self) -> Path:
+        return self.data_dir / "lance"
+
     def get_index_meta_path(self) -> Path:
         return self.data_dir / "index_meta.json"
 
@@ -534,12 +537,41 @@ class RepoManager:
         self.ensure_directories()
         self.get_repo_map_path().write_text(json.dumps(data, indent=2))
 
-    def load_memory(self, last_n: int = 10) -> str:
+    def load_memory(self, last_n: int = 10, max_tokens: int | None = None) -> str:
         path = self.get_memory_path()
         if not path.exists():
             return ""
-        lines = path.read_text().split("\n")
-        return "\n".join(lines[-last_n:])
+        text = path.read_text()
+        lines = text.split("\n")
+        result = "\n".join(lines[-last_n:])
+
+        # If max_tokens is specified, trim to fit within budget
+        if max_tokens is not None:
+            from core.tokens import count_tokens, truncate_to_tokens
+
+            if count_tokens(result) <= max_tokens:
+                return result
+
+            # Entry format: lines starting with "[YYYY-MM-DD" are timestamped entries.
+            # Split on timestamp markers and drop oldest entries first.
+            import re
+
+            entries = re.split(r"(?=\n\[)", result)
+            # Entries may start with newline; clean up
+            entries = [e.lstrip("\n") for e in entries if e.strip()]
+
+            # Keep dropping oldest (first) entries until we fit the budget
+            for i in range(len(entries)):
+                trimmed = "\n".join(entries[i:])
+                if count_tokens(trimmed) <= max_tokens:
+                    return trimmed
+
+            # If even a single newest entry exceeds the budget, hard-truncate it
+            if entries:
+                return truncate_to_tokens(entries[-1], max_tokens)
+            return ""
+
+        return result
 
     def append_memory(self, entry: str):
         from datetime import datetime

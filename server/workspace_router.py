@@ -69,6 +69,19 @@ class WorkspaceRouter:
             self._assemblers[repo_path] = ContextAssembler(project_path=repo_path)
         return self._assemblers[repo_path]
 
+    def assembler_for(self, repo_path: Path) -> ContextAssembler:
+        """Get the lazily-built ContextAssembler for a given repo.
+
+        Public API for external callers (e.g., MCP tools).
+
+        Args:
+            repo_path: The repo path.
+
+        Returns:
+            The ContextAssembler for that repo (cached).
+        """
+        return self._get_assembler(repo_path)
+
     def route(self, query: str, top_k: int = 5) -> tuple[Path | None, list[dict]]:
         """Route a query to the most relevant repo.
 

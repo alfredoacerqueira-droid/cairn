@@ -2,21 +2,34 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Optional, Protocol
 
 from core.cache import SessionCache
-from pipeline.indexer import VectorIndexer
+
+
+class SearchableStore(Protocol):
+    """Any object with a search method (VectorIndexer, ChromaStore, etc.)."""
+
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        filepath_prefix: Optional[str] = None,
+        metrics: Optional[object] = None,
+    ) -> list[dict]:
+        """Semantic search for relevant blocks."""
+        ...
 
 
 class EmbeddingRetriever:
-    """Thin wrapper around VectorIndexer.search() with the retriever interface."""
+    """Thin wrapper around a SearchableStore's search() method with the retriever interface."""
 
     def __init__(
         self,
-        vector_indexer: VectorIndexer,
+        store: SearchableStore,
         cache: Optional[SessionCache] = None,
     ):
-        self._indexer = vector_indexer
+        self._indexer = store
         self._cache = cache
 
     def search(
