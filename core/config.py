@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Module-level cache for config: (str_path, mtime_ns) -> Config
 _config_cache: dict[tuple[str, int], "Config"] = {}
@@ -259,6 +259,11 @@ class LocalLLMConfig(BaseModel):
     fastembed_model: str = "BAAI/bge-small-en-v1.5"
     # Parallel local-LLM map calls (1-2 on 6GB VRAM).
     map_concurrency: int = 1
+    # llama.cpp/Ollama per-request options forwarded to /api/generate and
+    # /api/embeddings (e.g. num_gpu, num_ctx, low_vram, num_thread, num_batch).
+    # Lower num_gpu offloads more layers to system RAM so a bigger model fits.
+    # Ollama backend only.
+    ollama_options: dict = Field(default_factory=dict)
 
 
 class Config(BaseModel):

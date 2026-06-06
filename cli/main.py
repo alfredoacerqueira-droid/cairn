@@ -831,6 +831,84 @@ def doctor():
     else:
         click.echo("[i] Local LLM: disabled (lexical/structural + cross-encoder only)")
 
+    # System resources and model recommendations
+    from core.resources import (
+        get_system_resources,
+        list_installed_ollama_models,
+        recommend_local_models,
+    )
+
+    resources = get_system_resources()
+    installed_models = list_installed_ollama_models()
+    rec = recommend_local_models(resources, installed_models)
+
+    def _res(key):
+        return resources[key]
+
+    click.echo()
+    click.echo("[i] System Resources:")
+    click.echo(
+        f"    RAM: {_res('ram_total_gb')} GB total, "
+        f"{_res('ram_available_gb')} GB available"
+    )
+    click.echo(f"    CPU: {_res('cpu_count')} cores")
+    if resources["gpu_name"]:
+        click.echo(
+            f"    GPU: {_res('gpu_name')} "
+            f"({_res('vram_total_gb')} GB VRAM, "
+            f"{_res('vram_free_gb')} GB free)"
+        )
+    else:
+        click.echo("    GPU: no GPU detected (CPU-only)")
+    click.echo(f"    Budget: {rec['budget_gb']:.1f} GB")
+    click.echo(
+        f"    Recommended worker: {rec['worker']['model']} "
+        f"({rec['worker']['reason']})"
+    )
+    click.echo(
+        f"    Recommended embed:  {rec['embed']['model']} "
+        f"({rec['embed']['reason']})"
+    )
+    click.echo(f"    Suggested num_ctx: {rec['suggested_num_ctx']}")
+
+    # Local LLM load test
+    if cfg.local_llm.enabled:
+        click.echo()
+        click.echo("[i] Local LLM load test:")
+        try:
+            from concurrent.futures import (
+                ThreadPoolExecutor,
+            )
+            from concurrent.futures import (
+                TimeoutError as FuturesTimeoutError,
+            )
+
+            from server.ollama_client import make_llm_client
+
+            def _test_generate():
+                client = make_llm_client(cfg.local_llm)
+                client.generate("ok")
+                return True
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_test_generate)
+                future.result(timeout=30)
+            model_name = cfg.local_llm.model or "(default)"
+            click.echo(f"    [✓] local model {model_name} loads")
+        except FuturesTimeoutError:
+            model_name = cfg.local_llm.model or "(default)"
+            click.echo(
+                f"    [!] local model {model_name} "
+                "FAILED to load: timed out after 30s"
+            )
+        except Exception as e:
+            model_name = cfg.local_llm.model or "(default)"
+            click.echo(
+                f"    [!] local model {model_name} FAILED to load: {e}"
+            )
+    else:
+        click.echo("    [i] local LLM disabled (indexing/search work without it)")
+
     # Ollama check (only if embeddings+llm are enabled)
     if cfg.embeddings_enabled and cfg.local_llm.enabled and cfg.local_llm.backend == "ollama":
         try:
@@ -1851,8 +1929,58 @@ def token_history(limit: int):
 def suggest_local(query: str):
     """Show whether a query looks simple enough for local model handling."""
     from core.config import load_config
+    from core.resources import (
+        get_system_resources,
+        list_installed_ollama_models,
+        recommend_local_models,
+    )
 
     cfg = load_config()
+
+    click.echo("== System Resources ==")
+    resources = get_system_resources()
+
+    def _res(key):
+        return resources[key]
+
+    click.echo(
+        f"  RAM: {_res('ram_total_gb')} GB total, "
+        f"{_res('ram_available_gb')} GB available"
+    )
+    click.echo(f"  CPU: {_res('cpu_count')} cores")
+    if resources["gpu_name"]:
+        click.echo(
+            f"  GPU: {_res('gpu_name')} "
+            f"({_res('vram_total_gb')} GB VRAM, "
+            f"{_res('vram_free_gb')} GB free)"
+        )
+    else:
+        click.echo("  GPU: no GPU detected (CPU-only)")
+    click.echo()
+
+    installed = list_installed_ollama_models()
+    rec = recommend_local_models(resources, installed)
+    click.echo("== Local Model Recommendations ==")
+    click.echo(
+        f"  Budget: {rec['budget_gb']:.1f} GB "
+        "(available RAM + VRAM - 2 GB headroom)"
+    )
+    click.echo(
+        f"  Worker: {rec['worker']['model']} "
+        f"— {rec['worker']['reason']}"
+    )
+    click.echo(
+        f"  Embed:  {rec['embed']['model']} "
+        f"— {rec['embed']['reason']}"
+    )
+    click.echo(f"  Suggested num_ctx: {rec['suggested_num_ctx']}")
+    if installed:
+        names = ", ".join(m["name"] for m in installed)
+        click.echo(f"  Installed models: {names}")
+    else:
+        click.echo("  No installed models detected via `ollama list`")
+    click.echo()
+
     if cfg.routing.mode == "cloud_only":
         click.echo("Routing mode is 'cloud_only'. All queries go to cloud.")
         click.echo("Change routing.mode in config to enable local suggestions.")
