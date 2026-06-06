@@ -128,8 +128,6 @@ class TestInitCommand:
 
     def test_init_no_index_flag(self, tmp_path):
         """Test init --no-index writes config without indexing."""
-        import tempfile
-
         runner = CliRunner()
         with runner.isolated_filesystem(temp_dir=tmp_path):
             # Initialize git repo
@@ -165,9 +163,6 @@ class TestInitCommand:
             assert gitignore_file.exists()
 
             # Should NOT have indexed (no chroma yet)
-            chroma_file = Path(".cairn") / "chroma" / "index.bin"
-            # chroma might not create a simple index.bin, but let's check the directory
-            # was created (that's expected even without indexing due to preflight checks)
 
     def test_init_idempotent(self, tmp_path):
         """Test that running init twice without --force is idempotent."""
@@ -197,7 +192,6 @@ class TestInitCommand:
 
             config_file = Path(".cairn") / "config.yaml"
             assert config_file.exists()
-            first_content = config_file.read_text()
 
             # Second init (should not error)
             result2 = runner.invoke(main, ["init", "--no-index"])
@@ -335,7 +329,6 @@ class TestInitCommand:
 
             opencode_file = Path("opencode.json")
             assert opencode_file.exists()
-            data1 = json.loads(opencode_file.read_text())
 
             # Second init
             result2 = runner.invoke(main, ["init", "--no-index"])
@@ -361,9 +354,6 @@ class TestInitCommand:
     def test_mcp_command_safe_without_sdk(self):
         """Test that mcp command has safe error handling for missing SDK."""
         # Read the source code to verify try/except is in place
-        import inspect
-
-        # Import the raw mcp callback function by reading the file
         with open("cli/main.py") as f:
             source = f.read()
 
@@ -382,3 +372,90 @@ class TestInitCommand:
         assert "MCP SDK not installed" in mcp_source
         assert "pip install mcp" in mcp_source
         assert "sys.exit(1)" in mcp_source
+
+
+class TestDebugOption:
+    """Test that --debug flag works on subcommands (not just root group)."""
+
+    def test_search_shows_debug_in_help(self):
+        """search --help should list --debug option."""
+        runner = CliRunner()
+        result = runner.invoke(main, ["search", "--help"])
+        assert result.exit_code == 0
+        assert "--debug" in result.output
+
+    def test_dry_run_shows_debug_in_help(self):
+        """dry-run --help should list --debug option."""
+        runner = CliRunner()
+        result = runner.invoke(main, ["dry-run", "--help"])
+        assert result.exit_code == 0
+        assert "--debug" in result.output
+
+    def test_reindex_shows_debug_in_help(self):
+        """reindex --help should list --debug option."""
+        runner = CliRunner()
+        result = runner.invoke(main, ["reindex", "--help"])
+        assert result.exit_code == 0
+        assert "--debug" in result.output
+
+    def test_status_shows_debug_in_help(self):
+        """status --help should list --debug option."""
+        runner = CliRunner()
+        result = runner.invoke(main, ["status", "--help"])
+        assert result.exit_code == 0
+        assert "--debug" in result.output
+
+    def test_mcp_shows_debug_in_help(self):
+        """mcp --help should list --debug option."""
+        runner = CliRunner()
+        result = runner.invoke(main, ["mcp", "--help"])
+        assert result.exit_code == 0
+        assert "--debug" in result.output
+
+    def test_search_invoked_with_debug_after_subcommand(self):
+        """Invoking search with --debug after the subcommand should not error."""
+        import subprocess as sp
+
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            sp.run(["git", "init"], check=True, capture_output=True)
+            sp.run(
+                ["git", "config", "user.email", "test@test.com"],
+                check=True,
+                capture_output=True,
+            )
+            sp.run(
+                ["git", "config", "user.name", "Test User"],
+                check=True,
+                capture_output=True,
+            )
+            Path("main.py").write_text("def main(): pass")
+
+            result = runner.invoke(main, ["search", "test", "--debug"])
+            # Should NOT contain a parse error about --debug
+            assert "No such option" not in result.output, (
+                f"Unexpected error: {result.output}"
+            )
+
+    def test_debug_calls_configure_logging_with_true(self):
+        """--debug after subcommand should call configure_logging(debug=True)."""
+        import subprocess as sp
+
+        runner = CliRunner()
+        with runner.isolated_filesystem():
+            sp.run(["git", "init"], check=True, capture_output=True)
+            sp.run(
+                ["git", "config", "user.email", "test@test.com"],
+                check=True,
+                capture_output=True,
+            )
+            sp.run(
+                ["git", "config", "user.name", "Test User"],
+                check=True,
+                capture_output=True,
+            )
+            Path("main.py").write_text("def main(): pass")
+
+            with patch("cli.main.configure_logging") as mock_logging:
+                runner.invoke(main, ["search", "test", "--debug"])
+                mock_logging.assert_any_call(debug=True)

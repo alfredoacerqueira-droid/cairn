@@ -21,6 +21,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def debug_option(f):
+    """Decorator that adds a --debug flag to enable debug logging on a subcommand.
+
+    Works alongside the root group's --debug option: both ``cairn --debug search q``
+    and ``cairn search q --debug`` will enable debug logging.
+    """
+    def _debug_callback(ctx, param, value):
+        if value:
+            configure_logging(debug=True)
+        return value
+
+    return click.option(
+        "--debug",
+        is_flag=True,
+        default=False,
+        help="Enable debug logging (or CAIRN_DEBUG=1)",
+        callback=_debug_callback,
+        expose_value=False,
+    )(f)
+
+
 def _detect_workspace_siblings(project_path: Path) -> list[Path]:
     """Detect if project is in a workspace by finding sibling git repos.
 
@@ -680,6 +701,7 @@ def profile(name: str | None):
 
 
 @main.command()
+@debug_option
 def status():
     """Check indexing status and DB freshness."""
     from core.freshness import DBFreshness
@@ -1370,6 +1392,7 @@ def _print_status(cfg):
 @main.command()
 @click.argument("query")
 @click.option("-k", "--top-k", default=5, help="Number of results")
+@debug_option
 def search(query: str, top_k: int):
     """Search the indexed codebase semantically.
 
@@ -1435,6 +1458,7 @@ def search(query: str, top_k: int):
 
 @main.command()
 @click.option("--mode", type=click.Choice(["quick", "full"]), default="quick")
+@debug_option
 def reindex(mode: str):
     """Re-index the current project."""
     import time as _time
@@ -1865,6 +1889,7 @@ def suggest_local(query: str):
 @click.argument("query")
 @click.option("-k", "--top-k", default=5, help="Number of results")
 @click.option("--show-prompt", is_flag=True, help="Show full assembled prompt")
+@debug_option
 def dry_run(query: str, top_k: int, show_prompt: bool):
     """Show what would be sent to the cloud model without actually sending."""
     from server.context_assembler import ContextAssembler
@@ -2203,6 +2228,7 @@ def _sparkline(values: list[float]) -> str:
 
 
 @main.command()
+@debug_option
 def mcp():
     """Run as an MCP server (for Claude Code / OpenCode)."""
     # Import inside function to avoid loading mcp at CLI startup

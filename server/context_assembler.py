@@ -141,7 +141,6 @@ class ContextAssembler:
             emb = EmbeddingRetriever(self.store, cache=self.cache)
 
         bm25 = BM25Retriever()
-        ast_rank = ASTRankRetriever()
 
         start = time.perf_counter()
         bm25_items, ast_items = self._load_function_texts()
@@ -149,7 +148,12 @@ class ContextAssembler:
         logger.debug("Loaded %d indexed blocks in %.1fms", len(bm25_items), load_elapsed)
 
         bm25.index(bm25_items)
-        ast_rank.index(ast_items, repo_map=self.repo.load_repo_map())
+
+        if self._retrieval_mode == "ast":
+            ast_rank = ASTRankRetriever()
+            ast_rank.index(ast_items, repo_map=self.repo.load_repo_map())
+        else:
+            ast_rank = None
 
         # Choose reranker by config. cross_encoder=FlashRank (CPU, ms, default);
         # llm=local-model scoring (opt-in, slow); none=disabled.
