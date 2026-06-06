@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -224,6 +223,60 @@ def test_lance_store_delete_file(lance_dir: Path, embedder: FakeEmbedder) -> Non
     blocks_left = list(store.iter_blocks())
     assert len(blocks_left) == 1
     assert blocks_left[0]["filepath"] == "other.py"
+
+
+def test_lance_store_delete_file_predicate_injection_safe(
+    lance_dir: Path, embedder: FakeEmbedder
+) -> None:
+    """Test delete_file is safe against SQL injection via single quotes."""
+    from pipeline.store.base import Block
+    from pipeline.store.lance_store import LanceStore
+
+    store = LanceStore(lance_dir, embedder)
+
+    # Create blocks with special characters in filepath
+    blocks = [
+        Block(
+            id="app/o'brien.py:func_a:10",
+            filepath="app/o'brien.py",
+            function="func_a",
+            code="def func_a(): pass",
+            line_start=10,
+            line_end=11,
+        ),
+        Block(
+            id="normal.py:func_b:20",
+            filepath="normal.py",
+            function="func_b",
+            code="def func_b(): pass",
+            line_start=20,
+            line_end=21,
+        ),
+    ]
+    store.upsert_blocks(blocks)
+
+    assert store.count() == 2
+
+    # Delete file with single quote in name (should not raise and should delete only that file)
+    result = store.delete_file("app/o'brien.py")
+
+    # Should succeed (return value is 1 to indicate success)
+    assert result == 1
+
+    # Check that only the normal.py block remains
+    blocks_left = list(store.iter_blocks())
+    assert len(blocks_left) == 1
+    assert blocks_left[0]["filepath"] == "normal.py"
+
+    # Test that injection-like strings don't crash and delete nothing
+    result = store.delete_file("nonexistent'; --")
+    assert result == 1  # Returns 1 even if no rows deleted
+
+    # Count should still be 1
+    assert store.count() == 1
+    blocks_left = list(store.iter_blocks())
+    assert len(blocks_left) == 1
+    assert blocks_left[0]["filepath"] == "normal.py"
 
 
 def test_lance_store_hybrid_search(

@@ -304,13 +304,15 @@ cairn reindex --mode full  # Must rebuild to switch embedding strategy
 cairn search "how does authentication work" -k 5
 ```
 
-### 6.2 Assemble Full Context
+### 6.2 Preview Full Assembled Context
+
+To see what would be sent to the cloud model (search results + repo map + memory + token compression):
 
 ```bash
-cairn assemble_context "how does auth work"
+cairn dry-run "how does auth work" --show-prompt
 ```
 
-Shows search results + repo map + memory + token estimate.
+Omit `--show-prompt` to just see token savings without the full prompt.
 
 ---
 
@@ -348,11 +350,12 @@ Cairn automatically scaffolds MCP configs at init. Both agents can now use it as
 
 ```json
 {
+  "$schema": "https://opencode.ai/config.json",
   "mcp": {
     "cairn": {
       "type": "local",
-      "command": "cairn",
-      "args": ["mcp"],
+      "command": ["/path/to/cairn", "mcp"],
+      "enabled": true,
       "env": { "CAIRN_PROJECT": "/absolute/path/to/your/project" }
     }
   }
@@ -365,7 +368,7 @@ Cairn automatically scaffolds MCP configs at init. Both agents can now use it as
 {
   "mcpServers": {
     "cairn": {
-      "command": "cairn",
+      "command": "/path/to/cairn",
       "args": ["mcp"],
       "env": { "CAIRN_PROJECT": "/absolute/path/to/your/project" }
     }

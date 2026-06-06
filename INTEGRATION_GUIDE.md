@@ -34,11 +34,12 @@ Both contain Cairn's MCP entry (auto-written by `init`):
 **OpenCode (`opencode.json`):**
 ```json
 {
+  "$schema": "https://opencode.ai/config.json",
   "mcp": {
     "cairn": {
       "type": "local",
-      "command": "cairn",
-      "args": ["mcp"],
+      "command": ["/path/to/cairn", "mcp"],
+      "enabled": true,
       "env": { "CAIRN_PROJECT": "/absolute/path/to/your/project" }
     }
   }
@@ -50,7 +51,7 @@ Both contain Cairn's MCP entry (auto-written by `init`):
 {
   "mcpServers": {
     "cairn": {
-      "command": "cairn",
+      "command": "/path/to/cairn",
       "args": ["mcp"],
       "env": { "CAIRN_PROJECT": "/absolute/path/to/your/project" }
     }
@@ -88,7 +89,7 @@ When agents need context, they call Cairn's MCP tools:
 {
   "mcpServers": {
     "cairn": {
-      "command": "cairn",
+      "command": "/path/to/cairn",
       "args": ["mcp"],
       "env": { "CAIRN_PROJECT": "/absolute/path/to/your/project" }
     }
@@ -161,7 +162,7 @@ indexing:
 
 4. **See the assembled context:**
    ```bash
-   cairn assemble_context "your query"
+   cairn dry-run "your query" --show-prompt
    ```
 
 ---
@@ -188,7 +189,7 @@ cairn mcp
 Check the rerank confidence threshold:
 
 ```bash
-cairn assemble_context "your query"
+cairn dry-run "your query" --show-prompt
 ```
 
 If you're getting "No confident matches" but `search_code` found things, Cairn determined the results were off-topic. Adjust the threshold:
