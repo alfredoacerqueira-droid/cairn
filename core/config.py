@@ -117,6 +117,7 @@ class MemoryConfig(BaseModel):
     max_entries: int = 50
     compaction_model: str = "qwen2.5-coder:1.5b"
     period_minutes: int = 5
+    scope: str = "auto"  # "auto" | "both" | "workspace" | "repo"
 
 
 class RoutingConfig(BaseModel):

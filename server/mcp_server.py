@@ -41,10 +41,14 @@ _semantic_caches: dict[Path, SemanticCache] = {}
 def _classify_binding() -> tuple[str, Path | None, str | None]:
     """Classify CAIRN_PROJECT/GATEWAY_PROJECT as SINGLE, WORKSPACE, or UNBOUND.
 
+    Robustly handles the case where a path has both .cairn/ (could be SINGLE)
+    AND indexed child repos (WORKSPACE). Prefers WORKSPACE when >=2 child repos
+    are discovered, to better support multi-repo workspaces.
+
     Returns:
         (mode, path, error) where:
-          - SINGLE: path has .cairn/, error is None
-          - WORKSPACE: path has no .cairn/ but children do, error is None
+          - SINGLE: path has .cairn/ and no indexed children, error is None
+          - WORKSPACE: path has >=2 indexed child repos (even if root has .cairn/), error is None
           - UNBOUND: path is None, error is an explanatory message
     """
     env_path = os.getenv("CAIRN_PROJECT") or os.getenv("GATEWAY_PROJECT")
@@ -62,13 +66,17 @@ def _classify_binding() -> tuple[str, Path | None, str | None]:
     if not path.exists():
         return "UNBOUND", None, f"CAIRN_PROJECT path does not exist: {env_path}"
 
+    # Check for WORKSPACE mode first: this path has >=2 indexed children
+    discovered = WorkspaceRouter.discover_repos(path)
+    if len(discovered) >= 2:
+        return "WORKSPACE", path, None
+
     # Check for SINGLE mode: this path itself has .cairn/
     cairn_dir = path / ".cairn"
     if cairn_dir.exists():
         return "SINGLE", path, None
 
-    # Check for WORKSPACE mode: this path has children with .cairn/
-    discovered = WorkspaceRouter.discover_repos(path)
+    # Check for WORKSPACE mode with 1 child (edge case: single repo in a folder)
     if discovered:
         return "WORKSPACE", path, None
 
@@ -605,6 +613,96 @@ def list_repos() -> str:
 
     except Exception as e:
         return f"Error listing repos: {str(e)}"
+
+
+@mcp.tool(description="Record a durable note to Cairn memory for this session")
+def remember(note: str) -> str:
+    """Record a durable note to Cairn memory (continuous memory across the workspace/repo).
+
+    In WORKSPACE mode, writes to the workspace-level memory at <workspace>/.cairn/memory.md.
+    In SINGLE mode, writes to the repo-level memory at <repo>/.cairn/memory.md.
+    These notes persist across sessions and can be recalled with the recall() tool.
+
+    Args:
+        note: The memory note to record.
+
+    Returns:
+        Confirmation message indicating where the note was stored.
+    """
+    try:
+        if _BIND_ERROR is not None:
+            return _BIND_ERROR
+
+        if _router is not None:
+            # WORKSPACE mode: write to workspace memory
+            _router.write_memory(note)
+            return "remembered (workspace)"
+        else:
+            # SINGLE mode: write to repo memory
+            if _PROJECT_PATH is None:
+                return (
+                    "Cairn MCP server has no bound project. Set CAIRN_PROJECT to an "
+                    "indexed repo (a dir containing .cairn/)."
+                )
+            from core.repo import RepoManager
+
+            repo = RepoManager(_PROJECT_PATH)
+            repo.append_memory(note)
+            return f"remembered (repo: {_PROJECT_PATH.name})"
+    except Exception as e:
+        return f"Memory write error: {str(e)}"
+
+
+@mcp.tool(description="Recall recent Cairn memory (workspace + per-repo per memory.scope)")
+def recall(max_entries: int = 10) -> str:
+    """Recall recent Cairn memory entries.
+
+    In WORKSPACE mode, returns memory entries according to memory.scope config:
+      - 'workspace': workspace memory only
+      - 'repo': per-repo memories across all repos
+      - 'both' (default): workspace memory + per-repo memories
+    In SINGLE mode, returns the bound repo's memory.
+
+    Args:
+        max_entries: Maximum number of memory entries to recall (hint, not strict).
+
+    Returns:
+        Recent memory entries formatted with headers, or empty string if no memory.
+    """
+    try:
+        if _BIND_ERROR is not None:
+            return _BIND_ERROR
+
+        if _router is not None:
+            # WORKSPACE mode: read per scope, with token cap
+            from core.config import load_config
+
+            if _router.repo_paths:
+                cfg = load_config(_router.repo_paths[0])
+            else:
+                cfg = load_config(_router.workspace_root)
+            result = _router.read_memory(max_tokens=cfg.budget.tool_max_tokens)
+            return _emit(result, cfg) if result else ""
+        else:
+            # SINGLE mode: read repo memory
+            if _PROJECT_PATH is None:
+                return (
+                    "Cairn MCP server has no bound project. Set CAIRN_PROJECT to an "
+                    "indexed repo (a dir containing .cairn/)."
+                )
+            from core.config import load_config
+            from core.repo import RepoManager
+
+            cfg = load_config(_PROJECT_PATH)
+            repo = RepoManager(_PROJECT_PATH)
+            result = repo.load_memory(
+                last_n=max_entries, max_tokens=cfg.budget.tool_max_tokens
+            )
+            if result:
+                result = f"## Repo memory\n{result}"
+            return _emit(result, cfg) if result else ""
+    except Exception as e:
+        return f"Memory recall error: {str(e)}"
 
 
 def run_stdio() -> None:

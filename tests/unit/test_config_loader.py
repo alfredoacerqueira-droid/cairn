@@ -317,3 +317,65 @@ class TestConfigLoader:
         loaded = load_config(tmp_path)
         assert loaded.cache.ttl_seconds == 300
         assert loaded.cache.semantic_ttl_seconds == 1800  # default
+
+    def test_memory_config_default_scope(self):
+        """Test MemoryConfig scope defaults to 'auto'."""
+        from core.config import MemoryConfig
+
+        config = MemoryConfig()
+        assert config.scope == "auto"
+
+    def test_memory_config_custom_scope(self):
+        """Test MemoryConfig can set custom scope."""
+        from core.config import MemoryConfig
+
+        config = MemoryConfig(scope="both")
+        assert config.scope == "both"
+
+        config = MemoryConfig(scope="workspace")
+        assert config.scope == "workspace"
+
+        config = MemoryConfig(scope="repo")
+        assert config.scope == "repo"
+
+    def test_memory_config_roundtrip_scope(self, tmp_path):
+        """Test memory scope survives save/load cycle."""
+        import yaml
+
+        config_dir = tmp_path / ".cairn"
+        config_dir.mkdir(parents=True)
+        config_file = config_dir / "config.yaml"
+
+        custom_config = {
+            "memory": {
+                "trigger": "manual",
+                "max_entries": 50,
+                "scope": "workspace",
+            }
+        }
+        config_file.write_text(yaml.dump(custom_config))
+
+        loaded = load_config(tmp_path)
+        assert loaded.memory.scope == "workspace"
+
+    def test_old_memory_config_without_scope_loads_default(self, tmp_path):
+        """Test backward compat: old memory config without scope loads 'auto' default."""
+        import yaml
+
+        config_dir = tmp_path / ".cairn"
+        config_dir.mkdir(parents=True)
+        config_file = config_dir / "config.yaml"
+
+        old_config = {
+            "memory": {
+                "trigger": "manual",
+                "max_entries": 50,
+                "compaction_model": "qwen2.5-coder:1.5b",
+            }
+        }
+        config_file.write_text(yaml.dump(old_config))
+
+        loaded = load_config(tmp_path)
+        assert loaded.memory.scope == "auto"
+        assert loaded.memory.trigger == "manual"
+        assert loaded.memory.max_entries == 50
