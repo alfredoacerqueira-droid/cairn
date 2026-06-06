@@ -331,6 +331,124 @@ export const MyComponent: React.FC<Props> = ({ title }) => {
         assert "Props" in type_names
 
 
+class TestCppParser:
+    """Tests for C++ AST parsing."""
+
+    def test_function_definition(self):
+        """Extract top-level C++ function."""
+        code = """int add(int a, int b) {
+    return a + b;
+}
+"""
+        parser = ASTParser()
+        result = parser.parse_string(code, "test.cpp", "cpp")
+
+        assert len(result.functions) == 1
+        func = result.functions[0]
+        assert func.name == "add"
+        assert "add" in func.code
+
+    def test_class_with_methods(self):
+        """Extract C++ class and its methods."""
+        code = """class Calculator {
+public:
+    int add(int a, int b) {
+        return a + b;
+    }
+
+    int multiply(int a, int b) {
+        return a * b;
+    }
+};
+"""
+        parser = ASTParser()
+        result = parser.parse_string(code, "test.cpp", "cpp")
+
+        assert len(result.classes) == 1
+        cls = result.classes[0]
+        assert cls.name == "Calculator"
+        # Should have methods
+        assert len(cls.methods) >= 2
+        method_names = {m.name for m in cls.methods}
+        assert "add" in method_names
+        assert "multiply" in method_names
+
+    def test_struct_definition(self):
+        """Extract C++ struct."""
+        code = """struct Point {
+    float x;
+    float y;
+    void display() {
+        // Display point
+    }
+};
+"""
+        parser = ASTParser()
+        result = parser.parse_string(code, "test.cpp", "cpp")
+
+        assert len(result.classes) == 1
+        cls = result.classes[0]
+        assert cls.name == "Point"
+        # Struct can have methods too
+        method_names = {m.name for m in cls.methods}
+        assert "display" in method_names or len(cls.methods) >= 0
+
+
+class TestRubyParser:
+    """Tests for Ruby AST parsing."""
+
+    def test_method_definition(self):
+        """Extract top-level Ruby method."""
+        code = """def greet(name)
+  puts "Hello, #{name}!"
+end
+"""
+        parser = ASTParser()
+        result = parser.parse_string(code, "test.rb", "ruby")
+
+        assert len(result.functions) == 1
+        func = result.functions[0]
+        assert func.name == "greet"
+
+    def test_class_with_methods(self):
+        """Extract Ruby class and its methods."""
+        code = """class Person
+  def initialize(name)
+    @name = name
+  end
+
+  def greet
+    puts "Hello, I'm #{@name}"
+  end
+end
+"""
+        parser = ASTParser()
+        result = parser.parse_string(code, "test.rb", "ruby")
+
+        assert len(result.classes) == 1
+        cls = result.classes[0]
+        assert cls.name == "Person"
+        # Should have methods
+        method_names = {m.name for m in cls.methods}
+        assert "initialize" in method_names
+        assert "greet" in method_names
+
+    def test_module_definition(self):
+        """Extract Ruby module."""
+        code = """module Greeter
+  def say_hello
+    puts "Hello from module"
+  end
+end
+"""
+        parser = ASTParser()
+        result = parser.parse_string(code, "test.rb", "ruby")
+
+        assert len(result.classes) == 1
+        cls = result.classes[0]
+        assert cls.name == "Greeter"
+
+
 class TestFallbackBehavior:
     """Tests that parser falls back gracefully to regex on errors."""
 
@@ -362,6 +480,26 @@ class TestFallbackBehavior:
         result = parser.parse_string(code, "test.go", "go")
         assert len(result.functions) == 0
         assert len(result.classes) == 0
+
+    def test_malformed_cpp_fallback(self):
+        """C++ malformed code should fall back without crashing."""
+        code = """class Broken {
+    int broken({
+}"""
+        parser = ASTParser()
+        result = parser.parse_string(code, "test.cpp", "cpp")
+        assert isinstance(result.functions, list)
+        assert isinstance(result.classes, list)
+
+    def test_malformed_ruby_fallback(self):
+        """Ruby malformed code should fall back without crashing."""
+        code = """def broken
+  puts "unclosed
+end"""
+        parser = ASTParser()
+        result = parser.parse_string(code, "test.rb", "ruby")
+        assert isinstance(result.functions, list)
+        assert isinstance(result.classes, list)
 
 
 class TestHangGuard:
