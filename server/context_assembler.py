@@ -543,7 +543,7 @@ class ContextAssembler:
                 stats["reduction_pct"],
             )
             # Mark as already-compressed so proxy doesn't re-compress
-            marker = "# [already-compressed-by-gateway]\n"
+            marker = "# [already-compressed]\n"
             return marker + result
         except Exception as e:
             logger.warning("Compression failed, returning unmodified: %s", e)
@@ -644,8 +644,8 @@ class ContextAssembler:
 ## Repository Structure
 {map_text}
 
-## Recent Changes
-{memory if memory else '*No recent changes recorded.*'}"""
+## Memory
+{memory if memory else '*No memory recorded.*'}"""
 
         raw_tokens = count_tokens(prompt)
         logger.debug("Assembled context: %d functions, %d tokens (raw)", len(functions), raw_tokens)

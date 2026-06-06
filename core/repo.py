@@ -592,46 +592,63 @@ class RepoManager:
         self.ensure_directories()
         self.get_repo_map_path().write_text(json.dumps(data, indent=2))
 
+    def _memory_caps(self) -> dict:
+        """Get the configured memory section caps.
+
+        Reads from config if available, falls back to DEFAULT_CAPS on any error.
+
+        Returns:
+            Dict mapping section keys (tasks, decisions, conventions, changes, prompts)
+            to their max entry counts.
+        """
+        try:
+            from core.config import load_config
+            from core.memory_doc import DEFAULT_CAPS
+
+            cfg = load_config(self.repo_path)
+            return {
+                "tasks": cfg.memory.max_tasks,
+                "decisions": cfg.memory.max_decisions,
+                "conventions": cfg.memory.max_conventions,
+                "changes": cfg.memory.max_changes,
+                "prompts": cfg.memory.max_prompts,
+            }
+        except Exception:
+            from core.memory_doc import DEFAULT_CAPS
+
+            return DEFAULT_CAPS
+
     def load_memory(self, last_n: int = 10, max_tokens: int | None = None) -> str:
+        """Load memory from the sectioned memory document.
+
+        Returns the structured, sectioned memory document text. If max_tokens is set,
+        the result is trimmed to fit within the budget while preserving Open Tasks,
+        Decisions, and Conventions in full.
+
+        Args:
+            last_n: Kept for signature compatibility (the token budget is the real trim).
+            max_tokens: Optional token budget for the returned memory string.
+
+        Returns:
+            Rendered memory document (structured markdown) or empty string if no memory.
+        """
+        from core.memory_doc import MemoryDoc
+
         path = self.get_memory_path()
-        if not path.exists():
-            return ""
-        text = path.read_text()
-        lines = text.split("\n")
-        result = "\n".join(lines[-last_n:])
+        doc = MemoryDoc.load(path, caps=self._memory_caps())
+        return doc.read(max_tokens=max_tokens)
 
-        # If max_tokens is specified, trim to fit within budget
-        if max_tokens is not None:
-            from core.tokens import count_tokens, truncate_to_tokens
+    def append_memory(self, entry: str, kind: str = "change"):
+        """Append an entry to the sectioned memory document.
 
-            if count_tokens(result) <= max_tokens:
-                return result
-
-            # Entry format: lines starting with "[YYYY-MM-DD" are timestamped entries.
-            # Split on timestamp markers and drop oldest entries first.
-            import re
-
-            entries = re.split(r"(?=\n\[)", result)
-            # Entries may start with newline; clean up
-            entries = [e.lstrip("\n") for e in entries if e.strip()]
-
-            # Keep dropping oldest (first) entries until we fit the budget
-            for i in range(len(entries)):
-                trimmed = "\n".join(entries[i:])
-                if count_tokens(trimmed) <= max_tokens:
-                    return trimmed
-
-            # If even a single newest entry exceeds the budget, hard-truncate it
-            if entries:
-                return truncate_to_tokens(entries[-1], max_tokens)
-            return ""
-
-        return result
-
-    def append_memory(self, entry: str):
-        from datetime import datetime
+        Args:
+            entry: The entry text to add.
+            kind: Entry kind: 'task', 'decision', 'convention', 'change', or 'prompt'.
+                  Unknown kinds default to 'change'.
+        """
+        from core.memory_doc import MemoryDoc
 
         self.ensure_directories()
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        with open(self.get_memory_path(), "a") as f:
-            f.write(f"\n[{timestamp}] {entry}")
+        doc = MemoryDoc.load(self.get_memory_path(), caps=self._memory_caps())
+        doc.add(kind, entry)
+        doc.save(self.get_memory_path())

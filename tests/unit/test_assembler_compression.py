@@ -62,7 +62,7 @@ class TestAssemblerCompression:
 
             # Result should:
             # 1. Be compressed (have the compression marker)
-            assert "[already-compressed-by-gateway]" in result
+            assert "[already-compressed]" in result
 
             # 2. Still contain content (not empty after compression)
             assert "test.py" in result or "Codebase Context" in result
@@ -212,7 +212,7 @@ class TestAssemblerCompression:
                 ]
             )
             result1 = assembler1.assemble_context("query1")
-            assert "[already-compressed-by-gateway]" in result1
+            assert "[already-compressed]" in result1
 
             # Second instance: should hit persistent cache (no search needed)
             assembler2 = ContextAssembler(project_path=project_path)

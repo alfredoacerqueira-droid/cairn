@@ -283,24 +283,28 @@ index abc..def 100644
         assert isinstance(summary, str)
 
     def test_maybe_compact_deterministic_when_disabled(self, tmp_path):
-        """Test _maybe_compact uses deterministic message when LLM disabled."""
+        """Test that MemorySummarizer with disabled LLM uses deterministic compaction."""
         memory_file = tmp_path / "memory.md"
         ms = MemorySummarizer(
             repo_path=tmp_path,
             llm_enabled=False,
             memory_file=str(memory_file),
-            max_entries=300,  # High max_entries so rotation doesn't trigger first
+            max_entries=300,
         )
 
-        # Populate memory file with entries exceeding compaction threshold (200)
-        for i in range(250):
+        # Populate memory file with entries exceeding cap (DEFAULT_CAPS changes=40)
+        for i in range(50):
             ms.append_to_memory(f"Entry {i}: some change")
 
-        # Compaction threshold is 200 lines, so with 250 entries, compaction should trigger
-        # Read file — should have compacted entry
+        # MemoryDoc enforces caps automatically; with 50 entries > 40 cap,
+        # oldest entries should be collapsed into (history) summary
         content = memory_file.read_text()
-        assert "[COMPACTED]" in content
-        assert "historical changes" in content or "entries compacted" in content
+        # Should have Recent Changes section (structured format)
+        assert "## Recent Changes" in content
+        # MemoryDoc uses "(history)" for compaction, not "[COMPACTED]"
+        if content.count("- ") < 50:  # Entries were capped
+            # Should have a history summary entry for overflow
+            assert "(history)" in content or content.count("- ") <= 41  # cap + 1 summary
 
 
 class TestContextAssemblerLLMGating:

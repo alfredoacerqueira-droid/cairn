@@ -616,7 +616,7 @@ def list_repos() -> str:
 
 
 @mcp.tool(description="Record a durable note to Cairn memory for this session")
-def remember(note: str) -> str:
+def remember(note: str, kind: str = "change") -> str:
     """Record a durable note to Cairn memory (continuous memory across the workspace/repo).
 
     In WORKSPACE mode, writes to the workspace-level memory at <workspace>/.cairn/memory.md.
@@ -625,18 +625,27 @@ def remember(note: str) -> str:
 
     Args:
         note: The memory note to record.
+        kind: Entry kind: 'task', 'decision', 'convention', 'change' (default), or 'prompt'.
+              Unknown kinds default to 'change'. Each kind is stored in its own section.
 
     Returns:
-        Confirmation message indicating where the note was stored.
+        Confirmation message indicating where the note was stored and which section.
     """
     try:
         if _BIND_ERROR is not None:
             return _BIND_ERROR
 
+        # Normalize kind: map 'note' to 'change' for backward compatibility
+        if kind == "note":
+            kind = "change"
+        # Validate kind and default unknown to 'change'
+        if kind not in ("task", "decision", "convention", "change", "prompt"):
+            kind = "change"
+
         if _router is not None:
             # WORKSPACE mode: write to workspace memory
-            _router.write_memory(note)
-            return "remembered (workspace)"
+            _router.write_memory(note, kind=kind)
+            return f"remembered ({kind}, workspace)"
         else:
             # SINGLE mode: write to repo memory
             if _PROJECT_PATH is None:
@@ -647,8 +656,8 @@ def remember(note: str) -> str:
             from core.repo import RepoManager
 
             repo = RepoManager(_PROJECT_PATH)
-            repo.append_memory(note)
-            return f"remembered (repo: {_PROJECT_PATH.name})"
+            repo.append_memory(note, kind=kind)
+            return f"remembered ({kind}, repo: {_PROJECT_PATH.name})"
     except Exception as e:
         return f"Memory write error: {str(e)}"
 

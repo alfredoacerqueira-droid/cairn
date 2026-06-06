@@ -118,6 +118,12 @@ class MemoryConfig(BaseModel):
     compaction_model: str = "qwen2.5-coder:1.5b"
     period_minutes: int = 5
     scope: str = "auto"  # "auto" | "both" | "workspace" | "repo"
+    # Per-section caps for sectioned memory document
+    max_tasks: int = 20
+    max_decisions: int = 40
+    max_conventions: int = 40
+    max_changes: int = 40
+    max_prompts: int = 10
 
 
 class RoutingConfig(BaseModel):

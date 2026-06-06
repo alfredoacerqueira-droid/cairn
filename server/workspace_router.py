@@ -520,13 +520,14 @@ class WorkspaceRouter:
             return "both"
         return scope
 
-    def write_memory(self, note: str, scope: str | None = None) -> None:
+    def write_memory(self, note: str, scope: str | None = None, kind: str = "change") -> None:
         """Record a durable note to workspace memory.
 
         Args:
             note: The memory note to append.
             scope: Memory scope override. If None, uses resolve_scope().
                    For simplicity: workspace/both -> workspace memory.
+            kind: Entry kind: 'task', 'decision', 'convention', 'change' (default), or 'prompt'.
         """
         if scope is None:
             scope = self.resolve_scope()
@@ -534,7 +535,7 @@ class WorkspaceRouter:
         # Both 'workspace' and 'both' scopes write to workspace memory
         if scope in ("workspace", "both"):
             workspace_repo = self._get_workspace_repo()
-            workspace_repo.append_memory(note)
+            workspace_repo.append_memory(note, kind=kind)
         elif scope == "repo":
             # Per-repo scope in workspace mode: not clearly bound to a single repo.
             # Log and write to workspace as safe default.
@@ -543,7 +544,7 @@ class WorkspaceRouter:
                 "writing to workspace memory as default"
             )
             workspace_repo = self._get_workspace_repo()
-            workspace_repo.append_memory(note)
+            workspace_repo.append_memory(note, kind=kind)
 
     def read_memory(
         self, max_tokens: int = 4000, scope: str | None = None
