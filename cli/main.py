@@ -11,20 +11,14 @@ from typing import TYPE_CHECKING
 import click
 
 from core.config import Config, load_config
+from core.logging_setup import configure_logging
 from core.profiles import detect_profile, get_profile
 from core.repo import census_extensions, detect_infra_markers
 
 if TYPE_CHECKING:
     from server.ollama_client import OllamaClient
 
-
-def _setup_logging(verbose: bool = False):
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+logger = logging.getLogger(__name__)
 
 
 def _detect_workspace_siblings(project_path: Path) -> list[Path]:
@@ -116,10 +110,10 @@ def _select_worker_model(installed: list[str], free_vram_mib: int | None, curren
 
 
 @click.group()
-@click.option("-v", "--verbose", is_flag=True, help="Enable debug logging")
-def main(verbose: bool):
+@click.option("--debug/--no-debug", default=False, help="Enable debug logging (or CAIRN_DEBUG=1)")
+def main(debug: bool):
     """Cairn - Intelligent context engine for OpenCode."""
-    _setup_logging(verbose)
+    configure_logging(debug=debug)
 
 
 def _run_preflight_checks(skip_ollama: bool = False) -> bool:
@@ -1380,9 +1374,12 @@ def search(query: str, top_k: int):
 
     assembler = ContextAssembler(project_path=Path.cwd(), top_k=top_k)
 
+    logger.debug("Starting semantic search: query='%s', top_k=%d", query, top_k)
     start_time = time.perf_counter()
     results = assembler.semantic_search(query, top_k=top_k, apply_guard=True)
     elapsed_ms = (time.perf_counter() - start_time) * 1000
+
+    logger.debug("Semantic search completed: %d results in %.1fms", len(results), elapsed_ms)
 
     # Record search metrics
     try:

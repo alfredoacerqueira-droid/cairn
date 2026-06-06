@@ -116,12 +116,22 @@ class ContextAssembler:
             return "unknown"
 
     def _get_retriever(self) -> HybridRetriever:
+        import time
+
         commit = self._git_commit()
         if self._retriever is not None and self._retriever_commit == commit:
             return self._retriever
 
         cfg = load_config(self.project_path)
         profile = get_profile(cfg.profile)
+
+        # Log profile and indexing config once at init
+        logger.debug(
+            "Retriever init: profile=%s, embeddings=%s, backend=%s",
+            cfg.profile,
+            cfg.embeddings_enabled and cfg.local_llm.enabled,
+            "chroma",  # Backend is currently hardcoded to chroma
+        )
 
         # Only build embeddings retriever if config, profile, AND local LLM all enable embeddings
         emb = None
@@ -132,7 +142,11 @@ class ContextAssembler:
         bm25 = BM25Retriever()
         ast_rank = ASTRankRetriever()
 
+        start = time.perf_counter()
         bm25_items, ast_items = self._load_function_texts()
+        load_elapsed = (time.perf_counter() - start) * 1000
+        logger.debug("Loaded %d indexed blocks in %.1fms", len(bm25_items), load_elapsed)
+
         bm25.index(bm25_items)
         ast_rank.index(ast_items, repo_map=self.repo.load_repo_map())
 
@@ -252,6 +266,8 @@ class ContextAssembler:
         guard (returns []), so CLI `search` and the MCP `search_code` tool reject
         off-topic queries instead of returning low-confidence noise.
         """
+        import time
+
         if top_k is None:
             top_k = self.top_k
 
@@ -260,8 +276,16 @@ class ContextAssembler:
 
         cached = self.cache.get(*cache_key) if self.cache else None
         if cached is not None:
+            logger.debug("Semantic search cache HIT for query (mode=%s)", self._retrieval_mode)
             results = cached
         else:
+            logger.debug(
+                "Semantic search cache MISS: query='%s' mode=%s top_k=%d",
+                query[:50],
+                self._retrieval_mode,
+                top_k,
+            )
+            start = time.perf_counter()
             if self._retrieval_mode == "embeddings":
                 results = self.store.search(query, top_k=top_k)
                 # Store.search returns real cosine in 'similarity'; mirror
@@ -272,6 +296,8 @@ class ContextAssembler:
                 retriever = self._get_retriever()
                 hybrid_results = retriever.search(query, top_k=top_k, commit=commit)
                 results = self._hybrid_results_to_legacy(hybrid_results)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            logger.debug("Retrieval completed: %d results in %.1fms", len(results), elapsed_ms)
 
             if self.cache:
                 self.cache.set(results, *cache_key)
@@ -305,8 +331,18 @@ class ContextAssembler:
         # Apply the confidence guard so CLI search + MCP search_code reject
         # off-topic queries (not just the assemble path). Cache stores the raw
         # results; the guard is applied on return.
-        if apply_guard and not self._passes_confidence_guard(results):
-            return []
+        if apply_guard:
+            if results and not self._passes_confidence_guard(results):
+                top_score = (
+                    results[0].get("rerank_score", 0.0)
+                    if "rerank_score" in results[0]
+                    else results[0].get("raw_cosine", 0.0)
+                )
+                logger.debug(
+                    "Confidence guard rejected results: top_score=%.3f below threshold",
+                    top_score,
+                )
+                return []
 
         return results
 
@@ -489,6 +525,8 @@ class ContextAssembler:
         return prompt
 
     def assemble_context(self, user_prompt: str) -> str:
+        from core.tokens import count_tokens
+
         commit = self._git_commit()
         cache_key = ("context", user_prompt, commit)
 
@@ -496,20 +534,25 @@ class ContextAssembler:
         if self.persistent_cache:
             cached = self.persistent_cache.get(*cache_key)
             if cached is not None:
-                logger.debug("Persistent cache hit for context query")
+                logger.debug("Persistent cache HIT for context query")
                 return cached
 
         # Fallback to in-memory cache
         if self.cache:
             cached = self.cache.get(*cache_key)
             if cached is not None:
+                logger.debug("Session cache HIT for context query")
                 return cached
+
+        logger.debug("Assembling context for query (cache MISS)")
 
         functions = self.semantic_search(user_prompt)
 
         if not self._passes_confidence_guard(functions):
             # Confidence-guard rejection: do not compress
+            logger.debug("Context assembly: confidence guard rejected results")
             return "*No confident matches found for this query.*"
+
         repo_map = self.get_repo_map()
         memory = self.get_memory()
 
@@ -527,9 +570,21 @@ class ContextAssembler:
 ## Recent Changes
 {memory if memory else '*No recent changes recorded.*'}"""
 
+        raw_tokens = count_tokens(prompt)
+        logger.debug("Assembled context: %d functions, %d tokens (raw)", len(functions), raw_tokens)
+
         # Compress context before caching/returning so all consumers
         # (CLI, MCP, proxy) get the compressed form
         compressed = self._maybe_compress(prompt)
+        compressed_tokens = count_tokens(compressed)
+        if compressed != prompt:
+            reduction = 100 * (1.0 - compressed_tokens / raw_tokens) if raw_tokens > 0 else 0
+            logger.debug(
+                "Context compression: %d → %d tokens (%.1f%% reduction)",
+                raw_tokens,
+                compressed_tokens,
+                reduction,
+            )
 
         # Cache compressed result in both in-memory and persistent
         if self.cache:

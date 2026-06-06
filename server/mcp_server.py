@@ -531,8 +531,17 @@ def run_stdio() -> None:
 
     Resolves the binding mode (SINGLE, WORKSPACE, or UNBOUND) from
     CAIRN_PROJECT/GATEWAY_PROJECT and initializes accordingly.
+
+    Logging is configured to go to stderr or file (NEVER stdout) to preserve
+    the JSON-RPC protocol on stdout.
     """
+    from core.logging_setup import configure_logging
+
     global _PROJECT_PATH, _BIND_ERROR, _router
+
+    # Configure logging (respects CAIRN_DEBUG env var)
+    configure_logging()
+
     mode, path, error = _classify_binding()
 
     if mode == "SINGLE":

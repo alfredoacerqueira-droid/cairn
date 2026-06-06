@@ -60,6 +60,7 @@ markers = [
     "corpus: mark test as requiring test corpus/fixtures",
     "ollama: mark test as requiring Ollama service",
     "eval: mark test as evaluation/benchmark test",
+    "e2e: mark test as end-to-end CLI test (slow, exercises full pipeline)",
 ]
 
 [tool.black]
