@@ -203,7 +203,7 @@ class TestBlocksFromAST:
         assert "Hello" in blocks[0].code
 
     def test_blocks_from_class_with_method(self):
-        """blocks_from_ast extracts class and its method."""
+        """blocks_from_ast extracts class definition and its method."""
         parser = ASTParser()
         ast = parser.parse_string(
             """class Calculator:
@@ -214,14 +214,19 @@ class TestBlocksFromAST:
         )
         blocks = blocks_from_ast(ast)
 
-        # Should have 1 method (classes themselves are not indexed)
-        methods = [b for b in blocks if "." in b.function]
-        assert len(methods) == 1
-        assert methods[0].function == "Calculator.add"
-        assert methods[0].id == f"calc.py:Calculator.add:{methods[0].line_start}"
+        assert len(blocks) == 2
+
+        class_blocks = [b for b in blocks if b.function == "Calculator"]
+        assert len(class_blocks) == 1
+        assert class_blocks[0].id == f"calc.py:Calculator:{class_blocks[0].line_start}"
+
+        method_blocks = [b for b in blocks if "." in b.function]
+        assert len(method_blocks) == 1
+        assert method_blocks[0].function == "Calculator.add"
+        assert method_blocks[0].id == f"calc.py:Calculator.add:{method_blocks[0].line_start}"
 
     def test_blocks_function_and_class(self):
-        """blocks_from_ast extracts both top-level functions and class methods."""
+        """blocks_from_ast extracts top-level functions, class definitions, and class methods."""
         parser = ASTParser()
         ast = parser.parse_string(
             """def outer():
@@ -235,13 +240,14 @@ class MyClass:
         )
         blocks = blocks_from_ast(ast)
 
-        # Should have 1 function + 1 method = 2 blocks
-        assert len(blocks) == 2
+        # Should have 1 function + 1 class definition + 1 method = 3 blocks
+        assert len(blocks) == 3
         funcs = [b for b in blocks if "." not in b.function]
         methods = [b for b in blocks if "." in b.function]
-        assert len(funcs) == 1
+        assert len(funcs) == 2
         assert len(methods) == 1
         assert funcs[0].function == "outer"
+        assert funcs[1].function == "MyClass"
         assert methods[0].function == "MyClass.inner"
 
     def test_block_id_format(self):
