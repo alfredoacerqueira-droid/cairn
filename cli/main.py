@@ -670,6 +670,15 @@ def status():
         click.echo("⚠ Quick re-index recommended")
 
     repo = RepoManager(project_path)
+
+    # Report index location
+    index_location = getattr(cfg.indexing, "index_location", "auto")
+    index_base = repo.index_base_dir(index_location)
+    if index_base == repo.data_dir:
+        click.echo("Index location: in-project (.cairn/)")
+    else:
+        click.echo(f"Index location: native ({index_base})")
+
     try:
         indexer = VectorIndexer(
             chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
@@ -677,55 +686,6 @@ def status():
         click.echo(f"Indexed functions: {indexer.count()}")
     except Exception as e:
         click.echo(f"Indexer: {e}")
-
-
-@main.command()
-@click.option("--host", default="127.0.0.1", help="Host to bind to")
-@click.option("--port", default=8000, help="Port to listen on")
-@click.option("--background", is_flag=True, help="Run server in background (PID file)")
-def serve(host: str, port: int, background: bool):
-    """Start the gateway API server."""
-    import uvicorn
-
-    from server.api import app as gateway_app
-
-    if background:
-        _start_background(host, port)
-        return
-
-    click.echo(f"Starting Semantic Gateway on http://{host}:{port}")
-    uvicorn.run(gateway_app, host=host, port=port)
-
-
-def _start_background(host: str, port: int) -> None:
-    """Start the gateway server as a background process via PID file."""
-    import subprocess
-    import sys
-
-    pid_file = Path.cwd() / ".cairn" / "gateway.pid"
-
-    if pid_file.exists():
-        try:
-            old_pid = int(pid_file.read_text().strip())
-            os.kill(old_pid, 0)
-            click.echo(f"Gateway already running (PID {old_pid}). Stop it first.")
-            return
-        except (OSError, ValueError):
-            pid_file.unlink()
-
-    cmd = [
-        sys.executable,
-        "-m",
-        "uvicorn",
-        "server.api:app",
-        "--host",
-        host,
-        "--port",
-        str(port),
-    ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    pid_file.write_text(str(proc.pid))
-    click.echo(f"Gateway started in background (PID {proc.pid}) on http://{host}:{port}")
 
 
 # ── Doctor ──────────────────────────────────────────────────────
@@ -740,15 +700,6 @@ def doctor():
     click.echo()
 
     ok = True
-
-    # Gateway code location (helps debug editable install issues)
-    try:
-        from server import api as server_module
-
-        gateway_path = Path(server_module.__file__).parent.parent
-        click.echo(f"[i] Gateway code: {gateway_path}")
-    except Exception:
-        pass
 
     # Python interpreter (exposes venv vs system Python issues)
     click.echo(f"[i] Interpreter: {sys.executable}")
@@ -978,6 +929,14 @@ def doctor():
         click.echo(f"[i] Collection: {collection_name}")
         if pid:
             click.echo(f"[i] Project ID: {pid}")
+
+        # Report index location
+        index_location = getattr(cfg.indexing, "index_location", "auto")
+        index_base = repo.index_base_dir(index_location)
+        if index_base == repo.data_dir:
+            click.echo("[i] Index location: in-project (.cairn/)")
+        else:
+            click.echo(f"[i] Index location: native ({index_base})")
     except Exception as e:
         click.echo(f"[i] Collection: error ({e})")
 
@@ -1067,7 +1026,7 @@ def _start_all_impl(
     """Shared implementation for start-all and run commands.
 
     Auto-checks health, indexes if stale, clears cache, rotates memory,
-    and starts gateway + janitor.
+    and starts janitor.
     """
     import time as _time
 
@@ -1077,7 +1036,7 @@ def _start_all_impl(
     click.echo()
 
     # ── Phase 1: Quick health check ──────────────────────────────
-    click.echo("[1/6] Health check...", nl=False)
+    click.echo("[1/5] Health check...", nl=False)
     try:
         from server.ollama_client import OllamaClient
 
@@ -1117,7 +1076,7 @@ def _start_all_impl(
         return
 
     # ── Phase 2: Config check ────────────────────────────────────
-    click.echo("[2/6] Configuration...", nl=False)
+    click.echo("[2/5] Configuration...", nl=False)
     cfg = load_config()
     config_path = Path.cwd() / ".cairn" / "config.yaml"
     if config_path.exists():
@@ -1129,7 +1088,7 @@ def _start_all_impl(
         click.echo(" ✓ Created")
 
     # ── Phase 3: Index freshness ─────────────────────────────────
-    click.echo("[3/6] Index...", nl=False)
+    click.echo("[3/5] Index...", nl=False)
     if not no_index:
         from core.freshness import DBFreshness
         from core.repo import RepoManager
@@ -1153,7 +1112,7 @@ def _start_all_impl(
             click.echo(f" ✓ {count} functions indexed (fresh)")
 
     # ── Phase 4: Cache management ────────────────────────────────
-    click.echo("[4/6] Cache...", nl=False)
+    click.echo("[4/5] Cache...", nl=False)
     if cfg.cache.enabled:
         from core.cache import SessionCache
 
@@ -1163,7 +1122,7 @@ def _start_all_impl(
         click.echo(" disabled")
 
     # ── Phase 5: Memory rotation ─────────────────────────────────
-    click.echo("[5/6] Memory...", nl=False)
+    click.echo("[5/5] Memory...", nl=False)
     from core.repo import RepoManager
 
     mem_repo = RepoManager(Path.cwd())
@@ -1174,11 +1133,7 @@ def _start_all_impl(
     else:
         click.echo(f" ✓ {lines} lines")
 
-    # ── Phase 6: Start services ──────────────────────────────────
-    click.echo(f"[6/6] Gateway on http://{host}:{port} ...")
-    _start_background(host, port)
-    click.echo()
-
+    # ── Phase 6: Start janitor ───────────────────────────────────
     # Start janitor in foreground (blocks here)
     if not no_janitor:
         from core.repo import RepoManager
@@ -1255,28 +1210,28 @@ def _start_all_impl(
 
 
 @main.command()
-@click.option("--host", default="127.0.0.1", help="Host for gateway")
-@click.option("--port", default=8000, help="Port for gateway")
+@click.option("--host", default="127.0.0.1", help="Deprecated (kept for compat)")
+@click.option("--port", default=8000, help="Deprecated (kept for compat)")
 @click.option("--no-janitor", is_flag=True, help="Skip starting the janitor")
 @click.option("--no-index", is_flag=True, help="Skip auto-indexing")
 @click.option("-y", "--yes", is_flag=True, help="Auto-pull missing models")
 def start_all(host: str, port: int, no_janitor: bool, no_index: bool, yes: bool):
-    """Start everything automatically (smart orchestrator).
+    """Start janitor and prepare the index (smart orchestrator).
 
     Auto-checks health, indexes if stale, clears cache, rotates memory,
-    and starts gateway + janitor.  One command to rule them all.
+    and starts the background janitor.  One command to rule them all.
     """
     _start_all_impl(host, port, no_janitor, no_index, yes)
 
 
 @main.command()
-@click.option("--host", default="127.0.0.1", help="Host for gateway")
-@click.option("--port", default=8000, help="Port for gateway")
+@click.option("--host", default="127.0.0.1", help="Deprecated (kept for compat)")
+@click.option("--port", default=8000, help="Deprecated (kept for compat)")
 @click.option("--no-janitor", is_flag=True, help="Skip starting the janitor")
 @click.option("--no-index", is_flag=True, help="Skip auto-indexing")
 @click.option("-y", "--yes", is_flag=True, help="Auto-pull missing models")
 def run(host: str, port: int, no_janitor: bool, no_index: bool, yes: bool):
-    """Alias for start-all: start everything with one command."""
+    """Alias for start-all: prepare and start janitor."""
     _start_all_impl(host, port, no_janitor, no_index, yes)
 
 
@@ -1331,7 +1286,6 @@ def _print_status(cfg):
         count = "?"
 
     click.echo("─" * 62)
-    click.echo("  Gateway:    http://127.0.0.1:8000")
     click.echo(f"  Index:      {count} functions")
     click.echo(f"  Cache:      TTL={cfg.cache.ttl_seconds}s, max={cfg.cache.max_entries}")
     click.echo(f"  Memory:     trigger={cfg.memory.trigger}, max={cfg.memory.max_entries}")
@@ -1347,8 +1301,7 @@ def _print_status(cfg):
 def search(query: str, top_k: int):
     """Search the indexed codebase semantically.
 
-    Uses the SAME retrieval path the gateway serves to agents (ContextAssembler),
-    so CLI results match what the proxy injects.
+    Uses ContextAssembler, the same retrieval path used by MCP and external agents.
     """
     import time
 
@@ -1903,7 +1856,7 @@ def _render_dashboard():
     # Header
     click.echo()
     click.echo("┌──────────────────────────────────────────────────────────┐")
-    click.echo("│          SEMANTIC CODE GATEWAY — DASHBOARD               │")
+    click.echo("│               CAIRN — OBSERVABILITY DASHBOARD             │")
     click.echo("└──────────────────────────────────────────────────────────┘")
     click.echo()
 
@@ -1977,19 +1930,6 @@ def _render_dashboard():
     except Exception:
         pass
 
-    # Server stats
-    srv = summary["server"]
-    click.echo("  ── Gateway Server ────────────────────────────────────────")
-    click.echo(f"  Total requests:    {srv['total_requests']}")
-    click.echo(f"  Total errors:      {srv['total_errors']}")
-    click.echo(f"  Error rate:        {srv['error_rate']:.1f}%")
-    click.echo(f"  Avg latency:       {srv['avg_latency_ms']:.0f}ms")
-
-    srv_latency = metrics.get_latency_history("server", limit=30)
-    if srv_latency:
-        sparkline = _sparkline(srv_latency)
-        click.echo(f"  Latency trend:     {sparkline}")
-    click.echo()
 
     # Janitor stats
     jan = summary["janitor"]

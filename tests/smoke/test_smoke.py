@@ -5,8 +5,7 @@ These verify:
 1. Profile detection works for all repo types
 2. Indexing + semantic search work correctly
 3. MCP fail-closed behavior
-4. Gateway API works
-5. Scaffold and opencode.json are valid
+4. Scaffold and opencode.json are valid
 """
 
 import json
@@ -15,11 +14,9 @@ from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
-from fastapi.testclient import TestClient
 
 from cli.main import main
 from core.repo import project_id
-from server.api import app
 from server.context_assembler import ContextAssembler
 from server.mcp_server import _resolve_project_path
 from tests.fixtures.builders import (
@@ -118,28 +115,6 @@ class TestSmokeMCPFailClosed:
             path, error = _resolve_project_path()
             assert str(path) == str(repo)
             assert error is None
-
-
-@pytest.mark.smoke
-class TestSmokeGatewayAPI:
-    """Smoke test: Gateway API endpoints."""
-
-    def test_gateway_health_check(self):
-        """GET /health returns ok."""
-        client = TestClient(app)
-        response = client.get("/health")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "ok"
-
-    def test_gateway_models_list(self):
-        """GET /v1/models returns smart-context model."""
-        client = TestClient(app)
-        response = client.get("/v1/models")
-        assert response.status_code == 200
-        data = response.json()
-        assert data["object"] == "list"
-        assert any(m["id"] == "smart-context" for m in data["data"])
 
 
 @pytest.mark.smoke

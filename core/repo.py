@@ -462,11 +462,66 @@ class RepoManager:
         self.project_path = Path(project_path)
         self.data_dir = self.project_path / ".cairn"
 
-    def get_chroma_path(self) -> Path:
-        return self.data_dir / "chroma"
+    def _on_windows_mount(self) -> bool:
+        """Check if project_path is on a Windows mount (/mnt/*)."""
+        return str(self.project_path.resolve()).startswith("/mnt/")
 
-    def get_lance_path(self) -> Path:
-        return self.data_dir / "lance"
+    def index_base_dir(self, index_location: str | None = None) -> Path:
+        """Resolve the base directory where heavy index data (chroma/, lance/) live.
+
+        Args:
+            index_location: If provided, use this setting directly ('in_project' or 'native').
+                           If None, read from config and apply auto-detection logic.
+
+        Returns:
+            Path to the base directory containing index data. Always created.
+
+        Logic:
+            - 'in_project': self.data_dir (.cairn/)
+            - 'native': ~/.cache/cairn/<project_id>/
+            - 'auto': 'native' if on /mnt/* mount, else 'in_project'
+        """
+        if index_location is None:
+            # Read from config
+            from core.config import load_config
+
+            cfg = load_config(self.project_path)
+            index_location = getattr(cfg.indexing, "index_location", "auto")
+
+        if index_location == "in_project":
+            base_dir = self.data_dir
+        elif index_location == "native":
+            pid = project_id(str(self.project_path.resolve()))
+            base_dir = Path.home() / ".cache" / "cairn" / pid
+        else:  # "auto" or any other default
+            # Use native if on Windows mount, else in_project
+            if self._on_windows_mount():
+                pid = project_id(str(self.project_path.resolve()))
+                base_dir = Path.home() / ".cache" / "cairn" / pid
+            else:
+                base_dir = self.data_dir
+
+        # Ensure directory exists
+        base_dir.mkdir(parents=True, exist_ok=True)
+        return base_dir
+
+    def get_chroma_path(self, index_location: str | None = None) -> Path:
+        """Get the path to the chroma directory.
+
+        Args:
+            index_location: Optional override for index location setting.
+                           If None, determined by index_base_dir().
+        """
+        return self.index_base_dir(index_location) / "chroma"
+
+    def get_lance_path(self, index_location: str | None = None) -> Path:
+        """Get the path to the lance directory.
+
+        Args:
+            index_location: Optional override for index location setting.
+                           If None, determined by index_base_dir().
+        """
+        return self.index_base_dir(index_location) / "lance"
 
     def get_index_meta_path(self) -> Path:
         return self.data_dir / "index_meta.json"

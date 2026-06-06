@@ -48,10 +48,13 @@ def make_store(cfg: object, repo: RepoManager, *, project_root: str | Path) -> I
     # Resolve project_id
     pid = project_id(project_root)
 
+    # Get index_location from config to ensure consistency
+    index_location = getattr(cfg.indexing, "index_location", "auto")
+
     if backend == "lance":
         # Build LanceStore
         return LanceStore(
-            repo.get_lance_path(),
+            repo.get_lance_path(index_location),
             embedder,
             project_id=pid,
             project_root=str(project_root),
@@ -60,7 +63,7 @@ def make_store(cfg: object, repo: RepoManager, *, project_root: str | Path) -> I
         # Default: build ChromaStore (wraps VectorIndexer)
         llm_client = make_llm_client(cfg.local_llm)
         indexer = VectorIndexer(
-            chroma_path=repo.get_chroma_path(),
+            chroma_path=repo.get_chroma_path(index_location),
             ollama_client=llm_client,
             embedding_model=getattr(cfg.indexing, "embedding_model", None),
             embeddings_enabled=emb_enabled,

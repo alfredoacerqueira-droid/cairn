@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Project Is
 
-A semantic context engine that sits between a coding agent (OpenCode) and a cloud LLM. It intercepts prompts, assembles surgical context from a local ChromaDB vector index, and forwards the enriched prompt to a cloud model — reducing token usage by 90%+. It runs as two concurrent processes: a **live Gateway** (high priority, sync) and a **background Janitor** (low priority, async).
+A local-first semantic context engine for AI coding agents (Claude Code, OpenCode). It indexes your codebase into a vector DB, retrieves surgically-relevant functions for queries, and exposes them via CLI and MCP tools. Reduces tokens sent to cloud LLMs by 90%+ while keeping all code on your machine. Runs as two processes: an **MCP server** (on-demand, high priority) and a **background Janitor** (file watcher → indexer, low priority).
 
 ## Commands
 
@@ -28,20 +28,21 @@ mypy server/ pipeline/ cli/ core/ throttle/
 python benchmarks/benchmark_ast_parser.py
 
 # CLI (from project root with .venv active)
-cairn init                             # create .cairn/config.yaml
+cairn init                             # create .cairn/config.yaml + MCP configs
 cairn reindex --mode quick             # index codebase into ChromaDB
-cairn serve --port 8000                # start gateway API
+cairn mcp                               # start MCP server (stdio) for agents
 cairn janitor start                    # start background file watcher
 cairn search "query" -k 5
-cairn dry-run "query" --show-prompt    # preview assembled context without sending
+cairn doctor                           # diagnose environment
 cairn dashboard                        # live metrics
 ```
 
-Cloud forwarding requires env vars (optional — without them, gateway returns assembled context directly):
+Optional: local LLM for embeddings/memory (disabled by default):
 ```bash
-export CLOUD_API_KEY="..."
-export CLOUD_API_BASE="https://api.deepseek.com/v1"   # default
-export CLOUD_MODEL_NAME="deepseek-chat"                # default
+# Requires Ollama running (ollama serve &)
+# Embeddings model: nomic-embed-text
+# Memory summarizer: qwen2.5-coder:1.5b
+# (Configured in .cairn/config.yaml local_llm section)
 ```
 
 ## Architecture
@@ -49,48 +50,58 @@ export CLOUD_MODEL_NAME="deepseek-chat"                # default
 ### Two-Process Model
 
 ```
-Janitor (background, low priority)
-  FileWatcher → PriorityJobQueue → ASTParser → VectorIndexer → ChromaDB
-  MemorySummarizer → .cairn/memory.md
+MCP Server (on-demand, high priority, stdio)
+  - Exposes: search_code, assemble_context, orchestrate, set_profile, cache_get, cache_set
+  - Claude Code / OpenCode call these as native tools
+  - Instantiates: ContextAssembler, SemanticCache, Orchestrator
 
-Gateway (foreground, high priority)
-  POST /v1/chat/completions → ContextAssembler → VectorIndexer.search()
-                                               → RepoManager.load_repo_map()
-                                               → RepoManager.load_memory()
-                           → cloud API (or local-only if no key)
+Janitor (background, low priority, async)
+  FileWatcher → PriorityJobQueue → ASTParser → IndexStore.upsert()
+              (IndexStore = ChromaStore | LanceStore)
+  MemorySummarizer → .cairn/memory.md
 ```
 
 ### Module Map
 
 | Directory | Role |
 |-----------|------|
-| `server/` | FastAPI app (`api.py`), context assembly (`context_assembler.py`), Ollama HTTP client (`ollama_client.py`) |
-| `pipeline/` | AST parsing (`ast_parser.py`), ChromaDB indexer (`indexer.py`), file watcher (`watcher.py`), git-diff memory summarizer (`memory.py`), background job queue (`queue.py`) |
-| `core/` | Pydantic config loader (`config.py`), session cache (`cache.py`), DB freshness detection (`freshness.py`), metrics (`metrics.py`), repo data manager (`repo.py`) |
+| `server/` | MCP server (`mcp_server.py`), context assembly (`context_assembler.py`), orchestrator (`orchestrator.py`), workspace router (`workspace_router.py`), Ollama client (`ollama_client.py`) |
+| `pipeline/` | AST parsing (`ast_parser.py`), index store backends (`store/chroma.py`, `store/lance.py`), file watcher (`watcher.py`), git-diff memory summarizer (`memory.py`), background job queue (`queue.py`) |
+| `core/` | Pydantic config loader (`config.py`), semantic cache (`semantic_cache.py`), token budgeting (`tokens.py`), DB freshness detection (`freshness.py`), metrics (`metrics.py`), repo data manager (`repo.py`), profiles (`profiles.py`) |
 | `throttle/` | CPU (`cpu.py`), RAM (`memory.py`), VRAM priority (`vram.py`) |
 | `cli/` | Click CLI entry point (`main.py`) — all commands live here |
 
 ### Key Design Decisions
 
-**VRAM priority** (`throttle/vram.py`): `VRAMPriority` is a simple mutex-like object. Gateway calls `vram.request("gateway")` which always succeeds and blocks janitor. Janitor checks before running each job and backs off if gateway is active.
+**MCP server** (`server/mcp_server.py`): Exposes six tools as native MCP resources. Claude Code / OpenCode invoke these directly over stdio. Supports SINGLE (one repo), WORKSPACE (multi-repo), and UNBOUND (error) binding modes.
 
-**Session cache** (`core/cache.py`): In-memory TTL cache. Cache keys include the current git commit hash (fetched via subprocess), so stale results are automatically evicted on each commit. Used for both raw embeddings and assembled prompts.
+**IndexStore abstraction** (`pipeline/store/`): Two backends (ChromaDB default, LanceDB optional via `[local]` extra) behind a common interface. Flips via `config.yaml` `indexing.store_backend`. Both achieve quality-equivalent retrieval; Chroma is leaner, Lance adds native hybrid + versioning.
 
-**ChromaDB IDs**: Each indexed function has the ID `filepath:function_name:line_start`. Methods are stored as `filepath:ClassName.method_name:line_start`. The collection uses cosine similarity.
+**Index location strategy** (`core/config.py`): `indexing.index_location` can be `auto` (default), `native`, or `in_project`. On WSL with projects on `/mnt/*`, `auto` places the heavy DB on Linux native fs (`~/.cache/cairn/<project-id>/`) while source stays on `/mnt/c`. Elsewhere keeps index in-project (`.cairn/`). Config/memory/repo_map always stay in `.cairn/`.
 
-**Context assembly** (`server/context_assembler.py`): `assemble()` pulls three sources — (1) top-K semantically similar functions, (2) repo map (up to 20 files of classes/functions), (3) last 10 memory entries — and formats them as a structured markdown prompt injected as the `system` message.
+**Semantic cache** (`core/semantic_cache.py`): Local, embedded, short TTL (~300s). Exact + semantic lookup (via embeddings). SET by local LLM, GET by cloud LLM via MCP `cache_set`/`cache_get` tools. No Redis.
 
-**Per-project data** (`core/repo.py`, `core/config.py`): All state lives in `.cairn/` within the target project. Config is `config.yaml`, vector DB is `chroma/`, repo structure snapshot is `repo_map.json`, git-diff summaries are `memory.md`, metrics are `metrics.json`. None of these are version-controlled (see `.gitignore`).
+**Token budgeting** (`core/tokens.py`): Real tiktoken (cl100k_base Sonnet proxy). `BudgetConfig`: session_window 200K, session_pct 0.18 (caps Cairn's session-start contribution to ~36K). Tool outputs capped at 8K each. Memory loading respects budget (newest entries survive).
+
+**Orchestrator** (`server/orchestrator.py`): Routes work in tokens — context-only / one local-LLM call / map-reduce split for big jobs / defer-to-cloud. Respects token budget and session state.
+
+**Per-project data** (`core/repo.py`, `core/config.py`): All state lives in `.cairn/` within the target project. Config is `config.yaml`, vector DB location in `indexing.index_location`, repo structure snapshot is `repo_map.json`, git-diff summaries are `memory.md`, metrics are `metrics.json`. None of these are version-controlled (see `.gitignore`).
 
 **Stale DB detection** (`core/freshness.py`): Tracks last-indexed commit in memory (not persisted across restarts). Uses `git rev-list --count from..HEAD` to count how far behind the index is. Thresholds (quick: 1000 commits, full: 10000) trigger CLI warnings.
 
-**AST parsing** (`pipeline/ast_parser.py`): Uses tree-sitter deterministically — no AI. Parses Python only. Extracts top-level functions, classes, and methods (including decorated definitions). Nested functions are recursed into. `diff_update()` always does a full re-parse (incremental diffing is not implemented).
+**AST parsing** (`pipeline/ast_parser.py`): Uses tree-sitter deterministically — no AI. Parses Python and other languages (via tree-sitter-language-pack). Extracts top-level functions, classes, and methods. Nested functions are recursed into. `diff_update()` does full re-parse (incremental not implemented).
 
 **Background job queue** (`pipeline/queue.py`): `PriorityJobQueue` wraps Python's `queue.PriorityQueue`. Jobs that fail resource checks (CPU/RAM/VRAM) are re-queued with slightly lower priority and retried. Workers run in a single daemon thread.
 
-### OpenCode Integration
+### MCP Tool Integration
 
-`opencode.json` at the project root configures OpenCode to use the gateway as an OpenAI-compatible provider at `http://127.0.0.1:8000/v1`. The model name `smart-context` maps to the gateway's `/v1/chat/completions` endpoint.
+`cairn mcp` exposes these tools to Claude Code / OpenCode:
+- `search_code(query, top_k)` — semantic + lexical search
+- `assemble_context(query)` — full context assembly (search + repo map + memory)
+- `orchestrate(query, instruction, payload)` — smart routing (local vs cloud)
+- `set_profile(profile_name)` — switch profile (iac/python/dotnet/shell/code)
+- `cache_get(query)` — retrieve cached responses
+- `cache_set(query, value, ttl_seconds)` — store cached responses
 
 ## Code Style
 

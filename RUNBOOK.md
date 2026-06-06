@@ -40,7 +40,7 @@ sudo apt update && sudo apt install -y python3-venv python3-pip build-essential
 
 ### 1.2 Install ripgrep (Optional but Recommended)
 
-ripgrep enables fresh exact-match lexical search. Without it, the gateway falls back to in-memory BM25.
+ripgrep enables fresh exact-match lexical search. Without it, Cairn falls back to in-memory BM25.
 
 ```bash
 sudo apt install ripgrep
@@ -52,7 +52,10 @@ curl -LO https://github.com/BurntSushi/ripgrep/releases/download/14.1.0/ripgrep_
 sudo dpkg -i ripgrep_14.1.0_amd64.deb
 ```
 
-### 1.3 Install Ollama
+### 1.3 Install Ollama (Optional — Required Only for Embedding Profiles)
+
+Ollama is optional. It's required only if your profile uses embeddings (python, dotnet, code, shell).
+IaC profiles (Terraform, Helm) disable embeddings by default. You can also use fastembed instead.
 
 ```bash
 curl -fsSL https://ollama.com/install.sh | sh
@@ -100,11 +103,18 @@ ollama serve &
 
 ---
 
-## Step 2: Install the Gateway
+## Step 2: Install Cairn
 
-### 2.1 Via uv (Recommended — PEP 668 & Corporate CA Support)
+### 2.1 Via pipx (Recommended — Global, Isolated)
 
-For systems with PEP 668 restrictions (uv respects them) or corporate root CA requirements:
+```bash
+# Install once globally
+pipx install .
+```
+
+### 2.2 Via uv (Alternative — PEP 668 & Corporate CA Support)
+
+For systems with PEP 668 restrictions or corporate root CA requirements:
 
 ```bash
 # Install globally from local path, respecting system certificates
@@ -114,13 +124,6 @@ uv tool install . --force --system-certs
 The `--system-certs` flag is essential when behind corporate proxies (e.g., Zscaler) that inject custom
 CA certificates. This tells uv to use the system's certificate bundle for HTTPS validation.
 
-### 2.2 Via pipx (Global, Isolated)
-
-```bash
-# Install once globally
-pipx install .
-```
-
 ### 2.3 Via venv (Development)
 
 ```bash
@@ -129,9 +132,9 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-**⚠️ DO NOT use `pip install --break-system-packages`** on system Python. Use `uv`, `pipx`, or a venv.
+**⚠️ DO NOT use `pip install --break-system-packages`** on system Python. Use `pipx`, `uv`, or a venv.
 
-### 2.3 Verify Installation
+### 2.4 Verify Installation
 
 ```bash
 cairn --help
@@ -229,7 +232,7 @@ This checks your environment and reports:
 ```
 == Cairn Doctor ==
 
-[i] Gateway code: /usr/local/lib/python3.12/site-packages/semantic_gateway
+[i] Cairn code: /usr/local/lib/python3.12/site-packages/cairn
 [i] Interpreter: /home/user/.venv/bin/python3.12
 
 [✓] Python: 3.12.3 (need ≥3.10)
@@ -249,9 +252,9 @@ All checks passed. Ready to run!
 ```
 
 **Key lines to understand:**
-- **Gateway code:** Shows where the gateway package is installed (helps debug editable installs)
+- **Cairn code:** Shows where Cairn is installed (helps debug editable installs)
 - **Interpreter:** Shows which Python binary is being used (catches venv issues)
-- **Embedding model:** Must be found (or init fails)
+- **Embedding model:** Found only if Ollama is running and profile uses embeddings
 - **ripgrep:** Optional; if missing, use in-memory BM25 fallback
 - **Reranker:** FlashRank availability for confidence guard
 - **OLLAMA_MAX_LOADED_MODELS:** Tip for small GPUs — keeps models resident to avoid reload latency
@@ -260,7 +263,7 @@ All checks passed. Ready to run!
 
 ## Step 5: Repository Profiles
 
-The gateway auto-detects your repo type and optimizes retrieval accordingly:
+Cairn auto-detects your repo type and optimizes retrieval accordingly:
 
 ### Profile Strategies
 
@@ -301,58 +304,45 @@ cairn reindex --mode full  # Must rebuild to switch embedding strategy
 cairn search "how does authentication work" -k 5
 ```
 
-### 6.2 Preview Assembled Context
+### 6.2 Assemble Full Context
 
 ```bash
-cairn dry-run "how does auth work" --show-prompt
+cairn assemble_context "how does auth work"
 ```
 
-Shows search results + full assembled prompt + token estimate.
+Shows search results + repo map + memory + token estimate.
 
 ---
 
-## Step 7: Start the Gateway
+## Step 7: Start the Janitor (Background Indexing)
 
-### 7.1 Simple Start: Run Everything
-
-```bash
-cairn run
-```
-
-This starts gateway + janitor together, in the foreground. Press Ctrl+C to stop.
-
-### 7.2 Advanced: Orchestrated Start
+### 7.1 Start the Janitor
 
 ```bash
-cairn start-all
+cairn janitor start
 ```
 
-Checks health, indexes if stale, clears cache, rotates memory, then starts both processes.
+Runs in the background, watching for file changes and commits. Logs to `.cairn/janitor.log`.
 
-### 7.3 Serve Only (No Janitor)
+### 7.2 Stop the Janitor
 
 ```bash
-cairn serve --port 8000
+cairn janitor stop
 ```
 
-Just the gateway HTTP server. Janitor must be started separately (or auto-start via config).
-
-### 7.4 Verify Server is Running
+### 7.3 View Janitor Status
 
 ```bash
-curl http://127.0.0.1:8000/health
+cairn status
 ```
 
-Expected:
-```json
-{"status":"ok","version":"0.6.0"}
-```
+Shows whether janitor is running, index freshness, and cache state.
 
 ---
 
-## Step 8: Using with Claude Code or OpenCode
+## Step 8: Using with Claude Code or OpenCode (MCP)
 
-The gateway automatically scaffolds MCP configs at init. Both agents can now use it as a tool:
+Cairn automatically scaffolds MCP configs at init. Both agents can now use it as a native tool:
 
 ### OpenCode (opencode.json — auto-written)
 
@@ -383,10 +373,13 @@ The gateway automatically scaffolds MCP configs at init. Both agents can now use
 }
 ```
 
-Both agents can now call:
-- `search_code(query, top_k=5)` — Find relevant code by query
-- `assemble_context(query)` — Get full surgical context for a task
+Both agents can now call these MCP tools:
+- `search_code(query, top_k=5)` — Find relevant code by query (semantic + lexical + structural)
+- `assemble_context(query)` — Get full surgical context (search + repo map + memory)
+- `orchestrate(query, instruction="", payload="")` — Smart routing (local vs cloud)
 - `set_profile(name)` — Switch profile if auto-detect was wrong
+- `cache_get(query)` — Retrieve cached responses
+- `cache_set(query, value, ttl_seconds=300)` — Store cached responses
 
 See [AGENTS.md](AGENTS.md) for detailed tool guidance.
 
@@ -425,7 +418,7 @@ cat .cairn/metrics.json
 
 ## Troubleshooting
 
-### Ollama Not Reachable
+### Ollama Not Reachable (If Using Embeddings Profile)
 
 ```bash
 curl http://127.0.0.1:11434/api/tags
@@ -436,9 +429,11 @@ If this fails:
 2. Restart Ollama: `pkill ollama; sleep 2; ollama serve &`
 3. Check logs: `cat ~/.ollama/logs/server.log` (if available)
 
+Note: Only needed if your profile uses embeddings (python, dotnet, code, shell). IaC profiles don't require Ollama.
+
 ### Indexing Hangs
 
-Ollama may be slow to generate embeddings on first run. Check progress:
+If using Ollama embeddings, it may be slow on first run. Check progress:
 
 ```bash
 # In another terminal, watch memory usage
@@ -447,10 +442,15 @@ watch -n 1 'ps aux | grep ollama | head -3'
 
 Give it 5–10 minutes for the first index.
 
-### ChromaDB Errors
+### Vector DB Errors
 
 ```bash
+# For ChromaDB
 rm -rf .cairn/chroma
+cairn reindex --mode full
+
+# For LanceDB
+rm -rf ~/.cache/cairn/<project-id>/lancedb
 cairn reindex --mode full
 ```
 

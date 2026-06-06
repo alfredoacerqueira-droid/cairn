@@ -42,6 +42,12 @@ class IndexingConfig(BaseModel):
         "*.tfvars",
         "*.toml",
     ]
+    # Index location: where the heavy vector DB directories (chroma/, lance/) live.
+    # "auto" (default): native ~/.cache/cairn/<project-id> if on Windows mount (/mnt/),
+    #                   else in-project (.cairn/)
+    # "native": ~/.cache/cairn/<project-id>/ (forces use of native filesystem)
+    # "in_project": .cairn/ (keeps index in the project directory)
+    index_location: str = "auto"
     exclude_patterns: list[str] = [
         "**/node_modules/**",
         "**/.git/**",

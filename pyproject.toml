@@ -8,10 +8,6 @@ version = "0.6.0"  # keep in sync with core/version.py:CAIRN_VERSION
 description = "Cairn — a local-first semantic code context engine for AI coding agents"
 requires-python = ">=3.10"
 dependencies = [
-    # >=0.119 required: older FastAPI passes on_startup= to starlette's Router,
-    # which starlette>=1.x (pulled in by sse-starlette) removed -> import crash.
-    "fastapi>=0.119",
-    "uvicorn>=0.23.0",
     "chromadb>=0.4.0",
     "tree-sitter>=0.20.0",
     "tree-sitter-python>=0.20.0",
