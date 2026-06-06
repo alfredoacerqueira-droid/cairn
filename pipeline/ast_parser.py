@@ -1,6 +1,6 @@
 # ruff: noqa: E501  # Regex patterns are inherently long, not breakable
 
-"""Deterministic AST parsing using tree-sitter (Python/HCL/YAML/C#/bash) + regex (others)."""
+"""Deterministic AST parsing using tree-sitter for Python/Go/Rust/Java/JS/TS/HCL/YAML/C#/bash + regex fallback."""
 
 import concurrent.futures
 import logging
@@ -22,6 +22,9 @@ except ImportError:
 
 PY_LANGUAGE = Language(tspython.language())
 PY_PARSER = Parser(PY_LANGUAGE)
+
+# Cache for tree-sitter parsers from language pack
+_PARSER_CACHE: dict[str, Any] = {}
 
 # ── Language patterns for regex-based extraction ──────────────────────────────
 
@@ -234,8 +237,13 @@ class ASTParser:
         if lang == "unknown":
             lang = "python"
 
-        # PARSE TIMEOUT: wrap the parse operation with a timeout if configured
-        if self.parse_timeout_s > 0:
+        # PARSE TIMEOUT: wrap the parse operation with a timeout if configured.
+        # Skip timeout for language-pack parsers (Go/Rust/Java/JS/TS/etc.) as they are
+        # not thread-safe and will panic if sent to a different thread.
+        languages_without_timeout = {"go", "rust", "java", "javascript", "typescript", "tsx"}
+        should_skip_timeout = lang in languages_without_timeout
+
+        if self.parse_timeout_s > 0 and not should_skip_timeout:
             try:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                     future = executor.submit(self._parse_impl, code, filepath, lang)
@@ -254,6 +262,13 @@ class ASTParser:
         # Route to appropriate parser
         if lang == "python":
             return self._tree_sitter_parse(code, filepath)
+        elif lang in ("go", "rust", "java", "javascript", "typescript", "tsx"):
+            # Real tree-sitter AST for these languages
+            try:
+                return self._treesitter_parse_ml(code, filepath, lang)
+            except Exception as e:
+                logger.warning(f"Tree-sitter parse failed for {lang} in {filepath}: {e}; falling back to regex")
+                return self._regex_parse(code, filepath, lang)
         elif lang in ("hcl", "yaml", "csharp", "bash"):
             try:
                 return self._treesitter_parse_generic(code, filepath, lang)
@@ -334,6 +349,493 @@ class ASTParser:
         code_lines = lines[node.start_point[0] : node.end_point[0] + 1]
         code = "\n".join(code_lines).strip()
         return ClassDef(name=name, line_start=line_start, line_end=line_end, code=code)
+
+    # ── Tree-sitter multi-language (Go/Rust/Java/JS/TS) ───────
+
+    def _get_cached_parser(self, lang: str):
+        """Get or cache a tree-sitter parser for the given language."""
+        if lang not in _PARSER_CACHE:
+            if get_parser is None:
+                raise ImportError("tree-sitter-language-pack not installed")
+            _PARSER_CACHE[lang] = get_parser(lang)
+        return _PARSER_CACHE[lang]
+
+    def _treesitter_parse_ml(self, code: str, filepath: str, lang: str) -> FileAST:
+        """Parse Go/Rust/Java/JavaScript/TypeScript using tree-sitter language pack.
+
+        Extracts top-level functions, classes/types, and methods (for class members).
+        Method names are prefixed with their class/receiver type (e.g., 'Class.method').
+        """
+        parser = self._get_cached_parser(lang)
+        code = code.lstrip("﻿")  # Strip BOM
+        tree = parser.parse(code)
+        lines = code.split("\n")
+        code_bytes = code.encode("utf-8")
+        result = FileAST(filepath)
+
+        if lang == "go":
+            self._extract_go_defs(tree.root_node(), lines, code_bytes, result)
+        elif lang == "rust":
+            self._extract_rust_defs(tree.root_node(), lines, code_bytes, result)
+        elif lang == "java":
+            self._extract_java_defs(tree.root_node(), lines, code_bytes, result)
+        elif lang in ("javascript", "typescript", "tsx"):
+            self._extract_js_defs(tree.root_node(), lines, code_bytes, result, lang)
+
+        return result
+
+    # ── Go extraction ────────────────────────────────────────────
+
+    def _extract_go_defs(self, node, lines: list[str], code_bytes: bytes, result: FileAST):
+        """Extract Go functions, methods, and types (structs/interfaces)."""
+        kind = node.kind()
+
+        if kind == "function_declaration":
+            name = self._get_go_func_name(node, code_bytes)
+            if name:
+                self._add_function(node, lines, name, result)
+
+        elif kind == "method_declaration":
+            name, receiver = self._get_go_method_name(node, code_bytes)
+            if name:
+                # For Go methods, prefix with receiver type (e.g., "Receiver.method")
+                full_name = f"{receiver}.{name}" if receiver else name
+                self._add_function(node, lines, full_name, result)
+
+        elif kind == "type_declaration":
+            # Go type_declaration contains type_spec nodes
+            # Extract each type_spec within
+            for i in range(node.child_count()):
+                child = node.child(i)
+                if child.kind() == "type_spec":
+                    self._extract_go_type_spec(child, lines, code_bytes, result)
+
+        # Recurse
+        for i in range(node.child_count()):
+            self._extract_go_defs(node.child(i), lines, code_bytes, result)
+
+    def _get_go_func_name(self, node, code_bytes: bytes) -> Optional[str]:
+        """Extract function name from function_declaration."""
+        for i in range(node.child_count()):
+            child = node.child(i)
+            if child.kind() == "identifier":
+                return code_bytes[child.start_byte() : child.end_byte()].decode("utf-8", "replace")
+        return None
+
+    def _get_go_method_name(self, node, code_bytes: bytes) -> tuple[Optional[str], Optional[str]]:
+        """Extract method name and receiver type from method_declaration.
+
+        Returns (method_name, receiver_type_name) or (None, None) if extraction fails.
+        """
+        method_name = None
+        receiver_type = None
+        param_list_seen = False
+
+        for i in range(node.child_count()):
+            child = node.child(i)
+            if child.kind() == "parameter_list":
+                # First parameter_list is the receiver, second is the actual parameters
+                if not param_list_seen:
+                    receiver_type = self._get_go_receiver_type(child, code_bytes)
+                    param_list_seen = True
+            elif child.kind() == "field_identifier":
+                # Method name comes after receiver
+                method_name = code_bytes[child.start_byte() : child.end_byte()].decode(
+                    "utf-8", "replace"
+                )
+
+        return method_name, receiver_type
+
+    def _get_go_receiver_type(self, param_list_node, code_bytes: bytes) -> Optional[str]:
+        """Extract receiver type name from parameter list (e.g., *Calculator from (c *Calculator))."""
+        for i in range(param_list_node.child_count()):
+            child = param_list_node.child(i)
+            if child.kind() == "parameter_declaration":
+                # Look for type identifier or pointer within this parameter
+                for j in range(child.child_count()):
+                    type_child = child.child(j)
+                    kind = type_child.kind()
+                    if kind == "type_identifier":
+                        return code_bytes[type_child.start_byte() : type_child.end_byte()].decode(
+                            "utf-8", "replace"
+                        )
+                    elif kind == "pointer_type":
+                        # Extract type from *Type
+                        for k in range(type_child.child_count()):
+                            ptr_child = type_child.child(k)
+                            if ptr_child.kind() == "type_identifier":
+                                return code_bytes[
+                                    ptr_child.start_byte() : ptr_child.end_byte()
+                                ].decode("utf-8", "replace")
+        return None
+
+    def _extract_go_type_spec(self, node, lines: list[str], code_bytes: bytes, result: FileAST):
+        """Extract a single Go type specification (from within type_declaration)."""
+        # type_spec contains: type_identifier struct_type/interface_type
+        type_name = None
+        for i in range(node.child_count()):
+            child = node.child(i)
+            if child.kind() == "type_identifier":
+                type_name = code_bytes[child.start_byte() : child.end_byte()].decode(
+                    "utf-8", "replace"
+                )
+                break
+
+        if type_name:
+            # Record as a class
+            start_row = node.start_position().row
+            end_row = node.end_position().row
+            code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+            if len(code_text) < 100000:
+                result.classes.append(
+                    ClassDef(
+                        name=type_name,
+                        line_start=start_row + 1,
+                        line_end=end_row + 1,
+                        code=code_text,
+                    )
+                )
+
+    # ── Rust extraction ──────────────────────────────────────────
+
+    def _extract_rust_defs(self, node, lines: list[str], code_bytes: bytes, result: FileAST, class_map: dict = None):
+        """Extract Rust functions, methods, and types (struct/enum/trait)."""
+        if class_map is None:
+            class_map = {}
+
+        kind = node.kind()
+
+        if kind == "function_item":
+            name = self._get_identifier_name(node, code_bytes)
+            if name:
+                self._add_function(node, lines, name, result)
+
+        elif kind == "impl_item":
+            # Extract impl block and its methods
+            self._extract_rust_impl(node, lines, code_bytes, result, class_map)
+
+        elif kind in ("struct_item", "enum_item", "trait_item"):
+            # Types/classes
+            name = self._get_identifier_name(node, code_bytes)
+            if name:
+                start_row = node.start_position().row
+                end_row = node.end_position().row
+                code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+                if len(code_text) < 100000:
+                    cls = ClassDef(
+                        name=name,
+                        line_start=start_row + 1,
+                        line_end=end_row + 1,
+                        code=code_text,
+                    )
+                    result.classes.append(cls)
+                    # Store in map for later impl blocks
+                    class_map[name] = cls
+
+        # Recurse
+        for i in range(node.child_count()):
+            self._extract_rust_defs(node.child(i), lines, code_bytes, result, class_map)
+
+    def _extract_rust_impl(self, node, lines: list[str], code_bytes: bytes, result: FileAST, class_map: dict):
+        """Extract methods from Rust impl blocks."""
+        # Find impl<T> Type or impl Type
+        impl_type = self._get_rust_impl_type(node, code_bytes)
+
+        # Find or create the class/type
+        if impl_type and impl_type in class_map:
+            cls = class_map[impl_type]
+            # Add methods to existing class (recursively find function_items)
+            self._collect_impl_methods(node, lines, code_bytes, cls)
+        else:
+            # No corresponding type definition, add as top-level functions
+            self._collect_impl_methods_as_functions(node, lines, code_bytes, result, impl_type)
+
+    def _collect_impl_methods(self, node, lines: list[str], code_bytes: bytes, cls: ClassDef):
+        """Recursively collect function_items from impl block and add as methods."""
+        if node.kind() == "function_item":
+            method_name = self._get_identifier_name(node, code_bytes)
+            if method_name:
+                start_row = node.start_position().row
+                end_row = node.end_position().row
+                code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+                if len(code_text) < 100000:
+                    cls.methods.append(
+                        FunctionDef(
+                            name=method_name,
+                            line_start=start_row + 1,
+                            line_end=end_row + 1,
+                            code=code_text,
+                        )
+                    )
+
+        for i in range(node.child_count()):
+            self._collect_impl_methods(node.child(i), lines, code_bytes, cls)
+
+    def _collect_impl_methods_as_functions(self, node, lines: list[str], code_bytes: bytes, result: FileAST, impl_type: Optional[str]):
+        """Recursively collect function_items from impl block and add as top-level functions."""
+        if node.kind() == "function_item":
+            method_name = self._get_identifier_name(node, code_bytes)
+            if method_name and impl_type:
+                full_name = f"{impl_type}.{method_name}"
+                self._add_function(node, lines, full_name, result)
+
+        for i in range(node.child_count()):
+            self._collect_impl_methods_as_functions(node.child(i), lines, code_bytes, result, impl_type)
+
+    def _get_rust_impl_type(self, impl_node, code_bytes: bytes) -> Optional[str]:
+        """Extract type name from impl block (e.g., 'MyStruct' from 'impl MyStruct')."""
+        for i in range(impl_node.child_count()):
+            child = impl_node.child(i)
+            kind = child.kind()
+            if kind == "type_identifier":
+                return code_bytes[child.start_byte() : child.end_byte()].decode(
+                    "utf-8", "replace"
+                )
+            elif kind == "generic_type":
+                # For generic types, try to extract the base type name
+                for j in range(child.child_count()):
+                    sub_child = child.child(j)
+                    if sub_child.kind() == "type_identifier":
+                        return code_bytes[sub_child.start_byte() : sub_child.end_byte()].decode(
+                            "utf-8", "replace"
+                        )
+        return None
+
+    # ── Java extraction ──────────────────────────────────────────
+
+    def _extract_java_defs(self, node, lines: list[str], code_bytes: bytes, result: FileAST):
+        """Extract Java classes, interfaces, enums, and methods."""
+        kind = node.kind()
+
+        if kind in ("class_declaration", "interface_declaration", "enum_declaration"):
+            # Extract class and its methods
+            class_name = self._get_identifier_name(node, code_bytes)
+            if class_name:
+                start_row = node.start_position().row
+                end_row = node.end_position().row
+                code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+                if len(code_text) < 100000:
+                    cls = ClassDef(
+                        name=class_name,
+                        line_start=start_row + 1,
+                        line_end=end_row + 1,
+                        code=code_text,
+                    )
+                    result.classes.append(cls)
+                    # Extract methods
+                    self._extract_java_methods(node, lines, code_bytes, cls)
+
+        # Recurse (for nested types)
+        for i in range(node.child_count()):
+            self._extract_java_defs(node.child(i), lines, code_bytes, result)
+
+    def _extract_java_methods(self, node, lines: list[str], code_bytes: bytes, cls: ClassDef):
+        """Extract methods from Java class."""
+        kind = node.kind()
+
+        if kind in ("method_declaration", "constructor_declaration"):
+            # For methods: skip modifiers and return type, get the identifier before formal_parameters
+            method_name = self._get_java_method_name(node, code_bytes)
+            if method_name:
+                start_row = node.start_position().row
+                end_row = node.end_position().row
+                code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+                if len(code_text) < 100000:
+                    cls.methods.append(
+                        FunctionDef(
+                            name=method_name,
+                            line_start=start_row + 1,
+                            line_end=end_row + 1,
+                            code=code_text,
+                        )
+                    )
+
+        # Recurse
+        for i in range(node.child_count()):
+            self._extract_java_methods(node.child(i), lines, code_bytes, cls)
+
+    # ── JavaScript/TypeScript extraction ─────────────────────────
+
+    def _extract_js_defs(
+        self, node, lines: list[str], code_bytes: bytes, result: FileAST, lang: str
+    ):
+        """Extract JS/TS functions, classes, methods, arrow functions."""
+        kind = node.kind()
+
+        if kind == "function_declaration":
+            name = self._get_identifier_name(node, code_bytes)
+            if name:
+                self._add_function(node, lines, name, result)
+
+        elif kind == "class_declaration":
+            class_name = self._get_identifier_name(node, code_bytes)
+            if class_name:
+                start_row = node.start_position().row
+                end_row = node.end_position().row
+                code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+                if len(code_text) < 100000:
+                    cls = ClassDef(
+                        name=class_name,
+                        line_start=start_row + 1,
+                        line_end=end_row + 1,
+                        code=code_text,
+                    )
+                    result.classes.append(cls)
+                    # Extract methods
+                    self._extract_js_methods(node, lines, code_bytes, cls)
+
+        elif kind == "lexical_declaration":
+            # Handle const/let NAME = () => {} or const NAME = function() {}
+            func_info = self._extract_js_arrow_or_func_expr(node, lines, code_bytes)
+            if func_info:
+                name, line_start, line_end, code_text = func_info
+                result.functions.append(
+                    FunctionDef(
+                        name=name,
+                        line_start=line_start,
+                        line_end=line_end,
+                        code=code_text,
+                    )
+                )
+
+        elif lang in ("typescript", "tsx") and kind in ("interface_declaration", "type_alias_declaration"):
+            # TypeScript-specific types
+            type_name = self._get_identifier_name(node, code_bytes)
+            if type_name:
+                start_row = node.start_position().row
+                end_row = node.end_position().row
+                code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+                if len(code_text) < 100000:
+                    result.classes.append(
+                        ClassDef(
+                            name=type_name,
+                            line_start=start_row + 1,
+                            line_end=end_row + 1,
+                            code=code_text,
+                        )
+                    )
+
+        # Recurse
+        for i in range(node.child_count()):
+            self._extract_js_defs(node.child(i), lines, code_bytes, result, lang)
+
+    def _extract_js_methods(self, node, lines: list[str], code_bytes: bytes, cls: ClassDef):
+        """Extract methods from JS/TS class body."""
+        kind = node.kind()
+
+        if kind == "method_definition":
+            method_name = self._get_identifier_name(node, code_bytes)
+            if method_name:
+                start_row = node.start_position().row
+                end_row = node.end_position().row
+                code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+                if len(code_text) < 100000:
+                    cls.methods.append(
+                        FunctionDef(
+                            name=method_name,
+                            line_start=start_row + 1,
+                            line_end=end_row + 1,
+                            code=code_text,
+                        )
+                    )
+
+        # Recurse
+        for i in range(node.child_count()):
+            self._extract_js_methods(node.child(i), lines, code_bytes, cls)
+
+    def _extract_js_arrow_or_func_expr(
+        self, node, lines: list[str], code_bytes: bytes
+    ) -> Optional[tuple[str, int, int, str]]:
+        """Extract name and function from 'const NAME = () => {}' or 'const NAME = function() {}'.
+
+        Returns (name, line_start, line_end, code) or None if not a function expression.
+        """
+        # lexical_declaration has structure: const/let/var NAME = arrow_function/function_expression
+        var_declarator = None
+        for i in range(node.child_count()):
+            child = node.child(i)
+            if child.kind() == "variable_declarator":
+                var_declarator = child
+                break
+
+        if not var_declarator:
+            return None
+
+        name = None
+        func_expr = None
+
+        for i in range(var_declarator.child_count()):
+            child = var_declarator.child(i)
+            if child.kind() == "identifier" and not name:
+                name = code_bytes[child.start_byte() : child.end_byte()].decode(
+                    "utf-8", "replace"
+                )
+            elif child.kind() in ("arrow_function", "function_expression"):
+                func_expr = child
+                break
+
+        if name and func_expr:
+            start_row = var_declarator.start_position().row
+            end_row = var_declarator.end_position().row
+            code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+            if len(code_text) < 100000:
+                return (name, start_row + 1, end_row + 1, code_text)
+
+        return None
+
+    # ── Helpers ──────────────────────────────────────────────────
+
+    def _get_identifier_name(self, node, code_bytes: bytes) -> Optional[str]:
+        """Get the identifier/name of a node (first identifier-like child)."""
+        id_kinds = {"identifier", "type_identifier", "property_identifier", "field_identifier"}
+        for i in range(node.child_count()):
+            child = node.child(i)
+            if child.kind() in id_kinds:
+                return code_bytes[child.start_byte() : child.end_byte()].decode(
+                    "utf-8", "replace"
+                )
+        return None
+
+    def _get_java_method_name(self, node, code_bytes: bytes) -> Optional[str]:
+        """Extract method name from Java method/constructor declaration.
+
+        Method structure: modifiers? type_identifier identifier formal_parameters ...
+        We want the identifier that comes right before formal_parameters.
+        """
+        formal_params_idx = None
+        for i in range(node.child_count()):
+            child = node.child(i)
+            if child.kind() == "formal_parameters":
+                formal_params_idx = i
+                break
+
+        if formal_params_idx is not None and formal_params_idx > 0:
+            # Look backwards from formal_parameters for the first identifier
+            for i in range(formal_params_idx - 1, -1, -1):
+                child = node.child(i)
+                if child.kind() == "identifier":
+                    return code_bytes[child.start_byte() : child.end_byte()].decode(
+                        "utf-8", "replace"
+                    )
+
+        return None
+
+    def _add_function(
+        self, node, lines: list[str], name: str, result: FileAST
+    ):
+        """Helper to add a function to the result."""
+        start_row = node.start_position().row
+        end_row = node.end_position().row
+        code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+        if len(code_text) < 100000:
+            result.functions.append(
+                FunctionDef(
+                    name=name,
+                    line_start=start_row + 1,
+                    line_end=end_row + 1,
+                    code=code_text,
+                )
+            )
 
     # ── Tree-sitter generic (HCL/YAML/C#/bash) ───────────────
 

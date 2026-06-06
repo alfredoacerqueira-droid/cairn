@@ -12,12 +12,13 @@ Assertions:
   - Indexed block count > 0 for any repo with real source (except empty/edge)
   - No silent file-type drop on hybrid/monorepo repos
   - Known-answer retrieval: plant a symbol, search for it, find it in results
-  - For languages with REGEX-only parsing: may fail if pattern is weak (mark xfail)
+  - For languages with regex-only parsing: may fail if pattern is weak (mark skip)
 
-Known limitations (reported in docstring):
-  - Go/Rust/Java/JS/TS: REGEX parsing only, patterns may miss some symbols
-  - C++/Ruby: weak patterns, high false-negative rate (not tested in e2e)
-  - JSON/TOML: no real AST, indexing unreliable (not tested in e2e)
+Parsing support:
+  - Python, Go, Rust, Java, JavaScript, TypeScript, C#, Bash, HCL/Terraform, YAML:
+    real tree-sitter AST extraction (robust, reliable)
+  - C++, Ruby: regex fallback (weaker, may miss some symbols)
+  - JSON, TOML: no real AST, indexing unreliable (not tested in e2e)
 """
 
 import json
@@ -600,13 +601,14 @@ def test_cli_search_retrieval(archetype: dict):
             # if the pattern fails. But for now, just check exit code.
             # If search returns non-zero, log but don't hard-fail (weak patterns).
             if rc_search != 0:
-                if archetype["name"] in ("go", "rust", "java", "typescript"):
+                # cpp/ruby still use regex fallback and may fail
+                if archetype["name"] in ("cpp", "ruby"):
                     pytest.skip(
                         f"Search failed for {query} in {archetype['name']} "
-                        f"(weak regex parsing expected)\nstderr: {err_search}"
+                        f"(regex fallback)\nstderr: {err_search}"
                     )
                 else:
-                    # For strong-parsing langs (python, csharp, terraform, yaml, shell),
+                    # For all other langs (tree-sitter or strong-parsing),
                     # search failure is a real issue
                     assert False, (
                         f"Search failed for {query} in {archetype['name']}\n"
