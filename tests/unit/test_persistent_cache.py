@@ -1,11 +1,8 @@
 """Tests for persistent file-based cache."""
 
-import json
 import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
-
-import pytest
 
 from core.persistent_cache import PersistentCache
 
@@ -29,14 +26,20 @@ class TestPersistentCache:
     def test_ttl_expiry(self):
         """Test that expired entries are treated as misses."""
         with TemporaryDirectory() as tmpdir:
-            cache = PersistentCache(Path(tmpdir), max_entries=10, ttl_seconds=1)
+            # Use a mutable container to allow time advancement without closure issues
+            fake_time_state = {"current": 100.0}
+
+            def fake_time():
+                return fake_time_state["current"]
+
+            cache = PersistentCache(Path(tmpdir), max_entries=10, ttl_seconds=1, time_fn=fake_time)
             cache.set("value1", "key1")
 
             # Should hit immediately
             assert cache.get("key1") == "value1"
 
-            # Wait for expiry
-            time.sleep(1.1)
+            # Advance time past TTL without real sleep
+            fake_time_state["current"] = 101.5
 
             # Should miss
             assert cache.get("key1") is None

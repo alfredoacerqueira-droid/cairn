@@ -1,5 +1,6 @@
-"""Git diff summarization using local Ollama model."""
+"""Git diff summarization using local Ollama model or deterministic fallback."""
 
+import re
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -15,6 +16,7 @@ class MemorySummarizer:
         model: str = "qwen2.5-coder:3b",
         memory_file: Optional[str] = None,
         max_entries: int = 50,
+        llm_enabled: bool = True,
     ):
         self.repo_path = Path(repo_path)
         self.ollama = ollama_client or OllamaClient()
@@ -22,6 +24,7 @@ class MemorySummarizer:
         self.memory_file = memory_file or str(self.repo_path / ".cairn" / "memory.md")
         self.max_entries = max_entries
         self._compaction_threshold = 200
+        self.llm_enabled = llm_enabled
 
     def get_recent_diff(self) -> str:
         """Get git diff for the last commit."""
@@ -64,10 +67,62 @@ class MemorySummarizer:
         except Exception:
             return ""
 
-    def summarize_diff(self, diff: str) -> str:
-        """Use local Qwen model to summarize a git diff."""
+    def _extract_files_from_diff(self, diff: str) -> list[str]:
+        """Extract changed filenames from a diff string."""
+        files = []
+        for line in diff.split("\n"):
+            if line.startswith("diff --git"):
+                # Extract file path from "diff --git a/path b/path"
+                parts = line.split(" b/")
+                if len(parts) > 1:
+                    files.append(parts[1].strip())
+            elif line.startswith("+++") or line.startswith("---"):
+                # Fallback: extract from +++ --- lines
+                path = line.lstrip("+- /").strip()
+                if path and path != "/dev/null":
+                    files.append(path)
+        return list(set(files))  # Deduplicate
+
+    def _deterministic_summary(self, diff: str) -> str:
+        """Generate a deterministic summary of changes without LLM.
+
+        Produces a bullet list of changed files and a change type heuristic.
+        """
         if not diff or len(diff.strip()) < 10:
             return "No significant changes."
+
+        files = self._extract_files_from_diff(diff)
+        if not files:
+            return "Modified codebase (diff details unavailable)."
+
+        # Heuristic: guess change type from file patterns and diff size
+        has_tests = any("test" in f.lower() for f in files)
+        has_docs = any(f.endswith((".md", ".rst", ".txt")) for f in files)
+        has_config = any(f.endswith((".yaml", ".yml", ".json", ".toml")) for f in files)
+
+        type_hints = []
+        if has_tests:
+            type_hints.append("tests")
+        if has_docs:
+            type_hints.append("documentation")
+        if has_config:
+            type_hints.append("config")
+
+        type_str = " + ".join(type_hints) if type_hints else "code"
+        file_list = "; ".join(files[:5])
+        if len(files) > 5:
+            file_list += f"; +{len(files) - 5} more"
+
+        return f"Modified {type_str}: {file_list}"
+
+    def summarize_diff(self, diff: str) -> str:
+        """Summarize a git diff using LLM if enabled, else deterministic fallback."""
+        if not diff or len(diff.strip()) < 10:
+            return "No significant changes."
+
+        # Use deterministic summary if LLM is disabled
+        if not self.llm_enabled:
+            return self._deterministic_summary(diff)
 
         prompt = f"Summarize this git diff in one short sentence:\n\n{diff[:2000]}"
 
@@ -75,7 +130,8 @@ class MemorySummarizer:
             response = self.ollama.generate(prompt=prompt, model=self.model)
             return response.strip()
         except Exception:
-            return "Failed to generate summary."
+            # Fallback to deterministic if LLM call fails
+            return self._deterministic_summary(diff)
 
     def summarize_and_record(self, diff: Optional[str] = None):
         """Summarize a diff and append to MEMORY.md."""
@@ -112,8 +168,6 @@ class MemorySummarizer:
             return
 
         # Split by timestamp markers
-        import re
-
         entries = re.split(r"\n(?=\[\d{4}-\d{2}-\d{2}\s)", content)
         entries = [e.strip() for e in entries if e.strip()]
 
@@ -140,14 +194,17 @@ class MemorySummarizer:
         old_lines = lines[: self._compaction_threshold]
         recent_lines = lines[self._compaction_threshold :]
 
-        # Generate a compacted summary
-        combined = "\n".join(old_lines)
-        prompt = f"Summarize these git diff summaries into one paragraph:\n\n{combined}"
-
-        try:
-            compact_summary = self.ollama.generate(prompt=prompt, model=self.model)
-        except Exception:
-            compact_summary = "Multiple changes over time."
+        # Compaction: use LLM if enabled, else use deterministic method
+        if self.llm_enabled:
+            combined = "\n".join(old_lines)
+            prompt = f"Summarize these git diff summaries into one paragraph:\n\n{combined}"
+            try:
+                compact_summary = self.ollama.generate(prompt=prompt, model=self.model)
+            except Exception:
+                compact_summary = "Multiple changes over time."
+        else:
+            # Deterministic compaction: count entries
+            compact_summary = f"Multiple historical changes ({len(old_lines)} entries compacted)."
 
         from datetime import datetime
 

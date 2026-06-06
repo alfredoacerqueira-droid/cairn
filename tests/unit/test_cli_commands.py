@@ -213,7 +213,7 @@ class TestInitCommand:
             assert "file_patterns" in second_content
 
     def test_init_scaffolds_opencode_json(self, tmp_path):
-        """Test that init scaffolds opencode.json with MCP config."""
+        """Test that init scaffolds opencode.json with correct OpenCode 1.15+ format."""
         runner = CliRunner()
         with runner.isolated_filesystem(temp_dir=tmp_path):
             # Initialize git repo
@@ -245,18 +245,27 @@ class TestInitCommand:
             assert "mcp" in opencode_data
             assert "cairn" in opencode_data["mcp"]
 
-            # Verify MCP entry
+            # Verify MCP entry (OpenCode 1.15+ format)
             mcp_cfg = opencode_data["mcp"]["cairn"]
             assert mcp_cfg["type"] == "local"
-            assert mcp_cfg["args"] == ["mcp"]
-            assert "CAIRN_PROJECT" in mcp_cfg["env"]
 
-            # CAIRN_PROJECT should be absolute path to current dir
+            # command must be an array (OpenCode 1.15+ format)
+            assert isinstance(mcp_cfg["command"], list)
+            # Last element of command should be "mcp"
+            assert mcp_cfg["command"][-1] == "mcp"
+            # No separate "args" key at top level
+            assert "args" not in mcp_cfg
+
+            # enabled must be True
+            assert mcp_cfg["enabled"] is True
+
+            # CAIRN_PROJECT must be absolute path to current dir
+            assert "CAIRN_PROJECT" in mcp_cfg["env"]
             expected_path = str(Path.cwd().resolve())
             assert mcp_cfg["env"]["CAIRN_PROJECT"] == expected_path
 
     def test_init_scaffolds_mcp_json(self, tmp_path):
-        """Test that init scaffolds .mcp.json with MCP config."""
+        """Test that init scaffolds .mcp.json with Claude Code format."""
         runner = CliRunner()
         with runner.isolated_filesystem(temp_dir=tmp_path):
             # Initialize git repo
@@ -288,10 +297,12 @@ class TestInitCommand:
             assert "mcpServers" in mcp_data
             assert "cairn" in mcp_data["mcpServers"]
 
-            # Verify MCP entry
+            # Verify MCP entry (Claude Code format: command + args separate)
             mcp_cfg = mcp_data["mcpServers"]["cairn"]
             assert "command" in mcp_cfg
-            assert mcp_cfg["args"] == ["mcp"]
+            assert isinstance(mcp_cfg["args"], list)
+            # args should contain "mcp" or "cairn mcp"
+            assert "mcp" in mcp_cfg["args"] or "cairn" in mcp_cfg["args"]
             assert "CAIRN_PROJECT" in mcp_cfg["env"]
 
             # CAIRN_PROJECT should be absolute path to current dir

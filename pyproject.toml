@@ -8,11 +8,14 @@ version = "0.6.0"  # keep in sync with core/version.py:CAIRN_VERSION
 description = "Cairn — a local-first semantic code context engine for AI coding agents"
 requires-python = ">=3.10"
 dependencies = [
-    "fastapi>=0.100.0",
-    "uvicorn>=0.23.0",
     "chromadb>=0.4.0",
     "tree-sitter>=0.20.0",
     "tree-sitter-python>=0.20.0",
+    # Grammars for HCL/YAML/Terraform/C#/Bash. Without it, ast_parser silently
+    # falls back to crude regex parsing for every non-Python language, badly
+    # degrading IaC/Helm/k8s index quality.
+    "tree-sitter-language-pack>=0.2.0",
+    "tiktoken>=0.7",
     "watchdog>=3.0.0",
     "httpx>=0.24.0",
     "pydantic>=2.0.0",
@@ -32,6 +35,11 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.5.0",
 ]
+local = [
+    "lancedb>=0.13",
+    "fastembed>=0.3",
+    "tantivy>=0.22",
+]
 
 [tool.setuptools.packages.find]
 include = ["server*", "pipeline*", "core*", "throttle*", "cli*"]
@@ -45,6 +53,14 @@ cairn = "cli.main:main"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "integration: mark test as integration test (requires real services)",
+    "smoke: mark test as smoke test (quick sanity check)",
+    "reranker: mark test as requiring flashrank reranker",
+    "corpus: mark test as requiring test corpus/fixtures",
+    "ollama: mark test as requiring Ollama service",
+    "eval: mark test as evaluation/benchmark test",
+]
 
 [tool.black]
 line-length = 100

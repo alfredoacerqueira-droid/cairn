@@ -2,40 +2,39 @@
 
 **Version 0.6.0** — A **local-first** semantic context engine for AI coding agents. It indexes your
 codebase into a per-repo vector DB, retrieves the surgically-relevant functions for a query,
-compresses them, and serves them to your agent — cutting the tokens you send to the cloud LLM while
-keeping all your code on your machine. Works with **Claude Code and OpenCode out of the box via MCP**,
-or as an OpenAI/Anthropic proxy.
+compresses them, and serves them via CLI or MCP tools — cutting the tokens you send to the cloud LLM while
+keeping all your code on your machine. Works natively with **Claude Code and OpenCode via MCP tools**.
 
 ```
-Claude Code / OpenCode ──MCP tool── Gateway ──► retrieve + compress (local)
+Claude Code / OpenCode ──MCP tool── Cairn ──► search + assemble + orchestrate (local)
                                        ↓
-                  per-repo .cairn/  (ChromaDB + BM25 + structural + cache + memory)
+                  per-repo .cairn/  (vector DB + lexical + structural + cache + memory)
                        ↑ auto-synced on file edits & commits (never out of date)
 ```
 
-## ⚡ Quick Start (ruflo-style: install once, init per repo)
+## ⚡ Quick Start (install once, init per repo)
 
 ```bash
-# 1. Install and start Ollama + pull the models the gateway needs
-curl -fsSL https://ollama.com/install.sh | sh
-ollama pull nomic-embed-text qwen2.5-coder:1.5b
-ollama serve &
-
-# 2. Install the gateway CLI (once, globally — pipx keeps it isolated)
+# 1. Install the CLI (once, globally — pipx keeps it isolated)
 pipx install .            # or: pip install -e ".[dev]" from this repo
 
-# 3. In the repo you want to work on:
+# 2. In the repo you want to work on:
 cd /path/to/your-project
 cairn init         # auto-detects profile → write config → build the index → ready
 cairn doctor       # verify environment
+
+# 3. Point your agent at it:
+# Option A: MCP (recommended) — agents call it as a native tool
+#   (See Use with Claude Code / OpenCode below)
+# Option B: CLI — use cairn search, cairn assemble_context directly
+cairn search "query" -k 5
 ```
 
-Then point your agent at it (see **Use with Claude Code / OpenCode** below) — or run
-`cairn run` to serve the proxy API.
+Note: Ollama is optional (required only for embeddings-heavy profiles; can be disabled per config).
 
 ## 🔌 Use with Claude Code / OpenCode (MCP — recommended)
 
-The gateway runs as a native **MCP server**, so either agent can call it as a tool. No proxy wiring.
+Cairn runs as a native **MCP server**, so either agent can call it as a tool. No proxy wiring.
 
 **OpenCode** (`opencode.json`):
 ```json
@@ -87,29 +86,21 @@ Exposes three tools: `search_code(query, top_k)`, `assemble_context(query)`, and
 > **Measured retrieval:** Terraform top-1 recall improved from ~17% (BM25) to ~60% (IaC profile strategy).
 > See [RUNBOOK](RUNBOOK.md#benchmarking) for methodology and real caveats.
 
-## 🚀 One Command to Rule Them All
+## 🚀 Daily Operations
 
 ```bash
+# Smart start (checks health, reindexes if stale, starts janitor)
 cairn start-all
-```
 
-Auto-checks health, indexes if stale, clears cache, rotates memory, starts gateway + janitor:
+# Or: just the janitor (background indexing)
+cairn janitor start
 
-```
-╔══════════════════════════════════════════════════════════════╗
-║     Cairn — Smart Start                     ║
-╚══════════════════════════════════════════════════════════════╝
+# Or: just the CLI (manual search + assemble)
+cairn search "query"
+cairn assemble_context "what does handle_request do?"
 
-[1/6] Health check... ✓ Ollama online
-[2/6] Configuration... ✓ Found existing config
-[3/6] Freshness... ✓ DB is up to date
-[4/6] Cache... ✓ Cleared
-[5/6] Memory... ✓ Rotated
-[6/6] Starting processes...
-  • Gateway on http://127.0.0.1:8000
-  • Janitor: watching for changes
-
-Ready. Press Ctrl+C to stop.
+# Agents invoke the MCP server directly (no manual start needed)
+# cairn mcp runs on-demand when agents call it
 ```
 
 ## 📦 Installation
@@ -133,7 +124,7 @@ cairn init
 ```
 
 **⚠️ Avoid `pip install --break-system-packages`** on your system Python.
-Use `pipx` or a venv. The gateway will fail if Ollama models can't be reached.
+Use `pipx` or a venv. (Ollama is optional; only required for embedding profiles.)
 
 ### Install via venv (for development)
 
@@ -144,42 +135,52 @@ pip install -e ".[dev]"
 cairn --help
 ```
 
+### Optional: Install Local Embedding Backend
+
+For embedding-heavy projects without Ollama, use fastembed (ONNX, in-process):
+
+```bash
+pip install -e ".[local]"  # adds lancedb + fastembed
+# Then set local_llm.embedder: fastembed in config.yaml
+```
+
 ## 🎯 How It Works
 
 ### Architecture
 
-Two concurrent processes:
+Two processes:
 
-1. **Gateway** (foreground, high priority)
-   - Listens on `POST /v1/chat/completions` (OpenAI) + `POST /v1/messages` (Anthropic)
-   - Also runs MCP server on stdio
-   - On request: searches ChromaDB → assembles context → forwards to cloud (or returns locally)
-   - Yields to janitor via VRAM lock
+1. **MCP Server** (`cairn mcp`) — on-demand, high priority
+   - Listens on stdio (not HTTP)
+   - Claude Code / OpenCode invoke it as a native tool
+   - Exposes: `search_code`, `assemble_context`, `orchestrate`, `set_profile`, `cache_get`, `cache_set`
+   - On request: searches index → assembles context → optionally routes to local LLM or returns
+   - Respects token budget and session state
 
 2. **Janitor** (background, low priority)
    - Watches repo for file changes (debounced)
    - Periodically checks for new commits
-   - Re-parses changed files → updates ChromaDB vector index
-   - Backs off if gateway is active (respects VRAM limits)
-   - Summarizes git diffs into memory
+   - Re-parses changed files → updates vector index (ChromaDB or LanceDB)
+   - Backs off if MCP server is active (respects VRAM limits)
+   - Summarizes git diffs into memory (token-budgeted)
 
 ### Context Assembly
 
-When a query arrives, the gateway:
+When `assemble_context()` is called:
 
-1. **Searches** for relevant code blocks (hybrid retrieval: lexical BM25 + semantic embeddings + AST)
+1. **Searches** for relevant code blocks (hybrid retrieval: lexical + semantic + structural)
 2. **Reranks** with FlashRank cross-encoder; gates on confidence (default: ≥0.47)
 3. **Loads** repository map (snapshot of all top-level functions/classes)
-4. **Loads** recent git-diff memory (last 10 entries)
+4. **Loads** recent git-diff memory (newest entries within token budget)
 5. **Assembles** a markdown prompt block with all three sources
 6. **Compresses** losslessly (removes boilerplate, shortens identifiers)
-7. **Injects** as system message to cloud model (or returns directly if local-only)
+7. **Injects** into your prompt (or returns as context string)
 
-The gateway never modifies the actual user query or agent's output — it's transparent.
+The system never modifies the actual user query or agent's output — it's transparent.
 
 ### Repository Profiles
 
-At `init`, the gateway auto-detects your repo type:
+At `init`, Cairn auto-detects your repo type:
 
 | Profile | File Types | Embedding | Strategy | Use Case |
 |---------|-----------|-----------|----------|----------|
@@ -195,12 +196,12 @@ Profiles can be overridden post-init with `cairn profile set <name>`.
 
 All state lives in `.cairn/` within your repo (version-controlled `.gitignore` prevents committing):
 
-- `config.yaml` — retrieval strategy, file patterns, profile, limits
-- `chroma/` — vector DB directory (auto-generated)
+- `config.yaml` — retrieval strategy, file patterns, profile, limits, embeddings config, token budgets
+- `chroma/` or `~/.cache/cairn/<project-id>/chroma/` — vector DB directory (location controlled by `indexing.index_location`)
 - `repo_map.json` — snapshot of functions/classes for context assembly
-- `memory.md` — git-diff summaries, last 10 entries
+- `memory.md` — git-diff summaries (newest entries, token-budgeted)
 - `metrics.json` — observability (query latency, token counts, indexing stats)
-- `.mcp.json` — MCP server config (auto-written at init)
+- `opencode.json` and `.mcp.json` — MCP server configs (auto-written at init)
 
 ## 📊 Observability
 
@@ -217,18 +218,17 @@ cat .cairn/metrics.json
 
 ## 🔒 Privacy & Security
 
-- **Local-first by default**: Code stays on your machine. The gateway only sends queries to the
-  cloud (no code unless you explicitly enable cloud reranking).
-- **No telemetry**: Gateway logs to stdout/file, never phones home.
+- **Local-first by default**: Code stays on your machine. Queries are processed locally via MCP.
+- **No telemetry**: Logs to stdout/file, never phones home.
 - **Git-aware**: Uses your repo's `.git/` to track commits; memory entries include commit hashes.
-- **Configurable routing**: `routing.mode` lets you choose "cloud_only" (always forward), "conservative" (local judgement),
-  or "aggressive" (prefer local handling).
+- **MCP isolation**: Agents communicate with Cairn over stdio (not HTTP), with no external endpoints.
 
 ## 📖 Full Documentation
 
 - **[RUNBOOK.md](RUNBOOK.md)** — First-time setup, commands reference, troubleshooting
-- **[INTEGRATION_GUIDE.md](INTEGRATION_GUIDE.md)** — Using with Claude Code, OpenCode, or as a proxy
+- **[INTEGRATION_GUIDE.md](INTEGRATION_GUIDE.md)** — Using with Claude Code & OpenCode via MCP
 - **[AGENTS.md](AGENTS.md)** — MCP tool reference & usage patterns for AI agents
+- **[docs/CONFIG.md](docs/CONFIG.md)** — Complete configuration schema reference
 
 ## 🛠 Development
 

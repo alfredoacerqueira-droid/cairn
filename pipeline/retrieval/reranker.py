@@ -6,27 +6,67 @@ ranking on semantic similarity rather than lexical/structural signals.
 
 Uses a singleton Ranker instance for efficiency (model loading is slow).
 Gracefully degrades to a no-op if flashrank is unavailable.
+
+Supports offline mode (disable reranker entirely) and custom CA bundles
+for corporate proxies.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Timeout for FlashRank model load (seconds). If the model download hangs
+# (e.g., behind a proxy), we bail out after this window.
+FLASHRANK_LOAD_TIMEOUT_S = 20
 
 # Singleton Ranker instance — loaded on first use
 _ranker: Any = None
 _ranker_failed: bool = False
 
 
-def _get_ranker() -> Any | None:
+def _configure_ca_bundle(ca_bundle: str | None) -> None:
+    """Set up CA certificate for HTTPS (corporate proxy support).
+
+    Honors the ca_bundle param first, then CAIRN_CA_BUNDLE env var,
+    then falls back to REQUESTS_CA_BUNDLE / SSL_CERT_FILE if set.
+    Sets os.environ["REQUESTS_CA_BUNDLE"] and os.environ["SSL_CERT_FILE"]
+    so the HTTP client (and FlashRank's model downloader) trust the CA.
+    """
+    # Priority: ca_bundle param > CAIRN_CA_BUNDLE > existing env vars
+    bundle_path = ca_bundle
+    if not bundle_path:
+        bundle_path = os.environ.get("CAIRN_CA_BUNDLE")
+    if not bundle_path:
+        # Fall back to existing env vars (no-op if neither is set)
+        bundle_path = os.environ.get("REQUESTS_CA_BUNDLE") or os.environ.get("SSL_CERT_FILE")
+
+    if bundle_path:
+        os.environ["REQUESTS_CA_BUNDLE"] = bundle_path
+        os.environ["SSL_CERT_FILE"] = bundle_path
+        logger.debug(f"Configured CA bundle: {bundle_path}")
+
+
+def _get_ranker(ca_bundle: str | None = None, offline: bool = False) -> Any | None:
     """Lazy-load the FlashRank Ranker as a singleton.
 
-    Returns None if flashrank is not available or the model fails to load.
-    Sets a flag to avoid repeated attempts after failure.
+    Args:
+        ca_bundle: Path to custom CA certificate bundle (corporate proxy).
+        offline: If True, skip model load entirely; return None immediately.
+
+    Returns None if flashrank is not available, model fails to load, times out,
+    or offline mode is enabled. Sets a flag to avoid repeated attempts after failure.
     """
     global _ranker, _ranker_failed
+
+    if offline:
+        logger.debug("Reranking disabled (offline mode)")
+        return None
 
     if _ranker_failed:
         return None
@@ -34,12 +74,31 @@ def _get_ranker() -> Any | None:
     if _ranker is not None:
         return _ranker
 
+    # Configure CA bundle before attempting import/load
+    _configure_ca_bundle(ca_bundle)
+
     try:
         from flashrank import Ranker
 
-        _ranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2")
-        logger.info("FlashRank reranker initialized (ms-marco-MiniLM-L-12-v2)")
-        return _ranker
+        # Wrap Ranker construction in a timeout to prevent hangs
+        # (e.g., Zscaler SSL stall during model download from huggingface.co)
+        def _load():
+            return Ranker(model_name="ms-marco-MiniLM-L-12-v2")
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_load)
+            try:
+                _ranker = future.result(timeout=FLASHRANK_LOAD_TIMEOUT_S)
+                logger.info("FlashRank reranker initialized (ms-marco-MiniLM-L-12-v2)")
+                return _ranker
+            except FuturesTimeoutError:
+                logger.warning(
+                    f"FlashRank model load timed out after {FLASHRANK_LOAD_TIMEOUT_S}s "
+                    "(possibly blocked by proxy); reranking disabled"
+                )
+                _ranker_failed = True
+                return None
+
     except ImportError:
         logger.warning("flashrank not available; reranking disabled (install via pip)")
         _ranker_failed = True
@@ -60,11 +119,21 @@ class Reranker:
 
     If flashrank is unavailable or model loading fails, the reranker
     gracefully returns candidates unchanged (no-op fallback).
+
+    Supports offline mode (skip reranker entirely) and custom CA bundles
+    for corporate proxies.
     """
 
-    def __init__(self):
-        """Initialize the reranker (lazy-loads model on first rerank call)."""
+    def __init__(self, ca_bundle: str | None = None, offline: bool = False):
+        """Initialize the reranker (lazy-loads model on first rerank call).
+
+        Args:
+            ca_bundle: Path to custom CA certificate bundle.
+            offline: If True, disable reranker (no model load attempt).
+        """
         self.ranker = None
+        self.ca_bundle = ca_bundle
+        self.offline = offline
 
     def rerank(self, query: str, candidates: list[dict], top_k: int | None = None) -> list[dict]:
         """Rerank candidates by cross-encoder relevance.
@@ -89,7 +158,7 @@ class Reranker:
         if not candidates:
             return []
 
-        ranker = _get_ranker()
+        ranker = _get_ranker(ca_bundle=self.ca_bundle, offline=self.offline)
         if ranker is None:
             # Graceful no-op: attach rerank_score from existing similarity
             for c in candidates:

@@ -42,6 +42,12 @@ class IndexingConfig(BaseModel):
         "*.tfvars",
         "*.toml",
     ]
+    # Index location: where the heavy vector DB directories (chroma/, lance/) live.
+    # "auto" (default): native ~/.cache/cairn/<project-id> if on Windows mount (/mnt/),
+    #                   else in-project (.cairn/)
+    # "native": ~/.cache/cairn/<project-id>/ (forces use of native filesystem)
+    # "in_project": .cairn/ (keeps index in the project directory)
+    index_location: str = "auto"
     exclude_patterns: list[str] = [
         "**/node_modules/**",
         "**/.git/**",
@@ -79,6 +85,12 @@ class IndexingConfig(BaseModel):
     source_roots: list[str] = ["."]
     batch_size: int = 50
     delay_ms: int = 500
+    # Maximum file size in KB before skipping parse. Set to 0 to disable the limit.
+    # Files exceeding this limit are skipped with a warning log.
+    max_file_kb: int = 0
+    # Maximum time in seconds to spend parsing a single file. If exceeded, the file
+    # is skipped with a warning log. Set to 0 to disable (no timeout).
+    parse_timeout_s: float = 10.0
     # Embedding model for semantic code search via Ollama.
     # Default "nomic-embed-text" is a general-purpose embedder.
     # For better code retrieval discrimination, use a code-trained model
@@ -91,6 +103,7 @@ class IndexingConfig(BaseModel):
     #   4. Re-measure RetrievalConfig.min_confidence on the new model's cosine scale
     #      (different models have different output distributions)
     embedding_model: str = "nomic-embed-text"
+    store_backend: str = "chroma"  # chroma | lance — flips to lance after benchmark
 
 
 class StaleDBConfig(BaseModel):
@@ -114,7 +127,19 @@ class RoutingConfig(BaseModel):
 class CacheConfig(BaseModel):
     enabled: bool = True
     ttl_seconds: int = 300
+    # Prompt/response semantic cache TTL (30 min) — separate from session cache
+    semantic_ttl_seconds: int = 1800
     max_entries: int = 100
+
+
+class BudgetConfig(BaseModel):
+    # Token budget for what Cairn injects at session start (memory + repo map +
+    # MCP outputs).
+    session_window: int = 200_000  # standard (non-1M) Sonnet context window
+    session_pct: float = 0.18  # cap Cairn's session-start contribution at 18%
+    # -> 36k tokens
+    tool_max_tokens: int = 8_000  # per-MCP-tool output cap
+    tokenizer_model: str = "claude"  # passed to core.tokens (cl100k_base proxy)
 
 
 class RetrievalConfig(BaseModel):
@@ -166,6 +191,13 @@ class RetrievalConfig(BaseModel):
     # For small/specialized repos, hybrid mode may help; override via config.
     # Set 0.0 to disable the guard entirely.
     min_confidence: float = 0.82
+    # Offline mode: disable reranker entirely (skip FlashRank load).
+    # Useful behind corporate proxies where model download fails/hangs.
+    offline: bool = False
+    # Custom CA bundle path for HTTPS certificate validation (e.g., corporate proxies).
+    # If set, overrides CAIRN_CA_BUNDLE / REQUESTS_CA_BUNDLE / SSL_CERT_FILE.
+    # Passed to flashrank via os.environ before model load.
+    ca_bundle: str | None = None
 
 
 class CompressionConfig(BaseModel):
@@ -175,6 +207,39 @@ class CompressionConfig(BaseModel):
     enabled: bool = True
     # Compression level: "none" (0%), "minimal" (20-40%), "aggressive" (60-90%)
     level: str = "minimal"
+
+
+class LocalLLMConfig(BaseModel):
+    # Whether to use a local LLM for embeddings and text generation.
+    # When disabled, Cairn operates without any LLM (lexical/structural + cross-encoder only).
+    enabled: bool = False
+    # Backend type: "ollama" (Ollama) or "openai_compatible" (LM Studio, llama.cpp, etc.)
+    backend: str = "ollama"  # ollama | openai_compatible
+    # Base URL for the backend (e.g., http://127.0.0.1:11434 for Ollama,
+    # http://127.0.0.1:8000 for LM Studio). If None, uses backend defaults.
+    base_url: str | None = None
+    # Model name for text generation (summarization, etc.).
+    # For Ollama: qwen2.5-coder:1.5b (default). For OpenAI-compatible: model ID.
+    model: str | None = None
+    # Model name for embeddings (semantic search).
+    # For Ollama: nomic-embed-text (default). For OpenAI-compatible: model ID.
+    embed_model: str | None = None
+    # The local model's true context window (tokens).
+    context_window: int = 8192
+    # Usable input budget per local call (context minus output reserve).
+    max_local_tokens: int = 6000
+    # Tokens reserved for a map/reduce answer.
+    reduce_reserve_tokens: int = 1024
+    # 10-15% sliding-window overlap between chunks.
+    chunk_overlap_pct: float = 0.12
+    # work <= one_shot_threshold * max_local_tokens -> single call
+    one_shot_threshold: float = 0.75
+    # Embedder type: "ollama" | "fastembed" | "none"
+    embedder: str = "ollama"
+    # In-process ONNX embedder for the no-LLM mode.
+    fastembed_model: str = "BAAI/bge-small-en-v1.5"
+    # Parallel local-LLM map calls (1-2 on 6GB VRAM).
+    map_concurrency: int = 1
 
 
 class Config(BaseModel):
@@ -190,8 +255,10 @@ class Config(BaseModel):
     memory: MemoryConfig = MemoryConfig()
     routing: RoutingConfig = RoutingConfig()
     cache: CacheConfig = CacheConfig()
+    budget: BudgetConfig = BudgetConfig()
     retrieval: RetrievalConfig = RetrievalConfig()
     compression: CompressionConfig = CompressionConfig()
+    local_llm: LocalLLMConfig = LocalLLMConfig()
 
 
 def load_config(project_path: Optional[Path] = None) -> Config:

@@ -2,18 +2,17 @@
 
 This guide is for AI agents (Claude Code, OpenCode, etc.) using the Cairn via MCP.
 
-## What Is the Gateway?
+## What Is Cairn?
 
-The Cairn is a **local retrieval + compression engine** that sits between you and your codebase.
+Cairn is a **local retrieval + compression engine** that sits between you and your codebase.
 It indexes your code into a vector database, searches for relevant functions when you need them, compresses them,
-and makes them available as MCP tools. **Everything stays local.** Your code is never sent to the cloud unless you
-explicitly forward it via the HTTP proxy.
+and makes them available as MCP tools via `cairn mcp`. **Everything stays local.** Your code never leaves your machine.
 
 **Key benefit:** Get surgical context for coding tasks without flooding the LLM with irrelevant code.
 
 ## How Profiles Work
 
-The gateway auto-detects your repo type and chooses a retrieval strategy:
+Cairn auto-detects your repo type and chooses a retrieval strategy:
 
 - **IaC** (Terraform, Helm, Kubernetes): structural + lexical search, embeddings OFF
 - **.NET** (C#): full hybrid (embeddings + lexical + structural)
@@ -28,7 +27,7 @@ by exact name matching and block boundaries, not semantic similarity.
 
 ---
 
-## The Three MCP Tools
+## The Six MCP Tools
 
 ### 1. `search_code(query, top_k=5)`
 
@@ -127,12 +126,51 @@ search_code("authentication middleware", top_k=3)
 ```
 # Auto-detect guessed "python" but it's actually Terraform
 set_profile("iac")
-→ Gateway now uses structural + lexical retrieval (no embeddings)
+→ Cairn now uses structural + lexical retrieval (no embeddings)
 ```
 
 **When to use:**
-- The gateway is returning irrelevant results
+- Cairn is returning irrelevant results
 - You know the correct profile but init misdetected it
+
+### 4. `orchestrate(query, instruction="", payload="")`
+
+**Use when:** You want Cairn to decide whether to handle work locally or defer to the cloud LLM.
+
+**What it does:**
+- Sizes work in tokens
+- Routes intelligently:
+  - Context-only (just return assembled context)
+  - One local-LLM call (if work fits the small window)
+  - Map-reduce split (for large work)
+  - Defer-to-cloud (if local can't handle it)
+
+**When to use:**
+- Complex reasoning tasks that might need local LLM assistance
+- Work that could be too large for a single call
+
+### 5. `cache_get(query)`
+
+**Use when:** You want to retrieve a cached response.
+
+**What it does:**
+- Looks up query in the local semantic cache
+- Returns cached value if found and not expired
+
+**When to use:**
+- Repeated queries on the same codebase (same session)
+
+### 6. `cache_set(query, value, ttl_seconds=300)`
+
+**Use when:** You want to store a computed response for later retrieval.
+
+**What it does:**
+- Stores value in the local semantic cache
+- Auto-expires after `ttl_seconds` (default 300s)
+
+**When to use:**
+- Caching results of expensive computations
+- Sharing context between tool calls
 
 ---
 
@@ -200,7 +238,7 @@ This means:
 - On-topic queries → full context injected
 - You never get irrelevant noise in `assemble_context()`
 
-If `assemble_context()` returns "No confident matches" but `search_code()` found things, the gateway
+If `assemble_context()` returns "No confident matches" but `search_code()` found things, Cairn
 decided those results were off-topic. This is **intentional** — better to have no context than wrong context.
 
 ---
@@ -216,7 +254,7 @@ Specific queries match better to relevant code.
 
 ### 2. Use Natural Language
 
-The gateway understands English descriptions of what you want to do.
+Cairn understands English descriptions of what you want to do.
 
 ✓ Good: "database connection pooling"
 ✓ Good: "how do we serialize JSON responses?"
@@ -251,11 +289,9 @@ The wrong profile gives noisy results. Use `set_profile()` if auto-detection was
 
 ## Privacy & Security
 
-- **Local first:** Code stays on your machine. The gateway runs locally.
-- **No telemetry:** Gateway doesn't phone home.
-- **No cloud forwarding:** MCP tools don't send code to the cloud (only your query).
-- **Optional proxy:** If you use the HTTP proxy mode, code is sent to the cloud in the system message
-  (but compressed ~90%).
+- **Local first:** Code stays on your machine. Cairn runs locally via MCP (stdio).
+- **No telemetry:** Cairn doesn't phone home.
+- **No cloud forwarding:** MCP tools don't send code to the cloud (only your natural-language query is processed locally).
 
 ---
 
@@ -263,14 +299,14 @@ The wrong profile gives noisy results. Use `set_profile()` if auto-detection was
 
 ### "No confident matches" from `assemble_context()`
 
-The gateway thinks your query is off-topic. Try:
+Cairn thinks your query is off-topic. Try:
 1. Make the query more specific
 2. Use `search_code()` to see what's available
 3. Check that the right profile is detected: `set_profile()` if not
 
 ### Results from `search_code()` look irrelevant
 
-The gateway may have the wrong profile. Check:
+Cairn may have the wrong profile. Check:
 1. The repo type (IaC? .NET? Python?)
 2. Call `set_profile()` to override if wrong
 3. Try a different query (more specific, different keywords)
@@ -288,10 +324,9 @@ Subsequent queries should be fast (<100ms).
 
 ## FAQ
 
-**Q: Does the gateway send my code to the cloud?**
+**Q: Does Cairn send my code to the cloud?**
 
-A: No (with MCP). Code stays local. Only your natural-language query is processed. The optional HTTP proxy
-mode does send code in the system message (but compressed ~90%).
+A: No. Code stays local. Only your natural-language query is processed locally via MCP. Nothing leaves your machine.
 
 **Q: What happens if the profile is wrong?**
 

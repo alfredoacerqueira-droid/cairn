@@ -3,26 +3,175 @@
 This module exposes the semantic search and context assembly capabilities as
 native MCP tools, allowing Claude Code and OpenCode to use the gateway directly
 without needing to route through OpenAI-compatible endpoints.
+
+Supports both single-repo and workspace modes:
+  - SINGLE: CAIRN_PROJECT points to a repo with .cairn/ directory
+  - WORKSPACE: CAIRN_PROJECT points to a parent directory with indexed child repos
+  - UNBOUND: No valid binding found
 """
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
 from mcp.server import FastMCP
 
+from core.semantic_cache import SemanticCache
 from server.context_assembler import ContextAssembler
+from server.orchestrator import Orchestrator, SessionBudget, emit
+from server.workspace_router import WorkspaceRouter
 
-# Bind project path from environment or use cwd
-_PROJECT_PATH = Path(os.getenv("CAIRN_PROJECT") or os.getenv("GATEWAY_PROJECT") or ".").resolve()
+logger = logging.getLogger(__name__)
+
+# Fail-closed project binding: strict resolution without fallback to cwd.
+_PROJECT_PATH: Path | None = None
+_BIND_ERROR: str | None = None
 _assembler: ContextAssembler | None = None
+_router: WorkspaceRouter | None = None
+
+# Per-session token budget (one per MCP process).
+_session_budget: SessionBudget | None = None
+
+# Per-project semantic caches, keyed by resolved project path.
+_semantic_caches: dict[Path, SemanticCache] = {}
 
 
-def _get_assembler() -> ContextAssembler:
-    """Get or create the shared ContextAssembler instance."""
-    global _assembler
-    if _assembler is None:
+def _classify_binding() -> tuple[str, Path | None, str | None]:
+    """Classify CAIRN_PROJECT/GATEWAY_PROJECT as SINGLE, WORKSPACE, or UNBOUND.
+
+    Returns:
+        (mode, path, error) where:
+          - SINGLE: path has .cairn/, error is None
+          - WORKSPACE: path has no .cairn/ but children do, error is None
+          - UNBOUND: path is None, error is an explanatory message
+    """
+    env_path = os.getenv("CAIRN_PROJECT") or os.getenv("GATEWAY_PROJECT")
+    if not env_path:
+        return (
+            "UNBOUND",
+            None,
+            (
+                "Cairn MCP server has no bound project. Set CAIRN_PROJECT to an "
+                "indexed repo (a dir containing .cairn/) or a workspace root."
+            ),
+        )
+
+    path = Path(env_path).resolve()
+    if not path.exists():
+        return "UNBOUND", None, f"CAIRN_PROJECT path does not exist: {env_path}"
+
+    # Check for SINGLE mode: this path itself has .cairn/
+    cairn_dir = path / ".cairn"
+    if cairn_dir.exists():
+        return "SINGLE", path, None
+
+    # Check for WORKSPACE mode: this path has children with .cairn/
+    discovered = WorkspaceRouter.discover_repos(path)
+    if discovered:
+        return "WORKSPACE", path, None
+
+    # Neither SINGLE nor WORKSPACE
+    return (
+        "UNBOUND",
+        None,
+        f"CAIRN_PROJECT path is neither indexed (no .cairn/) nor a workspace "
+        f"(no indexed child repos): {env_path}",
+    )
+
+
+def _resolve_project_path() -> tuple[Path | None, str | None]:
+    """Resolve project path from environment (SINGLE mode only).
+
+    Deprecated: use _classify_binding() for full mode detection.
+    Kept for backward compatibility in tests.
+
+    Returns:
+        (Path, None) if bound, or (None, error_msg) if unbound.
+    """
+    mode, path, error = _classify_binding()
+    if mode == "SINGLE":
+        return path, None
+    return None, error or "Unbound project"
+
+
+def _get_session_budget(cfg) -> SessionBudget:
+    """Get or create the per-process session budget.
+
+    Lazily creates a SessionBudget with capacity = session_window * session_pct
+    (e.g. 200_000 * 0.18 = 36_000 tokens by default).
+
+    Args:
+        cfg: Config object with .budget attributes.
+
+    Returns:
+        The global SessionBudget instance.
+    """
+    global _session_budget
+    if _session_budget is None:
+        cap = int(cfg.budget.session_window * cfg.budget.session_pct)
+        _session_budget = SessionBudget(cap)
+    return _session_budget
+
+
+def _emit(text: str, cfg) -> str:
+    """Budget-wrap tool output: per-tool cap + session budget charge.
+
+    Args:
+        text: Text to emit.
+        cfg: Config object with .budget.tool_max_tokens.
+
+    Returns:
+        Text truncated to per-tool cap, then charged to session budget.
+    """
+    session_budget = _get_session_budget(cfg)
+    return emit(text, cfg.budget.tool_max_tokens, session_budget)
+
+
+def _get_cache(project_path: Path, cfg) -> SemanticCache:
+    """Get or create a SemanticCache for a project.
+
+    Caches instances by resolved project_path so we reuse one instance per
+    project across multiple tool calls.
+
+    Args:
+        project_path: The project root path.
+        cfg: Config object.
+
+    Returns:
+        SemanticCache instance (cached).
+    """
+    global _semantic_caches
+    project_path = project_path.resolve()
+    if project_path not in _semantic_caches:
+        from pipeline.store.embedders import make_embedder
+
+        cache_dir = project_path / ".cairn" / "cache" / "semantic"
+        embedder = make_embedder(cfg)
+        _semantic_caches[project_path] = SemanticCache(
+            cache_dir,
+            embedder,
+            ttl_seconds=cfg.cache.semantic_ttl_seconds,
+        )
+    return _semantic_caches[project_path]
+
+
+def reset_session_budget() -> None:
+    """Reset the session budget (for test isolation).
+
+    This is a test-only helper; never called in production.
+    """
+    global _session_budget
+    _session_budget = None
+
+
+def _get_assembler() -> ContextAssembler | None:
+    """Get or create the shared ContextAssembler instance, or None if unbound."""
+    global _assembler, _PROJECT_PATH, _BIND_ERROR
+    if _BIND_ERROR is not None:
+        return None
+    if _assembler is None and _PROJECT_PATH is not None:
         _assembler = ContextAssembler(project_path=_PROJECT_PATH)
     return _assembler
 
@@ -43,13 +192,39 @@ def search_code(query: str, top_k: int = 5) -> str:
         A formatted string with matched functions, their locations, and code.
     """
     try:
+        if _BIND_ERROR is not None:
+            return _BIND_ERROR
+        # If workspace router is bound, delegate to it
+        if _router is not None:
+            from core.config import load_config
+
+            # Resolve the best repo's config for budget wrapping
+            best_repo, _ = _router.route(query, top_k=top_k)
+            if best_repo is None:
+                return (
+                    "Could not confidently determine which repo answers this query "
+                    "(no confident match in any workspace repo)."
+                )
+            cfg = load_config(best_repo)
+            result = _router.search(query, top_k=top_k)
+            return _emit(result, cfg)
+        # Otherwise single-repo mode
         assembler = _get_assembler()
+        if assembler is None:
+            return (
+                "Cairn MCP server has no bound project. Set CAIRN_PROJECT to an "
+                "indexed repo (a dir containing .cairn/)."
+            )
+        from core.config import load_config
+
+        cfg = load_config(_PROJECT_PATH)
         # apply_guard=True so off-topic queries return "no confident matches"
         # rather than low-confidence noise (same gate as assemble_context).
         results = assembler.semantic_search(query, top_k=top_k, apply_guard=True)
 
         if not results:
-            return "No confident matches found for this query."
+            result = "No confident matches found for this query."
+            return _emit(result, cfg)
 
         lines = []
         for i, result in enumerate(results, 1):
@@ -72,7 +247,7 @@ def search_code(query: str, top_k: int = 5) -> str:
                 lines.append(f"   Code: {code_preview}")
             lines.append("")
 
-        return "\n".join(lines)
+        return _emit("\n".join(lines), cfg)
     except Exception as e:
         return f"Search error: {str(e)}"
 
@@ -94,8 +269,34 @@ def assemble_context(query: str) -> str:
         The assembled context as markdown, token-compressed.
     """
     try:
+        if _BIND_ERROR is not None:
+            return _BIND_ERROR
+        # If workspace router is bound, delegate to it
+        if _router is not None:
+            from core.config import load_config
+
+            # Resolve the best repo's config for budget wrapping
+            best_repo, _ = _router.route(query, top_k=5)
+            if best_repo is None:
+                return (
+                    "Could not confidently determine which repo answers this query "
+                    "(no confident match in any workspace repo)."
+                )
+            cfg = load_config(best_repo)
+            result = _router.assemble(query)
+            return _emit(result, cfg)
+        # Otherwise single-repo mode
         assembler = _get_assembler()
-        return assembler.assemble_context(query)
+        if assembler is None:
+            return (
+                "Cairn MCP server has no bound project. Set CAIRN_PROJECT to an "
+                "indexed repo (a dir containing .cairn/)."
+            )
+        from core.config import load_config
+
+        cfg = load_config(_PROJECT_PATH)
+        result = assembler.assemble_context(query)
+        return _emit(result, cfg)
     except Exception as e:
         return f"Context assembly error: {str(e)}"
 
@@ -107,6 +308,8 @@ def set_profile(profile_name: str) -> str:
     Profiles determine which retrieval legs are active and whether embeddings
     are enabled. Options: 'iac', 'dotnet', 'python', 'code', 'shell', 'auto'.
 
+    Note: set_profile requires a single-repo binding (not a workspace).
+
     Args:
         profile_name: The profile to set ('iac', 'dotnet', 'python', 'code',
                       'shell', or 'auto' for detection)
@@ -115,9 +318,19 @@ def set_profile(profile_name: str) -> str:
         Confirmation message with the set profile and its strategy.
     """
     try:
+        if _BIND_ERROR is not None:
+            return _BIND_ERROR
+        # set_profile only works in single-repo mode
+        if _router is not None:
+            return "set_profile requires a single-repo binding, not a workspace."
+        if _PROJECT_PATH is None:
+            return (
+                "Cairn MCP server has no bound project. Set CAIRN_PROJECT to an "
+                "indexed repo (a dir containing .cairn/)."
+            )
         from core.config import load_config, save_config
         from core.profiles import PROFILES, detect_profile, get_profile
-        from core.repo import census_extensions
+        from core.repo import census_extensions, detect_infra_markers, detect_source_layout
 
         if profile_name not in PROFILES and profile_name != "auto":
             return (
@@ -129,11 +342,10 @@ def set_profile(profile_name: str) -> str:
 
         if profile_name == "auto":
             # Auto-detect
-            from core.repo import detect_source_layout
-
             detected_roots, _ = detect_source_layout(_PROJECT_PATH)
             ext_census = census_extensions(_PROJECT_PATH, source_roots=detected_roots)
-            detected_name = detect_profile(ext_census)
+            has_infra_markers = detect_infra_markers(_PROJECT_PATH, source_roots=detected_roots)
+            detected_name = detect_profile(ext_census, has_infra_markers=has_infra_markers)
             profile = get_profile(detected_name)
             cfg.profile = detected_name
             result_msg = (
@@ -159,14 +371,187 @@ def set_profile(profile_name: str) -> str:
             cfg.indexing.embedding_model = profile.embedding_model
 
         save_config(cfg, _PROJECT_PATH)
-        return result_msg + " Config updated."
+        result = result_msg + " Config updated."
+        return _emit(result, cfg)
 
     except Exception as e:
         return f"Error setting profile: {str(e)}"
 
 
+@mcp.tool(description="Execute a query with orchestrated context assembly and LLM routing")
+def orchestrate(query: str, instruction: str = "", payload: str = "") -> str:
+    """Execute a query with smart context assembly and optional local LLM processing.
+
+    Routes work to one of four execution paths based on token budget and LLM
+    availability:
+      - CONTEXT_ONLY: return enriched context (no LLM call)
+      - LOCAL_ONE_SHOT: single local-LLM call
+      - LOCAL_MAP_REDUCE: split + map-reduce execution
+      - DEFER_TO_CLOUD: too big for local → context-only with marker
+
+    All output is token-budget-capped per tool and per session.
+
+    Args:
+        query: The semantic search query.
+        instruction: Optional task instruction (e.g., "summarize", "extract").
+                    If empty, returns context-only.
+        payload: Optional explicit payload (overrides assembled context).
+
+    Returns:
+        LLM output (if instruction provided and local LLM enabled) or
+        context-only output (budget-capped).
+    """
+    try:
+        if _BIND_ERROR is not None:
+            return _BIND_ERROR
+
+        # Resolve project path and assembler (workspace or single)
+        if _router is not None:
+            best_repo, _ = _router.route(query, top_k=5)
+            if best_repo is None:
+                return (
+                    "Could not confidently determine which repo answers this query "
+                    "(no confident match in any workspace repo)."
+                )
+            assembler = _router.assembler_for(best_repo)
+            cfg_path = best_repo
+        else:
+            assembler = _get_assembler()
+            if assembler is None:
+                return (
+                    "Cairn MCP server has no bound project. Set CAIRN_PROJECT to an "
+                    "indexed repo (a dir containing .cairn/)."
+                )
+            cfg_path = _PROJECT_PATH
+
+        from core.config import load_config
+
+        cfg = load_config(cfg_path)
+
+        # Build LLM client if local_llm is enabled
+        llm = None
+        if cfg.local_llm.enabled:
+            from server.ollama_client import make_llm_client
+
+            llm = make_llm_client(cfg.local_llm)
+
+        # Execute via orchestrator
+        orch = Orchestrator(assembler, cfg, llm)
+        result = orch.execute(query, payload or None, instruction or None)
+        return _emit(result, cfg)
+    except Exception as e:
+        return f"Orchestration error: {str(e)}"
+
+
+@mcp.tool(description="Retrieve a cached value by query")
+def cache_get(query: str) -> str:
+    """Retrieve a cached value by query (exact or semantic match).
+
+    First tries EXACT match (O(1) filename probe). If miss, tries SEMANTIC
+    match by scanning non-expired entries and comparing embeddings.
+
+    Args:
+        query: The prompt/query string.
+
+    Returns:
+        Cached value if found and not expired, or "CACHE_MISS" literal.
+    """
+    try:
+        if _BIND_ERROR is not None:
+            return _BIND_ERROR
+
+        # Resolve project path (SINGLE: _PROJECT_PATH; WORKSPACE: route to best repo)
+        if _router is not None:
+            best_repo, _ = _router.route(query, top_k=5)
+            if best_repo is None:
+                return "No repo matched for cache lookup."
+            project_path = best_repo
+        else:
+            if _PROJECT_PATH is None:
+                return (
+                    "Cairn MCP server has no bound project. Set CAIRN_PROJECT to an "
+                    "indexed repo (a dir containing .cairn/)."
+                )
+            project_path = _PROJECT_PATH
+
+        from core.config import load_config
+
+        cfg = load_config(project_path)
+        cache = _get_cache(project_path, cfg)
+        hit = cache.get(query)
+        if hit is None:
+            return "CACHE_MISS"
+        return _emit(hit, cfg)
+    except Exception as e:
+        return f"Cache lookup error: {str(e)}"
+
+
+@mcp.tool(description="Store a value in the semantic cache")
+def cache_set(query: str, value: str, ttl_seconds: int = 0) -> str:
+    """Store a query-value pair in the semantic cache.
+
+    Args:
+        query: The prompt/query string.
+        value: The response/cached value.
+        ttl_seconds: Optional TTL override (0 = use cache default).
+
+    Returns:
+        Confirmation message "cached" or error.
+    """
+    try:
+        if _BIND_ERROR is not None:
+            return _BIND_ERROR
+
+        # Resolve project path (SINGLE: _PROJECT_PATH; WORKSPACE: route to best repo)
+        if _router is not None:
+            best_repo, _ = _router.route(query, top_k=5)
+            if best_repo is None:
+                return "No repo matched for cache storage."
+            project_path = best_repo
+        else:
+            if _PROJECT_PATH is None:
+                return (
+                    "Cairn MCP server has no bound project. Set CAIRN_PROJECT to an "
+                    "indexed repo (a dir containing .cairn/)."
+                )
+            project_path = _PROJECT_PATH
+
+        from core.config import load_config
+
+        cfg = load_config(project_path)
+        cache = _get_cache(project_path, cfg)
+        cache.set(query, value, ttl_seconds or None)
+        return "cached"
+    except Exception as e:
+        return f"Cache write error: {str(e)}"
+
+
 def run_stdio() -> None:
-    """Run the MCP server over stdio (for Claude Code / OpenCode)."""
+    """Run the MCP server over stdio (for Claude Code / OpenCode).
+
+    Resolves the binding mode (SINGLE, WORKSPACE, or UNBOUND) from
+    CAIRN_PROJECT/GATEWAY_PROJECT and initializes accordingly.
+    """
+    global _PROJECT_PATH, _BIND_ERROR, _router
+    mode, path, error = _classify_binding()
+
+    if mode == "SINGLE":
+        _PROJECT_PATH = path
+        _BIND_ERROR = None
+        logger.info("Cairn MCP bound to single repo: %s", _PROJECT_PATH)
+    elif mode == "WORKSPACE":
+        _router = WorkspaceRouter(path)
+        discovered_names = [p.name for p in _router.repo_paths]
+        logger.info(
+            "Cairn MCP bound to workspace %s (%d repos: %s)",
+            path,
+            len(_router.repo_paths),
+            ", ".join(discovered_names),
+        )
+    else:  # UNBOUND
+        _BIND_ERROR = error
+        logger.error("Cairn MCP: %s", _BIND_ERROR)
+
     mcp.run()
 
 

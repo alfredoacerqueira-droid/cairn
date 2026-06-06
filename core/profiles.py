@@ -151,23 +151,32 @@ PROFILES: dict[str, ProfileSpec] = {
 }
 
 
-def detect_profile(extension_counts: dict[str, int]) -> str:
+def detect_profile(
+    extension_counts: dict[str, int],
+    has_infra_markers: bool = False,
+) -> str:
     """Detect the best profile for a repo given a census of file extensions.
 
     Heuristic logic:
-    1. If terraform/HCL files present, OR yaml/yml dominant (>50% of code files
-       in an infra context) -> "iac"
-    2. Else if C# files present -> "dotnet"
-    3. Else if Python dominant (>50% of code files) -> "python"
-    4. Else if shell scripts dominant (>50% of code files) -> "shell"
-    5. Else -> "code" (catch-all generic programming languages)
+    1. If has_infra_markers (Chart.yaml, kustomization.yaml, K8s manifests),
+       return "iac" early (before language dominance checks).
+    2. If terraform/HCL files present -> "iac"
+    3. If yaml/yml dominant (>50%) AND no real programming language is dominant
+       (none of .py/.cs/.ts/.js/.go/.rs exceeds ~30%) -> "iac"
+    4. Else if C# files present -> "dotnet"
+    5. Else if Python dominant (>50%) -> "python"
+    6. Else if shell scripts dominant (>50%) -> "shell"
+    7. Else -> "code" (catch-all generic programming languages)
 
     The heuristic is deterministic: it checks in a fixed order and picks the
-    first match. This makes detection predictable across runs.
+    first match. Incidental .sh/.json files in a Helm repo do NOT block IaC
+    classification; only a dominant real programming language does.
 
     Args:
         extension_counts: dict mapping extension (with dot) to count,
                           e.g., {'.py': 150, '.tf': 50, '.yaml': 20}
+        has_infra_markers: If True, short-circuit and return "iac" immediately
+                           (set by detect_infra_markers helper).
 
     Returns:
         Profile name: 'iac' | 'dotnet' | 'python' | 'shell' | 'code'
@@ -176,37 +185,51 @@ def detect_profile(extension_counts: dict[str, int]) -> str:
         # Empty codebase; default to generic code
         return "code"
 
+    # Short-circuit: if explicit infrastructure markers present, always iac
+    if has_infra_markers:
+        return "iac"
+
     # Total code files (for computing percentages)
     total_files = sum(extension_counts.values())
 
-    # IaC detection: tf/hcl files OR (yaml/yml dominant in infra context)
+    # IaC detection: tf/hcl files present (always strong signal)
     has_tf = extension_counts.get(".tf", 0) > 0
     has_hcl = extension_counts.get(".hcl", 0) > 0
-    yaml_count = extension_counts.get(".yaml", 0) + extension_counts.get(".yml", 0)
-    yaml_pct = yaml_count / total_files if total_files > 0 else 0
 
-    # If terraform/HCL explicitly present, always pick iac
-    # (even if it's a multi-language repo with some iac)
     if has_tf or has_hcl:
         return "iac"
 
-    # If yaml/yml dominant (>50%) and no code files yet, tentatively iac
-    # (e.g., a k8s repo with only yamls). But only if *no* other code is
-    # detected, to avoid misclassifying a Python+YAML repo as iac.
-    has_code = any(
-        ext in extension_counts and extension_counts[ext] > 0
-        for ext in [".py", ".cs", ".sh", ".bash", ".js", ".ts", ".go", ".rs"]
-    )
-    if yaml_pct > 0.5 and not has_code and yaml_count > 0:
+    # Check for dominant real programming languages
+    # (a handful of .sh/.json in a Helm repo should not block IaC)
+    py_count = extension_counts.get(".py", 0)
+    cs_count = extension_counts.get(".cs", 0)
+    ts_count = extension_counts.get(".ts", 0)
+    js_count = extension_counts.get(".js", 0)
+    go_count = extension_counts.get(".go", 0)
+    rs_count = extension_counts.get(".rs", 0)
+
+    py_pct = py_count / total_files if total_files > 0 else 0
+    cs_pct = cs_count / total_files if total_files > 0 else 0
+    ts_pct = ts_count / total_files if total_files > 0 else 0
+    js_pct = js_count / total_files if total_files > 0 else 0
+    go_pct = go_count / total_files if total_files > 0 else 0
+    rs_pct = rs_count / total_files if total_files > 0 else 0
+
+    has_dominant_lang = any(p > 0.30 for p in [py_pct, cs_pct, ts_pct, js_pct, go_pct, rs_pct])
+
+    # If yaml/yml dominant (>50%) and NO dominant programming language,
+    # tentatively iac (e.g., a k8s or Helm repo with only yamls + helpers)
+    yaml_count = extension_counts.get(".yaml", 0) + extension_counts.get(".yml", 0)
+    yaml_pct = yaml_count / total_files if total_files > 0 else 0
+
+    if yaml_pct > 0.5 and not has_dominant_lang and yaml_count > 0:
         return "iac"
 
-    # C# detection: .cs files present
-    if extension_counts.get(".cs", 0) > 0:
+    # C# detection: .cs files present (check BEFORE language dominance tests)
+    if cs_count > 0:
         return "dotnet"
 
     # Python detection: python dominant
-    py_count = extension_counts.get(".py", 0)
-    py_pct = py_count / total_files if total_files > 0 else 0
     if py_pct > 0.5:
         return "python"
 

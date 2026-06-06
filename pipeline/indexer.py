@@ -1,5 +1,6 @@
 """ChromaDB vector indexer for semantic code search."""
 
+import logging
 import time
 from pathlib import Path
 from typing import Optional
@@ -7,7 +8,26 @@ from typing import Optional
 import chromadb
 from chromadb.config import Settings as ChromaSettings
 
+from core.repo import project_id
 from server.ollama_client import OllamaClient
+
+logger = logging.getLogger(__name__)
+
+# Maximum batch size for ChromaDB upserts. The client reports 5461, but we use
+# a conservative 5000 to leave headroom.
+_MAX_UPSERT_BATCH = 5000
+
+
+def _derive_project_root(chroma_path: str | Path) -> Path | None:
+    """Recover the project root from a standard ``<project>/.cairn/chroma`` path.
+
+    Returns None for non-standard chroma paths (e.g. bare tmp dirs used by some
+    low-level unit tests), which keeps the legacy un-namespaced collection.
+    """
+    p = Path(chroma_path).resolve()
+    if p.name == "chroma" and p.parent.name == ".cairn":
+        return p.parent.parent
+    return None
 
 
 class VectorIndexer:
@@ -26,6 +46,7 @@ class VectorIndexer:
         embedding_model: Optional[str] = None,
         cache=None,
         embeddings_enabled: bool = True,
+        project_root: Optional[str | Path] = None,
     ):
         self.chroma_path = str(chroma_path)
         self.ollama = ollama_client or OllamaClient()
@@ -39,12 +60,29 @@ class VectorIndexer:
         # store a placeholder vector instead — see _PLACEHOLDER_EMBEDDING.
         self.embeddings_enabled = embeddings_enabled
 
+        # Multi-repo isolation: namespace the collection per project and stamp
+        # provenance metadata on every record. project_root may be passed
+        # explicitly (reader path), but we also DERIVE it from a standard
+        # "<project>/.cairn/chroma" chroma_path so that every indexing call site
+        # (CLI reindex/init, sync engine, janitor) lands in the SAME namespaced
+        # collection the reader queries — without having to touch all of them.
+        if project_root is None:
+            project_root = _derive_project_root(self.chroma_path)
+        if project_root is not None:
+            self.project_root: str | None = str(Path(project_root).resolve())
+            self.project_id: str | None = project_id(project_root)
+            collection_name = f"functions_{self.project_id}"
+        else:
+            self.project_root = None
+            self.project_id = None
+            collection_name = "functions"
+
         self.client = chromadb.PersistentClient(
             path=self.chroma_path,
             settings=ChromaSettings(anonymized_telemetry=False),
         )
         self.collection = self.client.get_or_create_collection(
-            name="functions",
+            name=collection_name,
             metadata={"hnsw:space": "cosine"},
         )
 
@@ -66,18 +104,22 @@ class VectorIndexer:
         embedding = self.embed_function(code)
         doc_id = f"{filepath}:{function_name}:{line_start}"
 
+        metadata = {
+            "filepath": filepath,
+            "function": function_name,
+            "line_start": line_start,
+            "line_end": line_end,
+            "indexed_at": time.time(),
+        }
+        # Add project provenance if project_root is set
+        if self.project_id is not None:
+            metadata["project_id"] = self.project_id
+            metadata["project_root"] = self.project_root
+
         self.collection.upsert(  # type: ignore[arg-type]  # ChromaDB v1.x stubs
             ids=[doc_id],
             embeddings=[embedding],  # type: ignore[arg-type]
-            metadatas=[  # type: ignore[arg-type]
-                {
-                    "filepath": filepath,
-                    "function": function_name,
-                    "line_start": line_start,
-                    "line_end": line_end,
-                    "indexed_at": time.time(),
-                }
-            ],
+            metadatas=[metadata],  # type: ignore[arg-type]
             documents=[code],
         )
 
@@ -128,23 +170,37 @@ class VectorIndexer:
             doc_id = f"{item['filepath']}:{item['function_name']}:{item['line_start']}"
             ids.append(doc_id)
             all_embeddings.append(embedding)
-            metadatas.append(
-                {
-                    "filepath": item["filepath"],
-                    "function": item["function_name"],
-                    "line_start": item["line_start"],
-                    "line_end": item["line_end"],
-                    "indexed_at": time.time(),
-                }
-            )
+            metadata = {
+                "filepath": item["filepath"],
+                "function": item["function_name"],
+                "line_start": item["line_start"],
+                "line_end": item["line_end"],
+                "indexed_at": time.time(),
+            }
+            # Add project provenance if project_root is set
+            if self.project_id is not None:
+                metadata["project_id"] = self.project_id
+                metadata["project_root"] = self.project_root
+            metadatas.append(metadata)
             documents.append(item["code"])
 
-        self.collection.upsert(  # type: ignore[arg-type]  # ChromaDB v1.x stubs
-            ids=ids,
-            embeddings=all_embeddings,  # type: ignore[arg-type]
-            metadatas=metadatas,  # type: ignore[arg-type]
-            documents=documents,
-        )
+        # Determine the ChromaDB max batch size defensively, falling back to 5000.
+        try:
+            client_max = self.client.get_max_batch_size()
+        except Exception:
+            client_max = None
+        max_batch = min(_MAX_UPSERT_BATCH, client_max) if client_max else _MAX_UPSERT_BATCH
+
+        # Split into sub-batches and upsert each chunk separately.
+        num_items = len(ids)
+        for i in range(0, num_items, max_batch):
+            end_idx = min(i + max_batch, num_items)
+            self.collection.upsert(  # type: ignore[arg-type]  # ChromaDB v1.x stubs
+                ids=ids[i:end_idx],
+                embeddings=all_embeddings[i:end_idx],  # type: ignore[arg-type]
+                metadatas=metadatas[i:end_idx],  # type: ignore[arg-type]
+                documents=documents[i:end_idx],
+            )
 
     def remove_file(self, filepath: str):
         """Remove all functions for a file."""
@@ -159,7 +215,7 @@ class VectorIndexer:
         filepath_prefix: Optional[str] = None,
         metrics=None,
     ) -> list[dict]:
-        """Semantic search for relevant functions (with embedding cache)."""
+        """Semantic search for relevant functions (with embedding cache + multi-repo isolation)."""
         start = time.perf_counter()
 
         # Check cache for query embedding
@@ -177,6 +233,13 @@ class VectorIndexer:
         if filepath_prefix:
             where_filter = {"filepath": {"$startswith": filepath_prefix}}
 
+        # NOTE: we deliberately do NOT add a {"project_id": ...} metadata filter to
+        # the query. The collection is already namespaced per project
+        # (functions_<id>), and on large repos a project_id where-clause makes
+        # Chroma build a SQL `IN (...)` over every id, hitting SQLite's
+        # "too many SQL variables" limit. Isolation is instead enforced by the
+        # per-collection namespace + the in-memory drop of foreign ids below.
+
         results = self.collection.query(  # type: ignore[arg-type]  # ChromaDB v1.x stubs
             query_embeddings=[query_embedding],
             n_results=top_k,
@@ -184,6 +247,27 @@ class VectorIndexer:
         )
 
         formatted = self._format_results(results)
+
+        # Final belt-and-suspenders: drop any results that don't match project_id
+        # (should never happen, but if ChromaDB filter fails, we catch it here).
+        if self.project_id is not None:
+            filtered = []
+            for result in formatted:
+                result_pid = result.get("project_id")
+                # Drop only a provably foreign record. A None id means a legacy /
+                # un-stamped record in this (namespaced) collection — the where
+                # filter already scoped the query, so keep it.
+                if result_pid is not None and result_pid != self.project_id:
+                    logger.warning(
+                        "Dropped cross-project result %s (got project_id=%s, expected %s)",
+                        result.get("filepath"),
+                        result_pid,
+                        self.project_id,
+                    )
+                else:
+                    filtered.append(result)
+            formatted = filtered
+
         elapsed_ms = (time.perf_counter() - start) * 1000
 
         if metrics:
@@ -217,6 +301,10 @@ class VectorIndexer:
                     "line_end": metadata.get("line_end", 0),
                     "code": document,
                     "similarity": similarity,
+                    # Provenance: propagate so the isolation drop below (and the
+                    # assembler) can verify each result's owning project.
+                    "project_id": metadata.get("project_id"),
+                    "project_root": metadata.get("project_root"),
                 }
             )
 
