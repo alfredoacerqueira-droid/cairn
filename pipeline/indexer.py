@@ -7,6 +7,7 @@ from typing import Optional
 
 import chromadb
 from chromadb.config import Settings as ChromaSettings
+from chromadb.errors import InvalidArgumentError
 
 from core.repo import project_id
 from server.ollama_client import OllamaClient
@@ -116,10 +117,10 @@ class VectorIndexer:
             metadata["project_id"] = self.project_id
             metadata["project_root"] = self.project_root
 
-        self.collection.upsert(  # type: ignore[arg-type]  # ChromaDB v1.x stubs
+        self._upsert_with_dimension_fallback(
             ids=[doc_id],
-            embeddings=[embedding],  # type: ignore[arg-type]
-            metadatas=[metadata],  # type: ignore[arg-type]
+            embeddings=[embedding],
+            metadatas=[metadata],
             documents=[code],
         )
 
@@ -195,6 +196,12 @@ class VectorIndexer:
             metadatas.append(metadata)
             documents.append(item["code"])
 
+        # Proactively check if the collection dimension has changed (e.g. user
+        # toggled embeddings on/off or switched embed models).  If the stored
+        # vectors have a different shape, drop and recreate before upserting so
+        # ChromaDB doesn't reject every batch with a dimension error.
+        self._check_collection_dimension(embeddings)
+
         # Determine the ChromaDB max batch size defensively, falling back to 5000.
         try:
             client_max = self.client.get_max_batch_size()
@@ -206,10 +213,10 @@ class VectorIndexer:
         num_items = len(ids)
         for i in range(0, num_items, max_batch):
             end_idx = min(i + max_batch, num_items)
-            self.collection.upsert(  # type: ignore[arg-type]  # ChromaDB v1.x stubs
+            self._upsert_with_dimension_fallback(
                 ids=ids[i:end_idx],
-                embeddings=all_embeddings[i:end_idx],  # type: ignore[arg-type]
-                metadatas=metadatas[i:end_idx],  # type: ignore[arg-type]
+                embeddings=all_embeddings[i:end_idx],
+                metadatas=metadatas[i:end_idx],
                 documents=documents[i:end_idx],
             )
 
@@ -324,6 +331,61 @@ class VectorIndexer:
     def count(self) -> int:
         """Get total number of indexed functions."""
         return self.collection.count()
+
+    def _recreate_collection(self):
+        name = self.collection.name
+        metadata = self.collection.metadata
+        self.client.delete_collection(name)
+        self.collection = self.client.get_or_create_collection(
+            name=name,
+            metadata=metadata or {"hnsw:space": "cosine"},
+        )
+
+    def _check_collection_dimension(self, embeddings):
+        if not embeddings:
+            return
+        new_dim = len(embeddings[0])
+        try:
+            existing = self.collection.get(limit=1, include=["embeddings"])
+            if existing and existing.get("embeddings") and existing["embeddings"]:
+                existing_embedding = existing["embeddings"][0]
+                if existing_embedding:
+                    old_dim = len(existing_embedding)
+                    if old_dim != new_dim:
+                        logger.info(
+                            "embedding dimension changed (old=%d new=%d) — "
+                            "rebuilding collection %s",
+                            old_dim,
+                            new_dim,
+                            self.collection.name,
+                        )
+                        self._recreate_collection()
+        except Exception:
+            pass
+
+    def _upsert_with_dimension_fallback(self, ids, embeddings, metadatas, documents):
+        try:
+            self.collection.upsert(
+                ids=ids,
+                embeddings=embeddings,
+                metadatas=metadatas,
+                documents=documents,
+            )
+        except InvalidArgumentError as e:
+            if "dimension" in str(e).lower():
+                logger.info(
+                    "embedding dimension mismatch — rebuilding collection %s",
+                    self.collection.name,
+                )
+                self._recreate_collection()
+                self.collection.upsert(
+                    ids=ids,
+                    embeddings=embeddings,
+                    metadatas=metadatas,
+                    documents=documents,
+                )
+            else:
+                raise
 
     def clear(self):
         """Delete all vectors from the collection."""
