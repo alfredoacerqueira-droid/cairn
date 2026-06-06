@@ -203,62 +203,110 @@ class WorkspaceRouter:
         # Prefix with repo name
         return f"# Repo: {repo_name}\n\n{assembled}"
 
-    def route_multi(self, query: str, top_k: int = 8) -> list[dict]:
-        """Fan out to all repos and return merged, ranked results.
+    def _get_comparable_score(self, result: dict) -> float:
+        """Extract the comparable score from a result dict.
 
-        Searches each repo and merges results across repos, then ranks by
-        relevance score (rerank_score > 0, else raw_cosine, else similarity).
-        Each result is tagged with 'repo' (repo name) and 'repo_path' (full path).
-        Hard isolation: each repo searched independently; merge only in memory.
+        Used for ranking: rerank_score > 0, else raw_cosine, else similarity.
+
+        Args:
+            result: A result dict with optional 'rerank_score', 'raw_cosine', 'similarity'.
+
+        Returns:
+            The best available score as a float (0.0 if no score field present).
+        """
+        if "rerank_score" in result and result["rerank_score"] > 0:
+            return float(result["rerank_score"])
+        return float(result.get("raw_cosine", result.get("similarity", 0.0)))
+
+    def route_multi(self, query: str, top_k: int = 8, per_repo_min: int = 3) -> list[dict]:
+        """Fan out to all repos and return merged results with per-repo guarantee.
+
+        Searches each repo independently, then merges results while guaranteeing
+        representation from every confident repo. This prevents starvation where a
+        low-scoring repo's results get pushed out of the global top_k.
+
+        Algorithm:
+        1. Search all repos, tag results with 'repo' and 'repo_path', keep sorted by score.
+        2. Build guaranteed set: take top per_repo_min from each repo with results.
+        3. Build remaining pool: all other results sorted by score.
+        4. Fill final result from guaranteed + remaining until reaching min(top_k, _MAX_MERGED).
+        5. Sort final result by score descending and deduplicate.
 
         Args:
             query: The search query.
-            top_k: Number of top results to return across all repos.
+            top_k: Target number of top results to return (soft limit).
+            per_repo_min: Minimum number of results guaranteed from each repo that has any.
 
         Returns:
-            List of result dicts, sorted by score descending, or empty list if
-            no confident matches anywhere (fail-closed).
+            List of result dicts (de-duplicated, sorted by score descending),
+            or empty list if no confident matches anywhere (fail-closed).
         """
-        merged = []
-        repo_scores = {}  # Track best score per repo for ordering repos in output
+        max_merged = 24  # Hard cap on merged result size
 
+        # Step 1: Search all repos, collect by repo
+        results_by_repo: dict[Path, list[dict]] = {}
         for repo_path in self.repo_paths:
             try:
                 assembler = self._get_assembler(repo_path)
                 results = assembler.semantic_search(query, top_k=top_k, apply_guard=True)
 
-                for result in results:
-                    # Tag with repo info
-                    result["repo"] = repo_path.name
-                    result["repo_path"] = str(repo_path)
-                    merged.append(result)
+                if results:
+                    # Tag each result with repo info
+                    for result in results:
+                        result["repo"] = repo_path.name
+                        result["repo_path"] = str(repo_path)
 
-                    # Track best score for this repo
-                    if results:
-                        top_result = results[0]
-                        if "rerank_score" in top_result and top_result["rerank_score"] > 0:
-                            score = float(top_result["rerank_score"])
-                        else:
-                            score = float(
-                                top_result.get("raw_cosine", top_result.get("similarity", 0.0))
-                            )
-                        if repo_path not in repo_scores or score > repo_scores[repo_path]:
-                            repo_scores[repo_path] = score
+                    # Sort by comparable score (highest first)
+                    results.sort(key=self._get_comparable_score, reverse=True)
+                    results_by_repo[repo_path] = results
             except Exception as e:
                 logger.warning("Error searching repo %s: %s", repo_path, e)
                 continue
 
-        if not merged:
+        if not results_by_repo:
             return []
 
-        # Sort merged results by score descending
-        def get_score(r: dict) -> float:
-            if "rerank_score" in r and r["rerank_score"] > 0:
-                return float(r["rerank_score"])
-            return float(r.get("raw_cosine", r.get("similarity", 0.0)))
+        # Step 2: Build guaranteed set (top per_repo_min from each repo)
+        guaranteed = []
+        remaining = []
 
-        merged.sort(key=get_score, reverse=True)
-        return merged[:top_k]
+        for repo_path, repo_results in results_by_repo.items():
+            for i, result in enumerate(repo_results):
+                if i < per_repo_min:
+                    guaranteed.append(result)
+                else:
+                    remaining.append(result)
+
+        # Step 3: Sort remaining by score
+        remaining.sort(key=self._get_comparable_score, reverse=True)
+
+        # Step 4: Fill final result (guaranteed first, then from remaining)
+        max_final_size = min(top_k, max_merged)
+        final_results = guaranteed[:]
+
+        # Add from remaining until we reach max_final_size
+        for result in remaining:
+            if len(final_results) >= max_final_size:
+                break
+            final_results.append(result)
+
+        # Step 5: De-duplicate (by repo_path, filepath, function, line_start)
+        seen_keys = set()
+        deduplicated = []
+        for result in final_results:
+            key = (
+                result.get("repo_path", ""),
+                result.get("filepath", ""),
+                result.get("function", ""),
+                result.get("line_start", ""),
+            )
+            if key not in seen_keys:
+                seen_keys.add(key)
+                deduplicated.append(result)
+
+        # Final sort by score descending
+        deduplicated.sort(key=self._get_comparable_score, reverse=True)
+        return deduplicated
 
     def search_all(self, query: str, top_k: int = 8) -> str:
         """Search all repos and return merged formatted results.
