@@ -218,7 +218,13 @@ class WorkspaceRouter:
             return float(result["rerank_score"])
         return float(result.get("raw_cosine", result.get("similarity", 0.0)))
 
-    def route_multi(self, query: str, top_k: int = 8, per_repo_min: int = 3) -> list[dict]:
+    def route_multi(
+        self,
+        query: str,
+        top_k: int = 8,
+        per_repo_min: int | None = None,
+        max_merged: int | None = None,
+    ) -> list[dict]:
         """Fan out to all repos and return merged results with per-repo guarantee.
 
         Searches each repo independently, then merges results while guaranteeing
@@ -229,19 +235,29 @@ class WorkspaceRouter:
         1. Search all repos, tag results with 'repo' and 'repo_path', keep sorted by score.
         2. Build guaranteed set: take top per_repo_min from each repo with results.
         3. Build remaining pool: all other results sorted by score.
-        4. Fill final result from guaranteed + remaining until reaching min(top_k, _MAX_MERGED).
+        4. Fill final result from guaranteed + remaining until reaching min(top_k, max_merged).
         5. Sort final result by score descending and deduplicate.
 
         Args:
             query: The search query.
             top_k: Target number of top results to return (soft limit).
             per_repo_min: Minimum number of results guaranteed from each repo that has any.
+                If None, reads from config.retrieval.per_repo_min.
+            max_merged: Hard cap on merged result size.
+                If None, reads from config.retrieval.max_merged.
 
         Returns:
             List of result dicts (de-duplicated, sorted by score descending),
             or empty list if no confident matches anywhere (fail-closed).
         """
-        max_merged = 24  # Hard cap on merged result size
+        # Load defaults from config if not provided
+        if per_repo_min is None or max_merged is None:
+            from core.config import load_config
+            cfg = load_config(self.workspace_root)
+            if per_repo_min is None:
+                per_repo_min = cfg.retrieval.per_repo_min
+            if max_merged is None:
+                max_merged = cfg.retrieval.max_merged
 
         # Step 1: Search all repos, collect by repo
         results_by_repo: dict[Path, list[dict]] = {}
@@ -384,26 +400,22 @@ class WorkspaceRouter:
         """
         lines = []
 
-        # Prepend workspace memory if scope includes workspace
+        # Call route_multi FIRST; only prepend memory if we have results
+        merged = self.route_multi(query, top_k=top_k)
+
+        if not merged:
+            return (
+                "Could not confidently determine which repo answers this query "
+                "(no confident match in any workspace repo)."
+            )
+
+        # Prepend workspace memory if scope includes workspace (only if we have results)
         scope = self.resolve_scope()
         if scope in ("workspace", "both"):
             ws_mem = self.read_memory(scope="workspace", max_tokens=2000)
             if ws_mem:
                 lines.append(ws_mem)
                 lines.append("")
-
-        merged = self.route_multi(query, top_k=top_k)
-
-        if not merged:
-            fail_msg = (
-                "Could not confidently determine which repo answers this query "
-                "(no confident match in any workspace repo)."
-            )
-            if lines:
-                # If we have workspace memory, include fail-closed msg after it
-                lines.append(fail_msg)
-                return "\n".join(lines)
-            return fail_msg
 
         # Group by repo, preserving order of first appearance
         repos_dict: dict[str, list[dict]] = {}

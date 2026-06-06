@@ -123,6 +123,7 @@ class HybridRetriever:
         lexical: Any = None,
         structural: Any = None,
         profile_legs: list[str] | None = None,
+        rrf_k: int = 60,
     ):
         self.bm25 = bm25
         self.ast_rank = ast_rank
@@ -131,6 +132,7 @@ class HybridRetriever:
         self.weights = weights or [0.4, 0.3, 0.3]  # bm25, ast, embeddings
         self.reranker = reranker
         self.rerank_enabled = rerank_enabled
+        self.rrf_k = rrf_k
         # Optional lexical leg (RipgrepRetriever). When set, it REPLACES the
         # bm25+ast legs in hybrid fusion: lexical (fresh, exact) + embeddings,
         # then the cross-encoder reranks. The AST keyword-graph leg degraded
@@ -224,7 +226,7 @@ class HybridRetriever:
                     active_weights.append(0.3)
 
             start = time.perf_counter()
-            fused = reciprocal_rank_fusion(result_sets, k=60, weights=active_weights)
+            fused = reciprocal_rank_fusion(result_sets, k=self.rrf_k, weights=active_weights)
             fusion_elapsed = (time.perf_counter() - start) * 1000
             logger.debug(
                 "RRF fusion: %d legs → %d fused results in %.1fms",

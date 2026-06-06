@@ -112,7 +112,8 @@ class ContextAssembler:
                 timeout=5,
             )
             return result.stdout.strip() if result.returncode == 0 else "unknown"
-        except Exception:
+        except Exception as e:
+            logger.debug("git commit lookup failed: %s", e)
             return "unknown"
 
     def _get_retriever(self) -> HybridRetriever:
@@ -198,6 +199,7 @@ class ContextAssembler:
             lexical=lexical,
             structural=structural,
             profile_legs=profile.legs,
+            rrf_k=cfg.retrieval.rrf_k,
         )
         self._retriever_commit = commit
         return self._retriever

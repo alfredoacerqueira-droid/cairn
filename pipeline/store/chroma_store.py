@@ -98,8 +98,9 @@ class ChromaStore:
                 data = self.collection.get(
                     include=["metadatas", "documents"], limit=page, offset=offset
                 )
-            except Exception:
+            except Exception as e:
                 # Same error resilience as the original code
+                logger.warning("iter_blocks page %s failed: %s", offset, e)
                 break
 
             batch_ids = list(data.get("ids") or [])

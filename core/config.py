@@ -6,6 +6,9 @@ from typing import Optional
 import yaml
 from pydantic import BaseModel
 
+# Module-level cache for config: (str_path, mtime_ns) -> Config
+_config_cache: dict[tuple[str, int], "Config"] = {}
+
 
 class EnabledConfig(BaseModel):
     file_watcher: bool = True
@@ -156,6 +159,15 @@ class RetrievalConfig(BaseModel):
     # repos). "embeddings" / "bm25" / "ast" force a single leg (no rerank fusion).
     mode: str = "hybrid"  # hybrid | embeddings | bm25 | ast
     weights: list[float] = [0.4, 0.3, 0.3]  # bm25, ast, embeddings
+    # RRF k parameter: higher k pushes the rank-fusion curve flatter
+    # (more candidates stay relevant). Default 60 is appropriate for top-k queries.
+    rrf_k: int = 60
+    # Max number of merged results in multi-repo assembly (workspace router).
+    # Higher = more diverse context from multiple repos; lower = faster.
+    max_merged: int = 24
+    # Minimum results per repo when merging multi-repo results.
+    # Ensures each repo contributes even if it has lower scores.
+    per_repo_min: int = 3
     rerank_enabled: bool = True
     # Which reranker to use when rerank_enabled:
     #   "cross_encoder" (default) — FlashRank, CPU, ~milliseconds. Recommended.
@@ -269,7 +281,10 @@ class Config(BaseModel):
 
 
 def load_config(project_path: Optional[Path] = None) -> Config:
-    """Load configuration from .cairn/config.yaml in the project.
+    """Load configuration from .cairn/config.yaml in the project (memoized by mtime).
+
+    Cache key is (resolved path string, file mtime_ns). If the file hasn't changed
+    (same mtime), returns the cached Config. If mtime changes, reloads from disk.
 
     If a stale config is loaded (old exclude_patterns without new excludes),
     merges in the new standard excludes to prevent index pollution.
@@ -281,6 +296,20 @@ def load_config(project_path: Optional[Path] = None) -> Config:
 
     if not config_file.exists():
         return Config()
+
+    # Get file mtime for cache key
+    try:
+        mtime_ns = config_file.stat().st_mtime_ns
+    except OSError:
+        # File disappeared or permission error; reload without caching
+        mtime_ns = 0
+
+    path_key = str(config_file.resolve())
+    cache_key = (path_key, mtime_ns)
+
+    # Return cached config if still fresh
+    if cache_key in _config_cache:
+        return _config_cache[cache_key]
 
     with open(config_file) as f:
         data = yaml.safe_load(f) or {}
@@ -303,11 +332,32 @@ def load_config(project_path: Optional[Path] = None) -> Config:
     if not config.indexing.source_roots:
         config.indexing.source_roots = ["."]
 
+    # Cache the config before returning
+    _config_cache[cache_key] = config
     return config
 
 
+def clear_config_cache(path: Optional[Path] = None) -> None:
+    """Invalidate config cache for a given path.
+
+    If path is None, clears all cached configs (useful for testing).
+    Otherwise, clears only the cache entry for the specified path's config.yaml.
+    """
+    global _config_cache
+    if path is None:
+        _config_cache.clear()
+    else:
+        config_file = path / ".cairn" / "config.yaml"
+        path_key = str(config_file.resolve())
+        # Remove all cache entries for this path (they may have different mtimes)
+        _config_cache = {k: v for k, v in _config_cache.items() if k[0] != path_key}
+
+
 def save_config(config: Config, project_path: Optional[Path] = None):
-    """Save configuration to .cairn/config.yaml in the project."""
+    """Save configuration to .cairn/config.yaml in the project.
+
+    Invalidates the config cache for this path after writing.
+    """
     if project_path is None:
         project_path = Path.cwd()
 
@@ -317,3 +367,6 @@ def save_config(config: Config, project_path: Optional[Path] = None):
 
     with open(config_file, "w") as f:
         yaml.safe_dump(config.model_dump(), f, default_flow_style=False)
+
+    # Invalidate cache for this path so next load_config reads fresh
+    clear_config_cache(project_path)
