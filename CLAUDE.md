@@ -14,6 +14,10 @@ The main thread plans, orchestrates, reviews, and talks to the user. It does NOT
 
 `opencode run` is stateless/single-shot — pass full context in the prompt. Only acceptable direct main-thread file actions: reading for review, and writing plan/memory/docs. (Set by the user 2026-06-06, mirrors `~/.claude/CLAUDE.md`.)
 
+## HARD RULE — Always use ripgrep (`rg`) for searching
+
+For ANY text/code search, always use ripgrep — the `Grep` tool (ripgrep-backed) or `rg` directly. Never use `grep -r`, `find … | xargs grep`, or `ls`-based scanning. ripgrep is installed at `/usr/bin/rg` (v14.1.0); Cairn's lexical retrieval leg uses it (don't rely on the BM25 fallback when `rg` is available). Sub-agents must follow the same rule. (Set by the user 2026-06-06, mirrors `~/.claude/CLAUDE.md`.)
+
 ## What This Project Is
 
 A local-first semantic context engine for AI coding agents (Claude Code, OpenCode). It indexes your codebase into a vector DB, retrieves surgically-relevant functions for queries, and exposes them via CLI and MCP tools. Reduces tokens sent to cloud LLMs by 90%+ while keeping all code on your machine. Runs as two processes: an **MCP server** (on-demand, high priority) and a **background Janitor** (file watcher → indexer, low priority).
