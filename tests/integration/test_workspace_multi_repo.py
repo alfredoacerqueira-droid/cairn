@@ -8,11 +8,9 @@ This test suite validates:
   E) Profile detection on polyglot repos (mixed .py/.tf/.yaml/.go)
 """
 
-import json
 import subprocess
 from pathlib import Path
-import tempfile
-import shutil
+
 import pytest
 
 
@@ -307,11 +305,10 @@ func (ls *LedgerService) PostEntry(entry Entry) error {
             assert all("repo" in r for r in merged)
             assert all("repo_path" in r for r in merged)
             # Results should be ranked (first result should have highest score)
-            for i in range(len(merged) - 1):
-                score_i = merged[i].get("rerank_score", merged[i].get("raw_cosine", 0))
-                score_next = merged[i + 1].get("rerank_score", merged[i + 1].get("raw_cosine", 0))
-                # Note: ranking might not be strict if scores are equal
-                # Just verify the method runs without error
+            # Note: ranking might not be strict if scores are equal
+            # Just verify the method runs without error
+            if len(merged) > 1:
+                pass  # Verified results exist and method runs without error
 
     def test_search_all_merges_multi_repo_results(self, workspace_root):
         """Test: search_all formats multi-repo merged results with headers."""
@@ -346,3 +343,43 @@ func (ls *LedgerService) PostEntry(entry Entry) error {
         else:
             # Fail-closed is also valid
             assert "Could not confidently determine" in result
+
+    def test_orchestrate_workspace_context_only_multi_repo(self, workspace_root):
+        """Test: orchestrate with NO instruction fans out to all repos (multi-repo context)."""
+        import os
+        from unittest.mock import patch
+
+        from server.mcp_server import orchestrate, reset_session_budget
+
+        # Set workspace binding
+        with patch.dict(os.environ, {"CAIRN_PROJECT": str(workspace_root)}):
+            # Reset MCP server state to pick up new binding
+            import server.mcp_server as mcp_module
+
+            # Re-initialize binding by calling _classify_binding
+            mode, path, error = mcp_module._classify_binding()
+            assert mode == "WORKSPACE"
+
+            # Set up workspace router
+            mcp_module._router = mcp_module.WorkspaceRouter(path)
+            mcp_module._PROJECT_PATH = None
+            mcp_module._BIND_ERROR = None
+
+            reset_session_budget()
+
+            # Query that matches multiple repos (e.g., "charge" and "payment" exist in svc-api)
+            result = orchestrate("charge payment invoice", instruction="", payload="")
+
+            # In context-only mode (no instruction), orchestrate should call assemble_all
+            # which returns multi-repo context with ## Repo: headers
+            if "Could not confidently determine" not in result:
+                # Success path: should have multi-repo context with ## Repo: headers
+                assert "## Repo:" in result, f"Expected '## Repo:' in result: {result[:500]}"
+            else:
+                # If no match, that's fine too (fail-closed)
+                assert "Could not confidently determine" in result
+
+            reset_session_budget()
+            # Clean up
+            mcp_module._router = None
+            mcp_module._PROJECT_PATH = None

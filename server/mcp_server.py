@@ -408,11 +408,23 @@ def orchestrate(query: str, instruction: str = "", payload: str = "") -> str:
         if _BIND_ERROR is not None:
             return _BIND_ERROR
 
+        from core.config import load_config
+
         # Resolve project path and assembler (workspace or single)
         if _router is not None:
-            # Workspace mode: use multi-repo context (assemble_all)
-            # Note: for LLM execution, we route to best repo for efficiency.
-            # For context-only, we return merged multi-repo context.
+            # Workspace mode: context-only queries fan out to all repos;
+            # instruction queries route to best repo for LLM execution.
+            if not instruction:
+                # Context-only: return multi-repo context (no single repo routing)
+                result = _router.assemble_all(query)
+                # Use workspace root config for budget wrapping
+                if _router.repo_paths:
+                    cfg = load_config(_router.repo_paths[0])
+                else:
+                    cfg = load_config(_router.workspace_root)
+                return _emit(result, cfg)
+
+            # Instruction provided: route to best repo for LLM execution
             best_repo, _ = _router.route(query, top_k=5)
             if best_repo is None:
                 return (
@@ -430,8 +442,6 @@ def orchestrate(query: str, instruction: str = "", payload: str = "") -> str:
                     "indexed repo (a dir containing .cairn/)."
                 )
             cfg_path = _PROJECT_PATH
-
-        from core.config import load_config
 
         cfg = load_config(cfg_path)
 

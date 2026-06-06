@@ -964,7 +964,14 @@ class ASTParser:
             self._extract_hcl_blocks(child, lines, code_bytes, result)
 
     def _extract_yaml_blocks(self, lines: list[str], code: str, result: FileAST):
-        """Extract YAML documents by kind and name."""
+        """Extract YAML blocks by kind+name (k8s resources) or top-level keys (plain YAML).
+
+        For each YAML document:
+          - If it has a 'kind:' field (k8s/ArgoCD resource), emit one block per resource
+            with name '{kind}.{name}' or just '{kind}'.
+          - Otherwise (plain YAML like values.yaml), parse with PyYAML and emit one block
+            per top-level key. Each block spans from that key's line to the next top-level key.
+        """
         docs = code.split("\n---\n")
         start_line = 0
 
@@ -972,9 +979,9 @@ class ASTParser:
             doc_lines = doc_text.split("\n")
             doc_line_count = len(doc_lines)
 
+            # Check for 'kind:' field (k8s/ArgoCD resource)
             kind = None
             name = None
-
             for line in doc_lines:
                 if line.strip().startswith("kind:"):
                     kind = line.split(":", 1)[1].strip()
@@ -985,18 +992,97 @@ class ASTParser:
                             name = doc_lines[j].split(":", 1)[1].strip()
                             break
 
-            block_name = f"{kind}.{name}" if kind and name else (kind or doc_lines[0][:30])
-            if len(doc_text.strip()) > 0 and len(doc_text) < 100000:
-                result.functions.append(
-                    FunctionDef(
-                        name=block_name,
-                        line_start=start_line + 1,
-                        line_end=start_line + doc_line_count,
-                        code=doc_text.strip(),
+            if kind:
+                # K8s/ArgoCD resource: use per-resource naming
+                block_name = f"{kind}.{name}" if kind and name else kind
+                if len(doc_text.strip()) > 0 and len(doc_text) < 100000:
+                    result.functions.append(
+                        FunctionDef(
+                            name=block_name,
+                            line_start=start_line + 1,
+                            line_end=start_line + doc_line_count,
+                            code=doc_text.strip(),
+                        )
                     )
-                )
+            else:
+                # Plain YAML (no 'kind'): try to extract per top-level key
+                try:
+                    import yaml
+
+                    parsed = yaml.safe_load(doc_text)
+                    if isinstance(parsed, dict) and parsed:
+                        # Extract blocks for each top-level key
+                        self._extract_yaml_top_level_keys(
+                            doc_text, doc_lines, start_line, result
+                        )
+                    else:
+                        # Not a dict or empty: fall back to document-level block
+                        if len(doc_text.strip()) > 0 and len(doc_text) < 100000:
+                            result.functions.append(
+                                FunctionDef(
+                                    name=doc_lines[0][:30] if doc_lines else "yaml",
+                                    line_start=start_line + 1,
+                                    line_end=start_line + doc_line_count,
+                                    code=doc_text.strip(),
+                                )
+                            )
+                except Exception:
+                    # YAML parse error: fall back to document-level block
+                    if len(doc_text.strip()) > 0 and len(doc_text) < 100000:
+                        result.functions.append(
+                            FunctionDef(
+                                name=doc_lines[0][:30] if doc_lines else "yaml",
+                                line_start=start_line + 1,
+                                line_end=start_line + doc_line_count,
+                                code=doc_text.strip(),
+                            )
+                        )
 
             start_line += doc_line_count + 1
+
+    def _extract_yaml_top_level_keys(
+        self, doc_text: str, doc_lines: list[str], doc_start_line: int, result: FileAST
+    ):
+        """Extract YAML top-level keys as separate FunctionDef blocks.
+
+        For a plain YAML dict (no 'kind'), emits one block per top-level key.
+        Each block spans from the key's line to the next top-level key (or end).
+
+        Args:
+            doc_text: The YAML document text.
+            doc_lines: The document split into lines.
+            doc_start_line: The absolute line number where this document starts (in the file).
+            result: The FileAST to append blocks to.
+        """
+        # Find all top-level keys (column 0, no leading whitespace)
+        key_positions = []
+        for line_idx, line in enumerate(doc_lines):
+            if line and not line[0].isspace() and ":" in line:
+                key_name = line.split(":")[0].strip()
+                if key_name:
+                    key_positions.append((line_idx, key_name))
+
+        # For each top-level key, extract the block from that key to the next
+        for i, (key_line_idx, key_name) in enumerate(key_positions):
+            # Find the end line: either the next top-level key line or the end
+            if i + 1 < len(key_positions):
+                end_line_idx = key_positions[i + 1][0]
+            else:
+                end_line_idx = len(doc_lines)
+
+            # Extract code for this key (from key line to just before next key)
+            key_block_lines = doc_lines[key_line_idx:end_line_idx]
+            key_block_text = "\n".join(key_block_lines).rstrip()
+
+            if len(key_block_text) > 0 and len(key_block_text) < 100000:
+                result.functions.append(
+                    FunctionDef(
+                        name=key_name,
+                        line_start=doc_start_line + key_line_idx + 1,
+                        line_end=doc_start_line + end_line_idx,
+                        code=key_block_text,
+                    )
+                )
 
     def _extract_csharp_types(self, node, lines: list[str], code_bytes: bytes, result: FileAST):
         """Extract C# classes, interfaces, structs, records."""
