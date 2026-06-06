@@ -257,6 +257,69 @@ class ContextAssembler:
             return True
         return bool(functions) and top_score >= threshold
 
+    def _name_matches_query(self, query: str, func_name: str) -> bool:
+        """True if the query matches a function/class name via token identity.
+
+        Normalizes both (lowercase, split camelCase / snake_case / dots into
+        tokens) and returns True if the query is a strong symbol-name match:
+        the joined normalized form is a substring of the target, all query tokens
+        are present, or the query equals a token.  Requires the query's alnum-
+        normalized form to be non-trivial (prevents noise-word matches).
+        """
+        if not query or not func_name:
+            return False
+
+        def tokenize(s: str) -> set[str]:
+            parts = re.split(r"[^a-zA-Z0-9]+", s.lower())
+            tokens: set[str] = set()
+            for part in parts:
+                if not part:
+                    continue
+                camel = re.split(
+                    r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", part
+                )
+                tokens.update(t.lower() for t in camel if t)
+            return tokens
+
+        q_tokens = tokenize(query)
+        fn_tokens = tokenize(func_name)
+
+        if not q_tokens:
+            return False  # non-trivial alnum required
+
+        q_joined = "".join(sorted(q_tokens))
+        fn_joined = "".join(sorted(fn_tokens))
+        if q_joined and q_joined in fn_joined:
+            return True
+
+        if q_tokens and q_tokens.issubset(fn_tokens):
+            return True
+
+        q_norm = query.lower().strip()
+        if q_norm in fn_tokens:
+            return True
+
+        return False
+
+    def _rescue_name_matches(
+        self, query: str, results: list[dict]
+    ) -> list[dict]:
+        """Promote results whose symbol name matches the query to the front.
+
+        When the confidence guard rejects all results but one or more carry
+        a symbol name that *identically* matches the search query, return
+        those matches (promoted) instead of dropping everything.  Lexical /
+        structural legs correctly retrieve symbol-name candidates; the
+        cross-encoder rates them low because it evaluates prose relevance.
+        """
+        name_matches = [
+            r for r in results if self._name_matches_query(query, r.get("function", ""))
+        ]
+        if not name_matches:
+            return []
+        others = [r for r in results if r not in name_matches]
+        return name_matches + others
+
     def semantic_search(
         self, query: str, top_k: Optional[int] = None, apply_guard: bool = False
     ) -> list[dict]:
@@ -333,6 +396,13 @@ class ContextAssembler:
         # results; the guard is applied on return.
         if apply_guard:
             if results and not self._passes_confidence_guard(results):
+                rescued = self._rescue_name_matches(query, results)
+                if rescued:
+                    logger.debug(
+                        "Confidence guard rescued %d name-matched results",
+                        len(rescued),
+                    )
+                    return rescued
                 top_score = (
                     results[0].get("rerank_score", 0.0)
                     if "rerank_score" in results[0]
@@ -549,9 +619,16 @@ class ContextAssembler:
         functions = self.semantic_search(user_prompt)
 
         if not self._passes_confidence_guard(functions):
-            # Confidence-guard rejection: do not compress
-            logger.debug("Context assembly: confidence guard rejected results")
-            return "*No confident matches found for this query.*"
+            rescued = self._rescue_name_matches(user_prompt, functions)
+            if rescued:
+                logger.debug(
+                    "Context assembly: guard rescued %d name-matched results",
+                    len(rescued),
+                )
+                functions = rescued
+            else:
+                logger.debug("Context assembly: confidence guard rejected results")
+                return "*No confident matches found for this query.*"
 
         repo_map = self.get_repo_map()
         memory = self.get_memory()

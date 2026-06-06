@@ -139,6 +139,17 @@ class VectorIndexer:
             )
 
         for cls in ast_result.classes:
+            # Index the class definition itself
+            items.append(
+                {
+                    "filepath": ast_result.filepath,
+                    "function_name": cls.name,
+                    "code": cls.code,
+                    "line_start": cls.line_start,
+                    "line_end": cls.line_end,
+                }
+            )
+            # Index class methods
             for method in cls.methods:
                 items.append(
                     {

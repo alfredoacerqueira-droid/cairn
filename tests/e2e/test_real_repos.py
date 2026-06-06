@@ -617,11 +617,23 @@ def test_cli_search_retrieval(archetype: dict):
 
             # Check that the expected symbol appears in output
             if expected_substring not in out_search:
-                pytest.skip(
-                    f"Expected '{expected_substring}' not found in search results for "
-                    f"'{query}' in {archetype['name']} "
-                    f"(may indicate weak parsing or no results)"
-                )
+                # Strong-parse languages (tree-sitter AST): retrieval misses are bugs.
+                strong_parse = {
+                    "python-small", "python-larger", "go", "rust", "java",
+                    "typescript", "csharp", "hybrid-polyglot", "monorepo",
+                }
+                if archetype["name"] in strong_parse:
+                    assert False, (
+                        f"Expected '{expected_substring}' not found in search results for "
+                        f"'{query}' in {archetype['name']} "
+                        f"(should have been retrieved)"
+                    )
+                else:
+                    pytest.skip(
+                        f"Expected '{expected_substring}' not found in search results for "
+                        f"'{query}' in {archetype['name']} "
+                        f"(may indicate weak parsing or no results)"
+                    )
 
 
 @pytest.mark.e2e

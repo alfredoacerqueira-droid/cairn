@@ -163,9 +163,9 @@ class TestBatchSizeLimits:
         # Index the large AST
         indexer.index_ast(ast_result)
 
-        # Verify all records indexed
-        expected_count = num_functions + (num_classes * methods_per_class)
+        # Verify all records indexed (functions + class defs + methods)
+        expected_count = num_functions + num_classes + (num_classes * methods_per_class)
         count = indexer.count()
         assert count == expected_count, (
-            f"Expected {expected_count} records (functions + methods), " f"got {count}"
+            f"Expected {expected_count} records (functions + classes + methods), " f"got {count}"
         )
