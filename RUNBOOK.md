@@ -24,9 +24,11 @@ End-to-end guide for setting up and using the Cairn on a fresh machine.
 | Component | Version | Purpose |
 |-----------|---------|---------|
 | Python | 3.10+ | Runtime |
-| Ollama | 0.20+ | Local LLM engine |
+| Ollama | 0.20+ | Local LLM engine (optional; only for embeddings/summarization profiles) |
 | Git | 2.30+ | Version control |
 | GPU | 6GB+ VRAM | Local model inference (optional; falls back to CPU) |
+
+**Note:** Ollama is **optional**. Indexing and search work without it via lexical+structural retrieval. If using embeddings, choose either Ollama OR fastembed (in-process ONNX).
 
 ---
 
@@ -52,16 +54,22 @@ curl -LO https://github.com/BurntSushi/ripgrep/releases/download/14.1.0/ripgrep_
 sudo dpkg -i ripgrep_14.1.0_amd64.deb
 ```
 
-### 1.3 Install Ollama (Optional — Required Only for Embedding Profiles)
+### 1.3 Install Ollama (Optional — Only for Ollama-Based Embeddings)
 
-Ollama is optional. It's required only if your profile uses embeddings (python, dotnet, code, shell).
-IaC profiles (Terraform, Helm) disable embeddings by default. You can also use fastembed instead.
+Ollama is **optional**. Install only if:
+- Your profile uses embeddings (python, dotnet, code, shell) AND you prefer Ollama over fastembed
+- You want to use local LLM reranking or summarization
+- IaC profiles (Terraform, Helm) disable embeddings by default and don't need Ollama
+
+To use embeddings **without** Ollama, install fastembed instead (Section 1.3b).
+
+#### 1.3a. Install Ollama (if preferred)
 
 ```bash
 curl -fsSL https://ollama.com/install.sh | sh
 ```
 
-### 1.4 Pull Required Models
+### 1.4 Pull Required Models (Ollama only)
 
 ```bash
 ollama pull nomic-embed-text qwen2.5-coder:1.5b
@@ -80,7 +88,7 @@ nomic-embed-text:latest   0a109f4668af    274 MB    2 minutes ago
 qwen2.5-coder:1.5b        3cc9af7d0e38    943 MB    3 minutes ago
 ```
 
-### 1.5 Start Ollama
+### 1.5 Start Ollama (if using Ollama)
 
 ```bash
 ollama serve &
@@ -90,6 +98,23 @@ Verify:
 ```bash
 curl http://127.0.0.1:11434/api/tags
 ```
+
+#### 1.3b. Alternative: Install fastembed (No Ollama)
+
+For in-process embeddings (CPU, no external service), install the local extras:
+
+```bash
+pip install -e ".[local]"  # Adds lancedb + fastembed (~100MB total)
+```
+
+Then in `.cairn/config.yaml` after init:
+```yaml
+local_llm:
+  embedder: fastembed
+  fastembed_model: BAAI/bge-small-en-v1.5
+```
+
+This eliminates the Ollama dependency entirely.
 
 ### 1.6 Small GPU Tip
 

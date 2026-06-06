@@ -76,9 +76,14 @@ Exposes three tools: `search_code(query, top_k)`, `assemble_context(query)`, and
 - **Structural retrieval** — block-level scope analysis for better function isolation in large files.
 - **FlashRank reranker** — cross-encoder confidence guard separates relevant queries (~0.92 mean score)
   from off-topic (~0.007 mean score) with 0.47 confidence threshold (measured on Django, 8331 functions).
+- **Sectioned memory** — git-diff summaries now structured into sections (Open Tasks, Decisions, Conventions,
+  Recent Changes, Recent User Prompts) with per-section entry caps; `remember(note, kind)` MCP tool routes
+  to the right section; `recall()` returns trimmed, budget-aware view.
 - **Compression on all paths** — MCP tools, CLI, and proxy all benefit from lossless context compression.
 - **Configurable worker model** — choose the local Ollama model for optional reranking/summarization
   (default: qwen2.5-coder:1.5b).
+- **Multi-repo workspace** — a session can bind to a folder with multiple repos; `search_code` and
+  `assemble_context` fan out across all repos with `[repo]`-labeled results; hard per-repo isolation.
 - **Persistent session cache** — cache keys include git commit hash, auto-evicting stale results on commits.
 - **MCP server** — `cairn mcp`; works with Claude Code & OpenCode as a native tool (no proxy needed).
 
@@ -171,12 +176,31 @@ When `assemble_context()` is called:
 1. **Searches** for relevant code blocks (hybrid retrieval: lexical + semantic + structural)
 2. **Reranks** with FlashRank cross-encoder; gates on confidence (default: ≥0.47)
 3. **Loads** repository map (snapshot of all top-level functions/classes)
-4. **Loads** recent git-diff memory (newest entries within token budget)
+4. **Loads** recent sectioned memory (newest entries within token budget, split by kind)
 5. **Assembles** a markdown prompt block with all three sources
 6. **Compresses** losslessly (removes boilerplate, shortens identifiers)
 7. **Injects** into your prompt (or returns as context string)
 
 The system never modifies the actual user query or agent's output — it's transparent.
+
+### Works Without a Local LLM
+
+Cairn's indexing and search pipelines work **without any local LLM**:
+
+- **Indexing:** AST parsing (tree-sitter) + structural block extraction are language-native, zero-LLM
+- **Search:** Lexical retrieval (ripgrep/BM25) + structural matching (regex/AST graph) need no embeddings
+- **Reranking:** FlashRank cross-encoder (CPU, ~millisecond) is optional and independent of embeddings
+
+When embeddings are disabled (IaC profiles, `local_llm.embedder: none`), Cairn still indexes and retrieves using lexical + structural legs alone. At search time, FlashRank (if enabled) provides confidence gates without needing embeddings.
+
+For embeddings *without* Ollama, use **fastembed mode-2**:
+```yaml
+local_llm:
+  embedder: fastembed       # In-process ONNX, ~50MB, no Ollama needed
+  fastembed_model: BAAI/bge-small-en-v1.5
+```
+
+This requires `pip install -e ".[local]"` (adds lancedb + fastembed). Embeddings then work on CPU with no external service.
 
 ### Repository Profiles
 
