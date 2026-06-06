@@ -2,6 +2,18 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## HARD RULE — Delegate all execution (never execute on the main thread)
+
+The main thread plans, orchestrates, reviews, and talks to the user. It does NOT write code, run tests, or run shell commands directly. Delegate by task type:
+
+- **Coding** → an **opencode** agent (DeepSeek v4 pro): `opencode run --agent build --model opencode-go/deepseek-v4-pro "<precise spec>"`. Review the diff after. (`--variant high` for hard reasoning; `-c` to continue.)
+- **Tests / lint / builds / benchmarks** → opencode too: `opencode run --agent build --model opencode-go/deepseek-v4-pro "Run <command> and report results"`.
+- **Context / codebase search & discovery** → a **haiku** `Agent` (`Agent` tool, `model: "haiku"`).
+- **Git / env / plumbing shell commands** (not coding or test) → haiku `Agent`; don't call Bash directly.
+- **haiku is the fallback** when opencode is unavailable/unauthenticated.
+
+`opencode run` is stateless/single-shot — pass full context in the prompt. Only acceptable direct main-thread file actions: reading for review, and writing plan/memory/docs. (Set by the user 2026-06-06, mirrors `~/.claude/CLAUDE.md`.)
+
 ## What This Project Is
 
 A local-first semantic context engine for AI coding agents (Claude Code, OpenCode). It indexes your codebase into a vector DB, retrieves surgically-relevant functions for queries, and exposes them via CLI and MCP tools. Reduces tokens sent to cloud LLMs by 90%+ while keeping all code on your machine. Runs as two processes: an **MCP server** (on-demand, high priority) and a **background Janitor** (file watcher → indexer, low priority).
