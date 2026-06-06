@@ -389,8 +389,4 @@ class VectorIndexer:
 
     def clear(self):
         """Delete all vectors from the collection."""
-        self.client.delete_collection("functions")
-        self.collection = self.client.get_or_create_collection(
-            name="functions",
-            metadata={"hnsw:space": "cosine"},
-        )
+        self._recreate_collection()
