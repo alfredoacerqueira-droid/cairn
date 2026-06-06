@@ -193,6 +193,13 @@ class FileAST:
 
 
 class ASTParser:
+    # Hard ceiling for tree-sitter language-pack parsers (Go/Rust/Java/JS/TS).
+    # These are ~linear with input size, but pathological inputs (deeply nested,
+    # huge minified, etc.) can stall indexing on slow FSes (/mnt/c on WSL2).
+    # 1500 KB is ~100K lines of source, well above typical files but prevents
+    # indexing a multi-MB bundle from hanging the janitor.
+    TREESITTER_ML_MAX_KB = 1500
+
     def __init__(
         self,
         max_file_kb: int = 0,
@@ -237,13 +244,27 @@ class ASTParser:
         if lang == "unknown":
             lang = "python"
 
-        # PARSE TIMEOUT: wrap the parse operation with a timeout if configured.
-        # Skip timeout for language-pack parsers (Go/Rust/Java/JS/TS/etc.) as they are
-        # not thread-safe and will panic if sent to a different thread.
-        languages_without_timeout = {"go", "rust", "java", "javascript", "typescript", "tsx"}
-        should_skip_timeout = lang in languages_without_timeout
+        # INPUT-SIZE CEILING for language-pack parsers (Go/Rust/Java/JS/TS/TSX).
+        # These are ~linear with input size but can stall on pathological files
+        # (minified, deeply nested, huge). Language-pack parsers are not thread-safe,
+        # so we cannot use thread-based timeout. Input-size ceiling is the hang guard.
+        ml_languages = {"go", "rust", "java", "javascript", "typescript", "tsx"}
+        if lang in ml_languages:
+            code_bytes = code.encode("utf-8")
+            code_kb = len(code_bytes) / 1024
+            if code_kb > self.TREESITTER_ML_MAX_KB:
+                logger.warning(
+                    f"Skipping {filepath}: {code_kb:.1f}KB exceeds "
+                    f"max for tree-sitter ML parsers ({self.TREESITTER_ML_MAX_KB}KB); "
+                    f"falling back to regex"
+                )
+                return self._regex_parse(code, filepath, lang)
+            # Skip thread-based timeout for language-pack (not thread-safe)
+            return self._parse_impl(code, filepath, lang)
 
-        if self.parse_timeout_s > 0 and not should_skip_timeout:
+        # PARSE TIMEOUT: wrap the parse operation with a timeout if configured.
+        # Python parser is thread-safe, so we can use thread-based timeout.
+        if self.parse_timeout_s > 0:
             try:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                     future = executor.submit(self._parse_impl, code, filepath, lang)
@@ -267,7 +288,9 @@ class ASTParser:
             try:
                 return self._treesitter_parse_ml(code, filepath, lang)
             except Exception as e:
-                logger.warning(f"Tree-sitter parse failed for {lang} in {filepath}: {e}; falling back to regex")
+                logger.warning(
+                    f"Tree-sitter parse failed for {lang} in {filepath}: {e}; falling back to regex"
+                )
                 return self._regex_parse(code, filepath, lang)
         elif lang in ("hcl", "yaml", "csharp", "bash"):
             try:
@@ -365,10 +388,19 @@ class ASTParser:
 
         Extracts top-level functions, classes/types, and methods (for class members).
         Method names are prefixed with their class/receiver type (e.g., 'Class.method').
+
+        Note: language-pack parsers do not expose timeout_micros (thread-safe timeout).
+        Hang safety relies on the input-size ceiling applied in parse_string().
         """
         parser = self._get_cached_parser(lang)
         code = code.lstrip("﻿")  # Strip BOM
+
         tree = parser.parse(code)
+        if tree is None:
+            # Parser returned None (unlikely with language-pack, but be safe).
+            logger.debug(f"Parse returned None for {filepath} ({lang}); falling back to regex")
+            return self._regex_parse(code, filepath, lang)
+
         lines = code.split("\n")
         code_bytes = code.encode("utf-8")
         result = FileAST(filepath)
@@ -498,7 +530,9 @@ class ASTParser:
 
     # ── Rust extraction ──────────────────────────────────────────
 
-    def _extract_rust_defs(self, node, lines: list[str], code_bytes: bytes, result: FileAST, class_map: dict = None):
+    def _extract_rust_defs(
+        self, node, lines: list[str], code_bytes: bytes, result: FileAST, class_map: dict = None
+    ):
         """Extract Rust functions, methods, and types (struct/enum/trait)."""
         if class_map is None:
             class_map = {}
@@ -536,7 +570,9 @@ class ASTParser:
         for i in range(node.child_count()):
             self._extract_rust_defs(node.child(i), lines, code_bytes, result, class_map)
 
-    def _extract_rust_impl(self, node, lines: list[str], code_bytes: bytes, result: FileAST, class_map: dict):
+    def _extract_rust_impl(
+        self, node, lines: list[str], code_bytes: bytes, result: FileAST, class_map: dict
+    ):
         """Extract methods from Rust impl blocks."""
         # Find impl<T> Type or impl Type
         impl_type = self._get_rust_impl_type(node, code_bytes)
@@ -571,7 +607,9 @@ class ASTParser:
         for i in range(node.child_count()):
             self._collect_impl_methods(node.child(i), lines, code_bytes, cls)
 
-    def _collect_impl_methods_as_functions(self, node, lines: list[str], code_bytes: bytes, result: FileAST, impl_type: Optional[str]):
+    def _collect_impl_methods_as_functions(
+        self, node, lines: list[str], code_bytes: bytes, result: FileAST, impl_type: Optional[str]
+    ):
         """Recursively collect function_items from impl block and add as top-level functions."""
         if node.kind() == "function_item":
             method_name = self._get_identifier_name(node, code_bytes)
@@ -580,7 +618,9 @@ class ASTParser:
                 self._add_function(node, lines, full_name, result)
 
         for i in range(node.child_count()):
-            self._collect_impl_methods_as_functions(node.child(i), lines, code_bytes, result, impl_type)
+            self._collect_impl_methods_as_functions(
+                node.child(i), lines, code_bytes, result, impl_type
+            )
 
     def _get_rust_impl_type(self, impl_node, code_bytes: bytes) -> Optional[str]:
         """Extract type name from impl block (e.g., 'MyStruct' from 'impl MyStruct')."""
@@ -588,9 +628,7 @@ class ASTParser:
             child = impl_node.child(i)
             kind = child.kind()
             if kind == "type_identifier":
-                return code_bytes[child.start_byte() : child.end_byte()].decode(
-                    "utf-8", "replace"
-                )
+                return code_bytes[child.start_byte() : child.end_byte()].decode("utf-8", "replace")
             elif kind == "generic_type":
                 # For generic types, try to extract the base type name
                 for j in range(child.child_count()):
@@ -698,7 +736,10 @@ class ASTParser:
                     )
                 )
 
-        elif lang in ("typescript", "tsx") and kind in ("interface_declaration", "type_alias_declaration"):
+        elif lang in ("typescript", "tsx") and kind in (
+            "interface_declaration",
+            "type_alias_declaration",
+        ):
             # TypeScript-specific types
             type_name = self._get_identifier_name(node, code_bytes)
             if type_name:
@@ -767,9 +808,7 @@ class ASTParser:
         for i in range(var_declarator.child_count()):
             child = var_declarator.child(i)
             if child.kind() == "identifier" and not name:
-                name = code_bytes[child.start_byte() : child.end_byte()].decode(
-                    "utf-8", "replace"
-                )
+                name = code_bytes[child.start_byte() : child.end_byte()].decode("utf-8", "replace")
             elif child.kind() in ("arrow_function", "function_expression"):
                 func_expr = child
                 break
@@ -791,9 +830,7 @@ class ASTParser:
         for i in range(node.child_count()):
             child = node.child(i)
             if child.kind() in id_kinds:
-                return code_bytes[child.start_byte() : child.end_byte()].decode(
-                    "utf-8", "replace"
-                )
+                return code_bytes[child.start_byte() : child.end_byte()].decode("utf-8", "replace")
         return None
 
     def _get_java_method_name(self, node, code_bytes: bytes) -> Optional[str]:
@@ -820,9 +857,7 @@ class ASTParser:
 
         return None
 
-    def _add_function(
-        self, node, lines: list[str], name: str, result: FileAST
-    ):
+    def _add_function(self, node, lines: list[str], name: str, result: FileAST):
         """Helper to add a function to the result."""
         start_row = node.start_position().row
         end_row = node.end_position().row

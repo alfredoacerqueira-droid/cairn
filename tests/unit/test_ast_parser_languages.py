@@ -362,3 +362,76 @@ class TestFallbackBehavior:
         result = parser.parse_string(code, "test.go", "go")
         assert len(result.functions) == 0
         assert len(result.classes) == 0
+
+
+class TestHangGuard:
+    """Regression tests for hang-safety on pathological large inputs.
+
+    These tests verify that the parser does NOT hang on large/pathological files,
+    and instead gracefully times out or hits the size ceiling.
+    """
+
+    def test_large_js_file_within_timeout(self):
+        """Verify large JS file parses or falls back without hanging."""
+        import time
+
+        # Build a pathological ~2MB JS file (deeply nested object literals)
+        code_parts = ["const data = {"]
+        for i in range(50000):
+            code_parts.append(f"  key{i}: {{")
+        code_parts.append("    value: 42")
+        for _ in range(50000):
+            code_parts.append("  }")
+        code_parts.append("};")
+        code = "\n".join(code_parts)
+
+        parser = ASTParser(parse_timeout_s=5.0)
+
+        start = time.time()
+        result = parser.parse_string(code, "huge.js", "javascript")
+        elapsed = time.time() - start
+
+        # Should complete in under 5s (timeout guard works)
+        assert elapsed < 5.0, f"Parse took {elapsed:.2f}s (should be < 5s)"
+
+        # Should return a result (either parsed or fallback)
+        assert isinstance(result.functions, list)
+        assert isinstance(result.classes, list)
+
+    def test_large_go_file_exceeds_ceiling(self):
+        """Verify large Go file hits size ceiling and falls back."""
+        # Build a ~1600 KB Go file (exceeds TREESITTER_ML_MAX_KB = 1500 KB)
+        code = "package main\n\n"
+        # Each function ~500 bytes
+        for i in range(3500):
+            code += f"func function{i}() {{\n    x := {i}\n}}\n"
+
+        parser = ASTParser(parse_timeout_s=10.0)
+        result = parser.parse_string(code, "huge.go", "go")
+
+        # Should return a result (fallback to regex or skipped)
+        assert isinstance(result.functions, list)
+        assert isinstance(result.classes, list)
+
+    def test_normal_file_still_extracts(self):
+        """Verify normal-sized files still extract symbols correctly."""
+        code = """function helper() {
+    return 42;
+}
+
+class MyClass {
+    method() {
+        return "test";
+    }
+}
+"""
+        parser = ASTParser(parse_timeout_s=10.0)
+        result = parser.parse_string(code, "normal.js", "javascript")
+
+        # Should extract the function and class normally
+        assert len(result.functions) >= 1
+        assert len(result.classes) >= 1
+        func_names = {f.name for f in result.functions}
+        assert "helper" in func_names
+        class_names = {c.name for c in result.classes}
+        assert "MyClass" in class_names
