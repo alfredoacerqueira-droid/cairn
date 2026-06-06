@@ -257,12 +257,27 @@ def init(no_index: bool, yes: bool, force: bool, offline: bool):
     # STEP 3: Detect layout
     click.echo("3. Detecting source layout:")
     detected_roots, detected_patterns = detect_source_layout(project_path)
-    click.echo(f"  Detected source roots: {detected_roots}")
+
+    # Get extension census from ENTIRE repo (not just source_roots) to detect all file types
+    entire_repo_census = census_extensions(project_path, source_roots=None)
+
+    # For mixed repos (multiple language types), expand source_roots to ["."] to ensure
+    # all source directories are indexed (not just the "best" one)
+    from pipeline.ast_parser import EXTENSION_MAP
+    detected_extensions = set(ext for ext in entire_repo_census if ext in EXTENSION_MAP)
+    is_mixed_repo = len(detected_extensions) > 1
+    if is_mixed_repo and detected_roots != ["."]:
+        detected_roots = ["."]
+        click.echo(f"  Detected source roots: {detected_roots} (mixed repo, indexing all)")
+    else:
+        click.echo(f"  Detected source roots: {detected_roots}")
+
     click.echo(f"  Detected languages: {', '.join(detected_patterns)}")
     click.echo()
 
     # STEP 3b: Detect profile and retrieval strategy
     click.echo("3b. Detecting repository profile:")
+    # Get census from detected source roots for profile detection
     ext_census = census_extensions(project_path, source_roots=detected_roots)
     has_infra_markers = detect_infra_markers(project_path, source_roots=detected_roots)
     detected_profile_name = detect_profile(ext_census, has_infra_markers=has_infra_markers)
@@ -275,6 +290,34 @@ def init(no_index: bool, yes: bool, force: bool, offline: bool):
     if detected_profile.description:
         click.echo(f"  Description: {detected_profile.description}")
     click.echo()
+
+    # Build file_patterns: UNION of (detected patterns + broad default) to avoid silent drops
+    # This ensures mixed-language repos index all source types, not just dominant ones.
+    default_config = Config()
+    default_patterns = set(default_config.indexing.file_patterns)
+    detected_patterns_set = set(detected_patterns)
+
+    # Add patterns for any language extensions found in entire repo.
+    # Include .yaml/.yml for IaC repos (Kubernetes, Helm), but exclude pure config
+    # formats like .json and .toml that are only metadata (not source).
+    for ext in entire_repo_census:
+        if ext in EXTENSION_MAP and ext not in {".json", ".toml"}:
+            # Skip non-language config formats; include .yaml (legitimate IaC source)
+            pattern = f"*{ext}"
+            detected_patterns_set.add(pattern)
+
+    # Union with defaults to respect broad coverage
+    final_patterns = sorted(list(detected_patterns_set | default_patterns))
+
+    # Report file type breakdown if mixed
+    if is_mixed_repo:
+        breakdown = [
+            f"{count} {ext[1:] if ext.startswith('.') else ext}"
+            for ext, count in sorted(entire_repo_census.items())
+        ]
+        breakdown_str = ", ".join(breakdown)
+        click.echo(f"  Mixed repo: indexing {breakdown_str} (profile={detected_profile_name})")
+        click.echo()
 
     # STEP 4: Write config
     click.echo("4. Writing configuration:")
@@ -291,10 +334,10 @@ def init(no_index: bool, yes: bool, force: bool, offline: bool):
             click.echo(f"  Updated source_roots: {detected_roots}")
 
         # Update file_patterns if still default (all patterns)
-        default_config = Config()
-        if cfg.indexing.file_patterns == default_config.indexing.file_patterns:
-            cfg.indexing.file_patterns = detected_patterns
-            click.echo(f"  Updated file_patterns: {detected_patterns}")
+        default_cfg = Config()
+        if cfg.indexing.file_patterns == default_cfg.indexing.file_patterns:
+            cfg.indexing.file_patterns = final_patterns
+            click.echo(f"  Updated file_patterns: {final_patterns}")
 
         # Update profile if still default
         if cfg.profile == "code":
@@ -309,7 +352,7 @@ def init(no_index: bool, yes: bool, force: bool, offline: bool):
         # Create fresh config with detected values
         cfg = Config()
         cfg.indexing.source_roots = detected_roots
-        cfg.indexing.file_patterns = detected_patterns
+        cfg.indexing.file_patterns = final_patterns
         # Apply profile settings
         cfg.profile = detected_profile_name
         cfg.embeddings_enabled = detected_profile.embedding_enabled
@@ -683,7 +726,23 @@ def status():
         indexer = VectorIndexer(
             chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
         )
-        click.echo(f"Indexed functions: {indexer.count()}")
+        count = indexer.count()
+        click.echo(f"Indexed functions: {count}")
+
+        # ISSUE 2 FIX: Warn if current index location is empty but alternate has data
+        if count == 0:
+            # Check if alternate location has data
+            alt_location = (
+                "native" if index_location == "in_project" else "in_project"
+            )
+            alt_base = repo.index_base_dir(alt_location)
+            alt_chroma = alt_base / "chroma"
+            if alt_chroma.exists() and any(alt_chroma.iterdir()):
+                click.echo(
+                    f"\n⚠ WARNING: Index at {index_base} is EMPTY but data exists at "
+                    f"{alt_base} — index_location may have changed. "
+                    "Run 'cairn reindex' to sync."
+                )
     except Exception as e:
         click.echo(f"Indexer: {e}")
 
@@ -937,6 +996,18 @@ def doctor():
             click.echo("[i] Index location: in-project (.cairn/)")
         else:
             click.echo(f"[i] Index location: native ({index_base})")
+
+        # ISSUE 2 FIX: Warn if current index location is empty but alternate has data
+        count = indexer.count()
+        if count == 0:
+            alternate_location = "native" if index_location == "in_project" else "in_project"
+            alternate_base = repo.index_base_dir(alternate_location)
+            alternate_chroma = alternate_base / "chroma"
+            if alternate_chroma.exists() and any(alternate_chroma.iterdir()):
+                click.echo(
+                    f"[!] Index at {index_base} is EMPTY but data exists at "
+                    f"{alternate_base} — index_location may have changed. Run 'cairn reindex'."
+                )
     except Exception as e:
         click.echo(f"[i] Collection: error ({e})")
 
@@ -1322,7 +1393,25 @@ def search(query: str, top_k: int):
         pass
 
     if not results:
-        click.echo("No confident matches found for this query.")
+        # ISSUE 2 FIX: Hint if index is empty
+        try:
+            from core.repo import RepoManager
+
+            cfg = load_config()
+            repo = RepoManager(Path.cwd())
+            from pipeline.indexer import VectorIndexer
+
+            idx = VectorIndexer(
+                chroma_path=repo.get_chroma_path(),
+                embeddings_enabled=_get_embeddings_enabled(cfg),
+            )
+            if idx.count() == 0:
+                click.echo("No confident matches found for this query.")
+                click.echo("(index is empty — run 'cairn reindex')", err=True)
+            else:
+                click.echo("No confident matches found for this query.")
+        except Exception:
+            click.echo("No confident matches found for this query.")
         return
 
     for i, r in enumerate(results, 1):
