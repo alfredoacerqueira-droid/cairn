@@ -152,7 +152,7 @@ def _get_cache(project_path: Path, cfg) -> SemanticCache:
         _semantic_caches[project_path] = SemanticCache(
             cache_dir,
             embedder,
-            ttl_seconds=cfg.cache.ttl_seconds,
+            ttl_seconds=cfg.cache.semantic_ttl_seconds,
         )
     return _semantic_caches[project_path]
 

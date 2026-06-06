@@ -127,6 +127,8 @@ class RoutingConfig(BaseModel):
 class CacheConfig(BaseModel):
     enabled: bool = True
     ttl_seconds: int = 300
+    # Prompt/response semantic cache TTL (30 min) — separate from session cache
+    semantic_ttl_seconds: int = 1800
     max_entries: int = 100
 
 

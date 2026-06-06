@@ -257,3 +257,63 @@ class TestConfigLoader:
         assert loaded.local_llm.embedder == "fastembed"
         assert loaded.local_llm.fastembed_model == "intfloat/e5-small-v2"
         assert loaded.local_llm.map_concurrency == 2
+
+    def test_cache_config_semantic_ttl_default(self):
+        """Test that CacheConfig has semantic_ttl_seconds with 1800 default."""
+        from core.config import CacheConfig
+
+        config = CacheConfig()
+        assert config.semantic_ttl_seconds == 1800
+        assert config.ttl_seconds == 300
+
+    def test_cache_semantic_ttl_in_root_config(self):
+        """Test that Config has cache.semantic_ttl_seconds with correct default."""
+        config = Config()
+        assert hasattr(config.cache, "semantic_ttl_seconds")
+        assert config.cache.semantic_ttl_seconds == 1800
+        assert config.cache.ttl_seconds == 300
+
+    def test_cache_semantic_ttl_roundtrip(self, tmp_path):
+        """Test that cache.semantic_ttl_seconds survives save/load cycle."""
+        import yaml
+
+        config_dir = tmp_path / ".cairn"
+        config_dir.mkdir(parents=True)
+        config_file = config_dir / "config.yaml"
+
+        # Config with custom semantic_ttl_seconds
+        custom_config = {
+            "cache": {
+                "enabled": True,
+                "ttl_seconds": 300,
+                "semantic_ttl_seconds": 3600,
+                "max_entries": 100,
+            }
+        }
+        config_file.write_text(yaml.dump(custom_config))
+
+        loaded = load_config(tmp_path)
+        assert loaded.cache.ttl_seconds == 300
+        assert loaded.cache.semantic_ttl_seconds == 3600
+
+    def test_old_config_without_semantic_ttl(self, tmp_path):
+        """Test backward compat: old config without semantic_ttl_seconds loads with default."""
+        import yaml
+
+        config_dir = tmp_path / ".cairn"
+        config_dir.mkdir(parents=True)
+        config_file = config_dir / "config.yaml"
+
+        # Old-style config with no semantic_ttl_seconds
+        old_config = {
+            "cache": {
+                "enabled": True,
+                "ttl_seconds": 300,
+                "max_entries": 100,
+            }
+        }
+        config_file.write_text(yaml.dump(old_config))
+
+        loaded = load_config(tmp_path)
+        assert loaded.cache.ttl_seconds == 300
+        assert loaded.cache.semantic_ttl_seconds == 1800  # default

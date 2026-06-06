@@ -231,7 +231,8 @@ Semantic response cache (local, embedded).
 
 **Fields:**
 - `enabled` (bool) — Enable caching. Default: `true`
-- `ttl_seconds` (int) — Cache entry lifetime. Default: `300` (5 minutes)
+- `ttl_seconds` (int) — In-memory session/embedding cache entry lifetime. Default: `300` (5 minutes)
+- `semantic_ttl_seconds` (int) — MCP prompt/response semantic cache entry lifetime (separate from session cache). Default: `1800` (30 minutes)
 - `max_entries` (int) — Max cached responses. Default: `100`
 
 **Example:**
@@ -239,6 +240,7 @@ Semantic response cache (local, embedded).
 cache:
   enabled: true
   ttl_seconds: 300
+  semantic_ttl_seconds: 1800
   max_entries: 100
 ```
 
