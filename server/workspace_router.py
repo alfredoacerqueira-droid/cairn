@@ -201,3 +201,210 @@ class WorkspaceRouter:
 
         # Prefix with repo name
         return f"# Repo: {repo_name}\n\n{assembled}"
+
+    def route_multi(self, query: str, top_k: int = 8) -> list[dict]:
+        """Fan out to all repos and return merged, ranked results.
+
+        Searches each repo and merges results across repos, then ranks by
+        relevance score (rerank_score > 0, else raw_cosine, else similarity).
+        Each result is tagged with 'repo' (repo name) and 'repo_path' (full path).
+        Hard isolation: each repo searched independently; merge only in memory.
+
+        Args:
+            query: The search query.
+            top_k: Number of top results to return across all repos.
+
+        Returns:
+            List of result dicts, sorted by score descending, or empty list if
+            no confident matches anywhere (fail-closed).
+        """
+        merged = []
+        repo_scores = {}  # Track best score per repo for ordering repos in output
+
+        for repo_path in self.repo_paths:
+            try:
+                assembler = self._get_assembler(repo_path)
+                results = assembler.semantic_search(query, top_k=top_k, apply_guard=True)
+
+                for result in results:
+                    # Tag with repo info
+                    result["repo"] = repo_path.name
+                    result["repo_path"] = str(repo_path)
+                    merged.append(result)
+
+                    # Track best score for this repo
+                    if results:
+                        top_result = results[0]
+                        if "rerank_score" in top_result and top_result["rerank_score"] > 0:
+                            score = float(top_result["rerank_score"])
+                        else:
+                            score = float(
+                                top_result.get("raw_cosine", top_result.get("similarity", 0.0))
+                            )
+                        if repo_path not in repo_scores or score > repo_scores[repo_path]:
+                            repo_scores[repo_path] = score
+            except Exception as e:
+                logger.warning("Error searching repo %s: %s", repo_path, e)
+                continue
+
+        if not merged:
+            return []
+
+        # Sort merged results by score descending
+        def get_score(r: dict) -> float:
+            if "rerank_score" in r and r["rerank_score"] > 0:
+                return float(r["rerank_score"])
+            return float(r.get("raw_cosine", r.get("similarity", 0.0)))
+
+        merged.sort(key=get_score, reverse=True)
+        return merged[:top_k]
+
+    def search_all(self, query: str, top_k: int = 8) -> str:
+        """Search all repos and return merged formatted results.
+
+        Combines results from all repos with repo labels, ranked by relevance.
+        Each result includes [repo_name] tag for LLM provenance tracking.
+
+        Args:
+            query: The search query.
+            top_k: Number of results to return.
+
+        Returns:
+            Formatted multi-repo search results, or fail-closed message if no
+            confident matches anywhere.
+        """
+        merged = self.route_multi(query, top_k=top_k)
+
+        if not merged:
+            return (
+                "Could not confidently determine which repo answers this query "
+                "(no confident match in any workspace repo)."
+            )
+
+        # Gather unique repo names from results (in order of appearance)
+        repo_names = []
+        seen_repos = set()
+        for r in merged:
+            repo = r.get("repo", "unknown")
+            if repo not in seen_repos:
+                repo_names.append(repo)
+                seen_repos.add(repo)
+
+        lines = [f"Searched {len(self.repo_paths)} repos: {', '.join(repo_names)}"]
+        lines.append("")
+
+        for i, result in enumerate(merged, 1):
+            repo = result.get("repo", "unknown")
+            filepath = result.get("filepath", "unknown")
+            function = result.get("function", "unknown")
+            line_start = result.get("line_start", "?")
+            code = result.get("code", "")
+
+            # Report the score that decides relevance
+            if "rerank_score" in result and result.get("rerank_score", 0.0) > 0:
+                score_label, score_val = "relevance", float(result.get("rerank_score", 0.0))
+            else:
+                score_label, score_val = "relevance", float(
+                    result.get("raw_cosine", result.get("similarity", 0.0))
+                )
+
+            lines.append(f"{i}. [{repo}] {filepath}:{function} (line {line_start})")
+            lines.append(f"   {score_label}: {score_val:.3f}")
+            if code:
+                code_preview = code[:200].replace("\n", "\n   ")
+                lines.append(f"   Code: {code_preview}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    def assemble_all(self, query: str, top_k: int = 8) -> str:
+        """Assemble multi-repo context from all matching repos.
+
+        Groups merged results by repo and formats as markdown sections.
+        Does NOT call full assemble_context (too expensive); formats the
+        merged search results with repo headers.
+
+        Args:
+            query: The search query.
+            top_k: Number of results per repo (soft limit, sorted globally).
+
+        Returns:
+            Markdown with '## Repo: name' headers and code blocks, or fail-closed.
+        """
+        merged = self.route_multi(query, top_k=top_k)
+
+        if not merged:
+            return (
+                "Could not confidently determine which repo answers this query "
+                "(no confident match in any workspace repo)."
+            )
+
+        # Group by repo, preserving order of first appearance
+        repos_dict: dict[str, list[dict]] = {}
+        repo_order = []
+        for result in merged:
+            repo = result.get("repo", "unknown")
+            if repo not in repos_dict:
+                repos_dict[repo] = []
+                repo_order.append(repo)
+            repos_dict[repo].append(result)
+
+        lines = []
+        for repo in repo_order:
+            results = repos_dict[repo]
+            lines.append(f"## Repo: {repo}")
+            lines.append("")
+
+            for result in results:
+                filepath = result.get("filepath", "unknown")
+                function = result.get("function", "unknown")
+                line_start = result.get("line_start", "?")
+                code = result.get("code", "")
+
+                lines.append(f"### {filepath}:{function} (line {line_start})")
+                lines.append("")
+                if code:
+                    lines.append("```")
+                    lines.append(code[:500])  # Longer preview for assemble
+                    lines.append("```")
+                    lines.append("")
+
+            lines.append("")
+
+        return "\n".join(lines)
+
+    def overview(self) -> list[dict]:
+        """List all repos in the workspace with their profiles and block counts.
+
+        Returns a cheap overview of each repo: name, path, configured profile,
+        and indexed block count. Used by list_repos() MCP tool.
+
+        Returns:
+            List of dicts with keys: 'name', 'path', 'profile', 'blocks'.
+            On error for a repo, 'blocks' is 0 and profile is 'unknown'.
+            Always succeeds (fail-closed).
+        """
+        from core.config import load_config
+
+        overview_list = []
+        for repo_path in self.repo_paths:
+            profile = "unknown"
+            blocks = 0
+            try:
+                cfg = load_config(repo_path)
+                profile = cfg.profile
+                assembler = self._get_assembler(repo_path)
+                blocks = assembler.store.count()
+            except Exception as e:
+                logger.warning("Error loading overview for repo %s: %s", repo_path, e)
+
+            overview_list.append(
+                {
+                    "name": repo_path.name,
+                    "path": str(repo_path),
+                    "profile": profile,
+                    "blocks": blocks,
+                }
+            )
+
+        return overview_list

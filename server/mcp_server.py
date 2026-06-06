@@ -194,19 +194,17 @@ def search_code(query: str, top_k: int = 5) -> str:
     try:
         if _BIND_ERROR is not None:
             return _BIND_ERROR
-        # If workspace router is bound, delegate to it
+        # If workspace router is bound, use multi-repo search
         if _router is not None:
             from core.config import load_config
 
-            # Resolve the best repo's config for budget wrapping
-            best_repo, _ = _router.route(query, top_k=top_k)
-            if best_repo is None:
-                return (
-                    "Could not confidently determine which repo answers this query "
-                    "(no confident match in any workspace repo)."
-                )
-            cfg = load_config(best_repo)
-            result = _router.search(query, top_k=top_k)
+            result = _router.search_all(query, top_k=top_k)
+            # For budget wrapping, use the first repo's config (or workspace root)
+            # They share the same budget config in practice
+            if _router.repo_paths:
+                cfg = load_config(_router.repo_paths[0])
+            else:
+                cfg = load_config(_router.workspace_root)
             return _emit(result, cfg)
         # Otherwise single-repo mode
         assembler = _get_assembler()
@@ -271,19 +269,16 @@ def assemble_context(query: str) -> str:
     try:
         if _BIND_ERROR is not None:
             return _BIND_ERROR
-        # If workspace router is bound, delegate to it
+        # If workspace router is bound, use multi-repo assembly
         if _router is not None:
             from core.config import load_config
 
-            # Resolve the best repo's config for budget wrapping
-            best_repo, _ = _router.route(query, top_k=5)
-            if best_repo is None:
-                return (
-                    "Could not confidently determine which repo answers this query "
-                    "(no confident match in any workspace repo)."
-                )
-            cfg = load_config(best_repo)
-            result = _router.assemble(query)
+            result = _router.assemble_all(query)
+            # For budget wrapping, use the first repo's config
+            if _router.repo_paths:
+                cfg = load_config(_router.repo_paths[0])
+            else:
+                cfg = load_config(_router.workspace_root)
             return _emit(result, cfg)
         # Otherwise single-repo mode
         assembler = _get_assembler()
@@ -407,12 +402,16 @@ def orchestrate(query: str, instruction: str = "", payload: str = "") -> str:
 
         # Resolve project path and assembler (workspace or single)
         if _router is not None:
+            # Workspace mode: use multi-repo context (assemble_all)
+            # Note: for LLM execution, we route to best repo for efficiency.
+            # For context-only, we return merged multi-repo context.
             best_repo, _ = _router.route(query, top_k=5)
             if best_repo is None:
                 return (
                     "Could not confidently determine which repo answers this query "
                     "(no confident match in any workspace repo)."
                 )
+            # Use best repo's assembler (for consistent execution)
             assembler = _router.assembler_for(best_repo)
             cfg_path = best_repo
         else:
@@ -524,6 +523,88 @@ def cache_set(query: str, value: str, ttl_seconds: int = 0) -> str:
         return "cached"
     except Exception as e:
         return f"Cache write error: {str(e)}"
+
+
+@mcp.tool(
+    description="List repos in the workspace with profiles and indexed block counts"
+)
+def list_repos() -> str:
+    """List the repos in the current workspace with their profile and indexed block count.
+
+    In WORKSPACE mode, shows all discovered indexed repos with their profile
+    and block count. In SINGLE mode, shows just the bound repo. The agent can
+    use this to understand the workspace scope and target searches appropriately.
+
+    Returns:
+        Formatted text listing repos: one line per repo with name, profile,
+        block count, and path. Prefixed with workspace info if in WORKSPACE mode.
+    """
+    try:
+        if _BIND_ERROR is not None:
+            return _BIND_ERROR
+
+        if _router is not None:
+            # WORKSPACE mode: list all discovered repos
+            overview = _router.overview()
+
+            if not overview:
+                return (
+                    f"Workspace at {_router.workspace_root} has no indexed repos "
+                    "(no .cairn/ directories found in children)."
+                )
+
+            lines = [f"Workspace: {_router.workspace_root} ({len(overview)} repos)"]
+            lines.append("")
+
+            for item in overview:
+                name = item.get("name", "unknown")
+                profile = item.get("profile", "unknown")
+                blocks = item.get("blocks", 0)
+                path = item.get("path", "")
+                lines.append(f"{name}  profile={profile}  blocks={blocks}  ({path})")
+
+            result = "\n".join(lines)
+            from core.config import load_config
+
+            # Use first repo's config for budget wrapping (or workspace root)
+            if _router.repo_paths:
+                cfg = load_config(_router.repo_paths[0])
+            else:
+                cfg = load_config(_router.workspace_root)
+            return _emit(result, cfg)
+
+        else:
+            # SINGLE mode: list the bound repo
+            if _PROJECT_PATH is None:
+                return (
+                    "Cairn MCP server has no bound project. Set CAIRN_PROJECT to an "
+                    "indexed repo (a dir containing .cairn/)."
+                )
+
+            from core.config import load_config
+
+            cfg = load_config(_PROJECT_PATH)
+            assembler = _get_assembler()
+            if assembler is None:
+                return (
+                    "Cairn MCP server has no bound project. Set CAIRN_PROJECT to an "
+                    "indexed repo (a dir containing .cairn/)."
+                )
+
+            try:
+                blocks = assembler.store.count()
+            except Exception as e:
+                logger.warning("Error getting block count: %s", e)
+                blocks = 0
+
+            result = (
+                f"{_PROJECT_PATH.name}  profile={cfg.profile}  "
+                f"blocks={blocks}  (single-repo mode)"
+            )
+            return _emit(result, cfg)
+
+    except Exception as e:
+        return f"Error listing repos: {str(e)}"
 
 
 def run_stdio() -> None:
