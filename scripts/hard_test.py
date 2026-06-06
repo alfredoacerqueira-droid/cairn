@@ -183,6 +183,7 @@ def count_indexed_blocks(repo_path: Path) -> int:
         indexer = VectorIndexer(
             chroma_path=repo.get_chroma_path(),
             embeddings_enabled=emb_enabled,
+            project_root=repo_path,
         )
         return indexer.collection.count()
     except Exception as e:

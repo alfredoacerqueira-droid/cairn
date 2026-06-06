@@ -541,7 +541,8 @@ memory.md
         repo = RepoManager(project_path)
         parser = ASTParser()
         indexer = VectorIndexer(
-            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
+            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg),
+            project_root=project_path,
         )
         freshness = DBFreshness(
             project_path,
@@ -718,7 +719,8 @@ def status():
 
     try:
         indexer = VectorIndexer(
-            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
+            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg),
+            project_root=project_path,
         )
         count = indexer.count()
         click.echo(f"Indexed functions: {count}")
@@ -975,7 +977,8 @@ def doctor():
         from pipeline.indexer import VectorIndexer
 
         indexer = VectorIndexer(
-            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
+            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg),
+            project_root=project_path,
         )
         collection_name = indexer.collection.name if indexer.collection else "unknown"
         pid = project_id(project_path)
@@ -1163,7 +1166,8 @@ def _start_all_impl(
         info = freshness.check_freshness()
         repo = RepoManager(Path.cwd())
         idx = VectorIndexer(
-            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
+            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg),
+            project_root=Path.cwd(),
         )
 
         if info["last_indexed_commit"] is None:
@@ -1214,7 +1218,8 @@ def _start_all_impl(
         repo = RepoManager(project_path)
         parser = ASTParser()
         indexer = VectorIndexer(
-            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
+            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg),
+            project_root=project_path,
         )
 
         cpu = CPUThrottler(max_cpu_percent=cfg.resources.max_cpu_percent)
@@ -1309,7 +1314,8 @@ def _run_quick_reindex(cfg, freshness):
     repo = RepoManager(Path.cwd())
     parser = ASTParser()
     indexer = VectorIndexer(
-        chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
+        chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg),
+        project_root=Path.cwd(),
     )
     total = 0
 
@@ -1344,7 +1350,8 @@ def _print_status(cfg):
         from pipeline.indexer import VectorIndexer
 
         idx = VectorIndexer(
-            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
+            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg),
+            project_root=Path.cwd(),
         )
         count = idx.count()
     except Exception:
@@ -1401,6 +1408,7 @@ def search(query: str, top_k: int):
             idx = VectorIndexer(
                 chroma_path=repo.get_chroma_path(),
                 embeddings_enabled=_get_embeddings_enabled(cfg),
+                project_root=Path.cwd(),
             )
             if idx.count() == 0:
                 click.echo("No confident matches found for this query.")
@@ -1451,7 +1459,8 @@ def reindex(mode: str):
 
     parser = ASTParser()
     indexer = VectorIndexer(
-        chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
+        chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg),
+        project_root=project_path,
     )
 
     if mode == "full":
@@ -1535,7 +1544,8 @@ def janitor_start(debounce: float | None):
     repo = RepoManager(project_path)
     parser = ASTParser()
     indexer = VectorIndexer(
-        chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
+        chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg),
+        project_root=project_path,
     )
 
     cpu = CPUThrottler(max_cpu_percent=cfg.resources.max_cpu_percent)

@@ -1134,6 +1134,7 @@ def compare_embedding_models(models: list[str]) -> dict[str, dict[str, float]]:
                 chroma_path=TESTAPI_PATH / ".cairn" / "chroma",
                 ollama_client=client,
                 embedding_model=model_name,
+                project_root=TESTAPI_PATH,
             )
 
             # Collect cosines for relevant queries
