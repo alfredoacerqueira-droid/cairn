@@ -54,6 +54,7 @@ class VectorIndexer:
         embeddings_enabled: bool = True,
         project_root: Optional[str | Path] = None,
         embedder: Optional[EmbeddingFn] = None,
+        cfg=None,
     ):
         self.chroma_path = str(chroma_path)
         self.ollama = ollama_client or OllamaClient()
@@ -70,6 +71,17 @@ class VectorIndexer:
         # AND embeddings_enabled, used instead of self.ollama.embed/embed_batch
         # so that fastembed works without Ollama.
         self.embedder = embedder
+        # Auto-derive embedder from config when none explicitly passed.
+        # fastembed → use fastembed embedder (384d, no Ollama).
+        # ollama   → leave None so self.ollama (injected or default) is used.
+        if self.embedder is None and embeddings_enabled and cfg is not None:
+            from core.config import embeddings_available
+
+            avail, name = embeddings_available(cfg)
+            if avail and name == "fastembed":
+                from pipeline.store.embedders import make_embedder
+
+                self.embedder = make_embedder(cfg)
 
         # Multi-repo isolation: namespace the collection per project and stamp
         # provenance metadata on every record. project_root may be passed

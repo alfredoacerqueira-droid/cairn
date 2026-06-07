@@ -83,20 +83,15 @@ class ContextAssembler:
         self.ollama = ollama_client or make_llm_client(cfg.local_llm)
 
         # Effective embeddings flag: use the helper so fastembed works without Ollama
-        emb_available, emb_name = embeddings_available(cfg)
+        emb_available, _ = embeddings_available(cfg)
         emb_enabled = emb_available
-        embedder = None
-        if emb_enabled and emb_name == "fastembed":
-            from pipeline.store.embedders import make_embedder
-
-            embedder = make_embedder(cfg)
         self.vector_indexer = VectorIndexer(
             chroma_path=self.repo.get_chroma_path(),
             ollama_client=self.ollama,
             cache=self.cache,
             embeddings_enabled=emb_enabled,
             project_root=self.project_path,
-            embedder=embedder,
+            cfg=cfg,
         )
         # Wrap the indexer in ChromaStore for the read path
         self.store = ChromaStore(self.vector_indexer)

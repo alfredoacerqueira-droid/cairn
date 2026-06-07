@@ -24,6 +24,7 @@ dependencies = [
     "click>=8.1.0",
     "mcp>=1.0.0",
     "flashrank>=0.2.0",
+    "fastembed>=0.3",
 ]
 
 [project.optional-dependencies]
@@ -37,7 +38,6 @@ dev = [
 ]
 local = [
     "lancedb>=0.13",
-    "fastembed>=0.3",
     "tantivy>=0.22",
 ]
 

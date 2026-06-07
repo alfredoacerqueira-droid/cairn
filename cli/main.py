@@ -72,6 +72,16 @@ def _get_embeddings_enabled(cfg: Config) -> bool:
     return embeddings_available(cfg)[0]
 
 
+def _fastembed_available() -> bool:
+    """Check if the fastembed package is importable (guarded try/except ImportError)."""
+    try:
+        import fastembed  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
 def _select_worker_model(installed: list[str], free_vram_mib: int | None, current: str) -> str:
     """Select the best installed qwen2.5-coder model based on available VRAM.
 
@@ -377,6 +387,16 @@ def init(no_index: bool, yes: bool, force: bool, offline: bool):
             cfg.indexing.embedding_model = detected_profile.embedding_model
         click.echo("  Created new config with profile settings")
 
+    # Auto-select fastembed as the default embedder when available and Ollama not enabled
+    if detected_profile.embedding_enabled and not cfg.local_llm.enabled:
+        if _fastembed_available():
+            cfg.local_llm.embedder = "fastembed"
+            click.echo("  Semantic search: ON (offline via fastembed, no server needed)")
+        elif cfg.local_llm.embedder == "ollama":
+            click.echo(
+                "  [i] Semantic search needs fastembed or a local LLM " "(pip install fastembed)"
+            )
+
     # Apply --offline flag if set (disables reranker)
     if offline:
         cfg.retrieval.offline = True
@@ -567,6 +587,7 @@ memory.md
             chroma_path=repo.get_chroma_path(),
             embeddings_enabled=_get_embeddings_enabled(cfg),
             project_root=project_path,
+            cfg=cfg,
         )
         freshness = DBFreshness(
             project_path,
@@ -747,6 +768,7 @@ def status():
             chroma_path=repo.get_chroma_path(),
             embeddings_enabled=_get_embeddings_enabled(cfg),
             project_root=project_path,
+            cfg=cfg,
         )
         count = indexer.count()
         click.echo(f"Indexed functions: {count}")
@@ -832,6 +854,20 @@ def doctor():
             click.echo(f"[!] LLM health check error: {e}")
     else:
         click.echo("[i] Local LLM: disabled (lexical/structural + cross-encoder only)")
+
+    # Active embedder and offline capability
+    emb_available, emb_source = embeddings_available(cfg)
+    if emb_available and emb_source == "fastembed":
+        fast_model = cfg.local_llm.fastembed_model
+        click.echo(f"[✓] Embeddings: fastembed (offline, no server) — {fast_model}")
+    elif emb_available and emb_source == "ollama":
+        emb_model = cfg.indexing.embedding_model
+        click.echo(f"[✓] Embeddings: ollama ({emb_model}) — requires server")
+    else:
+        click.echo(
+            "[i] Embeddings: OFF (lexical+structural only) — "
+            "install fastembed or enable local LLM for semantic search"
+        )
 
     # System resources and model recommendations
     from core.resources import (
@@ -1070,6 +1106,7 @@ def doctor():
             chroma_path=repo.get_chroma_path(),
             embeddings_enabled=_get_embeddings_enabled(cfg),
             project_root=project_path,
+            cfg=cfg,
         )
         collection_name = indexer.collection.name if indexer.collection else "unknown"
         pid = project_id(project_path)
@@ -1260,6 +1297,7 @@ def _start_all_impl(
             chroma_path=repo.get_chroma_path(),
             embeddings_enabled=_get_embeddings_enabled(cfg),
             project_root=Path.cwd(),
+            cfg=cfg,
         )
 
         if info["last_indexed_commit"] is None:
@@ -1313,6 +1351,7 @@ def _start_all_impl(
             chroma_path=repo.get_chroma_path(),
             embeddings_enabled=_get_embeddings_enabled(cfg),
             project_root=project_path,
+            cfg=cfg,
         )
 
         cpu = CPUThrottler(max_cpu_percent=cfg.resources.max_cpu_percent)
@@ -1410,6 +1449,7 @@ def _run_quick_reindex(cfg, freshness):
         chroma_path=repo.get_chroma_path(),
         embeddings_enabled=_get_embeddings_enabled(cfg),
         project_root=Path.cwd(),
+        cfg=cfg,
     )
     total = 0
 
@@ -1447,6 +1487,7 @@ def _print_status(cfg):
             chroma_path=repo.get_chroma_path(),
             embeddings_enabled=_get_embeddings_enabled(cfg),
             project_root=Path.cwd(),
+            cfg=cfg,
         )
         count = idx.count()
     except Exception:
@@ -1505,6 +1546,7 @@ def search(query: str, top_k: int):
                 chroma_path=repo.get_chroma_path(),
                 embeddings_enabled=_get_embeddings_enabled(cfg),
                 project_root=Path.cwd(),
+                cfg=cfg,
             )
             if idx.count() == 0:
                 click.echo("No confident matches found for this query.")
@@ -1559,6 +1601,7 @@ def reindex(mode: str):
         chroma_path=repo.get_chroma_path(),
         embeddings_enabled=_get_embeddings_enabled(cfg),
         project_root=project_path,
+        cfg=cfg,
     )
 
     if mode == "full":
@@ -1645,6 +1688,7 @@ def janitor_start(debounce: float | None):
         chroma_path=repo.get_chroma_path(),
         embeddings_enabled=_get_embeddings_enabled(cfg),
         project_root=project_path,
+        cfg=cfg,
     )
 
     cpu = CPUThrottler(max_cpu_percent=cfg.resources.max_cpu_percent)
