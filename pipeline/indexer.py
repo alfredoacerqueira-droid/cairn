@@ -1,9 +1,11 @@
 """ChromaDB vector indexer for semantic code search."""
 
+from __future__ import annotations
+
 import logging
 import time
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import chromadb
 from chromadb.config import Settings as ChromaSettings
@@ -11,6 +13,9 @@ from chromadb.errors import InvalidArgumentError
 
 from core.repo import project_id
 from server.ollama_client import OllamaClient
+
+if TYPE_CHECKING:
+    from pipeline.store.base import EmbeddingFn
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +53,7 @@ class VectorIndexer:
         cache=None,
         embeddings_enabled: bool = True,
         project_root: Optional[str | Path] = None,
+        embedder: Optional[EmbeddingFn] = None,
     ):
         self.chroma_path = str(chroma_path)
         self.ollama = ollama_client or OllamaClient()
@@ -60,6 +66,10 @@ class VectorIndexer:
         # When False (iac/shell profiles), skip Ollama embedding at index time and
         # store a placeholder vector instead — see _PLACEHOLDER_EMBEDDING.
         self.embeddings_enabled = embeddings_enabled
+        # Embedding callable (e.g. FastEmbedEmbedder, OllamaEmbedder). When set
+        # AND embeddings_enabled, used instead of self.ollama.embed/embed_batch
+        # so that fastembed works without Ollama.
+        self.embedder = embedder
 
         # Multi-repo isolation: namespace the collection per project and stamp
         # provenance metadata on every record. project_root may be passed
@@ -91,7 +101,19 @@ class VectorIndexer:
         """Generate embedding for a code snippet."""
         if not self.embeddings_enabled:
             return list(self._PLACEHOLDER_EMBEDDING)
+        if self.embedder is not None:
+            return self.embedder([code])[0]
         return self.ollama.embed(code, model=self.embedding_model)
+
+    def _embed_query(self, query: str) -> list[float]:
+        """Generate embedding for a query string.
+
+        Uses the embedder callable when set (fastembed / OllamaEmbedder),
+        otherwise falls back to the legacy ollama-client path.
+        """
+        if self.embedder is not None and self.embeddings_enabled:
+            return self.embedder([query])[0]
+        return self.ollama.embed(query, model=self.embedding_model)
 
     def index_function(
         self,
@@ -167,7 +189,10 @@ class VectorIndexer:
 
         codes = [item["code"] for item in items]
         if self.embeddings_enabled:
-            embeddings = self.ollama.embed_batch(codes, model=self.embedding_model)
+            if self.embedder is not None:
+                embeddings = self.embedder(codes)
+            else:
+                embeddings = self.ollama.embed_batch(codes, model=self.embedding_model)
         else:
             # embeddings=OFF: store placeholders, never call Ollama (saves the
             # embed model load + one call per block on iac/shell profiles).
@@ -242,10 +267,10 @@ class VectorIndexer:
             if cached_embedding is not None:
                 query_embedding = cached_embedding
             else:
-                query_embedding = self.ollama.embed(query, model=self.embedding_model)
+                query_embedding = self._embed_query(query)
                 self.cache.set(query_embedding, "embedding", query, self.embedding_model)
         else:
-            query_embedding = self.ollama.embed(query, model=self.embedding_model)
+            query_embedding = self._embed_query(query)
 
         where_filter = None
         if filepath_prefix:

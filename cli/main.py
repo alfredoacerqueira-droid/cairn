@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 import click
 
-from core.config import Config, load_config
+from core.config import Config, embeddings_available, load_config
 from core.logging_setup import configure_logging
 from core.profiles import detect_profile, get_profile
 from core.repo import census_extensions, detect_infra_markers
@@ -68,8 +68,8 @@ def _detect_workspace_siblings(project_path: Path) -> list[Path]:
 
 
 def _get_embeddings_enabled(cfg: Config) -> bool:
-    """Get effective embeddings flag: both config and local_llm must be enabled."""
-    return cfg.embeddings_enabled and cfg.local_llm.enabled
+    """Get effective embeddings flag: uses the helper so fastembed works without Ollama."""
+    return embeddings_available(cfg)[0]
 
 
 def _select_worker_model(installed: list[str], free_vram_mib: int | None, current: str) -> str:

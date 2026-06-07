@@ -6,6 +6,7 @@ that ChromaStore and LanceStore will implement.
 
 from pathlib import Path
 
+from core.config import embeddings_available
 from core.repo import RepoManager, project_id
 from pipeline.store.base import Block, EmbeddingFn, IndexStore, blocks_from_ast
 from pipeline.store.chroma_store import ChromaStore
@@ -36,14 +37,21 @@ def make_store(cfg: object, repo: RepoManager, *, project_root: str | Path) -> I
     from pipeline.indexer import VectorIndexer
     from server.ollama_client import make_llm_client
 
-    # Determine embeddings flag: enabled if both config and local LLM are enabled
-    emb_enabled = cfg.embeddings_enabled and cfg.local_llm.enabled
+    # Determine embeddings flag: enabled if any real embedder is available (no
+    # longer requires local_llm.enabled — fastembed works without Ollama).
+    emb_available, emb_name = embeddings_available(cfg)
+    emb_enabled = emb_available
 
     # Get the backend choice
     backend = getattr(cfg.indexing, "store_backend", "chroma")
 
-    # Build embedder (same for both backends)
-    embedder = make_embedder(cfg)
+    # Build embedder only when needed:
+    # - fastembed: in-process, no ollama client required
+    # - lance backend: needs an embedder for all embedding types
+    # - chroma + ollama: VectorIndexer uses ollama_client directly
+    embedder = None
+    if emb_enabled and (emb_name == "fastembed" or backend == "lance"):
+        embedder = make_embedder(cfg)
 
     # Resolve project_id
     pid = project_id(project_root)
@@ -68,6 +76,7 @@ def make_store(cfg: object, repo: RepoManager, *, project_root: str | Path) -> I
             embedding_model=getattr(cfg.indexing, "embedding_model", None),
             embeddings_enabled=emb_enabled,
             project_root=project_root,
+            embedder=embedder,
         )
         return ChromaStore(indexer)
 

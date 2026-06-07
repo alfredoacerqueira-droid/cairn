@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from core.cache import SessionCache
-from core.config import load_config
+from core.config import embeddings_available, load_config
 from core.persistent_cache import PersistentCache
 from core.profiles import get_profile
 from core.repo import RepoManager, project_id
@@ -82,14 +82,21 @@ class ContextAssembler:
         # Use factory to build client based on local_llm config
         self.ollama = ollama_client or make_llm_client(cfg.local_llm)
 
-        # Effective embeddings flag: only enable if both config and local LLM are enabled
-        emb_enabled = cfg.embeddings_enabled and cfg.local_llm.enabled
+        # Effective embeddings flag: use the helper so fastembed works without Ollama
+        emb_available, emb_name = embeddings_available(cfg)
+        emb_enabled = emb_available
+        embedder = None
+        if emb_enabled and emb_name == "fastembed":
+            from pipeline.store.embedders import make_embedder
+
+            embedder = make_embedder(cfg)
         self.vector_indexer = VectorIndexer(
             chroma_path=self.repo.get_chroma_path(),
             ollama_client=self.ollama,
             cache=self.cache,
             embeddings_enabled=emb_enabled,
             project_root=self.project_path,
+            embedder=embedder,
         )
         # Wrap the indexer in ChromaStore for the read path
         self.store = ChromaStore(self.vector_indexer)
@@ -127,16 +134,18 @@ class ContextAssembler:
         profile = get_profile(cfg.profile)
 
         # Log profile and indexing config once at init
+        emb_available, _ = embeddings_available(cfg)
         logger.debug(
             "Retriever init: profile=%s, embeddings=%s, backend=%s",
             cfg.profile,
-            cfg.embeddings_enabled and cfg.local_llm.enabled,
+            emb_available,
             "chroma",  # Backend is currently hardcoded to chroma
         )
 
-        # Only build embeddings retriever if config, profile, AND local LLM all enable embeddings
+        # Only build embeddings retriever if config, profile, AND a real embedder are available
         emb = None
-        emb_enabled = cfg.embeddings_enabled and cfg.local_llm.enabled and profile.embedding_enabled
+        emb_available, _ = embeddings_available(cfg)
+        emb_enabled = emb_available and profile.embedding_enabled
         if emb_enabled:
             emb = EmbeddingRetriever(self.store, cache=self.cache)
 

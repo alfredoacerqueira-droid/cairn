@@ -287,6 +287,20 @@ class Config(BaseModel):
     local_llm: LocalLLMConfig = LocalLLMConfig()
 
 
+def embeddings_available(cfg: Config) -> tuple[bool, str | None]:
+    """True + embedder name when a REAL embedder is available (no Ollama required for fastembed)."""
+    if not getattr(cfg, "embeddings_enabled", False):
+        return (False, None)
+    embedder = getattr(cfg.local_llm, "embedder", "ollama")
+    if embedder == "none":
+        return (False, None)
+    if embedder == "fastembed":
+        return (True, "fastembed")
+    if getattr(cfg.local_llm, "enabled", False):
+        return (True, "ollama")
+    return (False, None)
+
+
 def load_config(project_path: Optional[Path] = None) -> Config:
     """Load configuration from .cairn/config.yaml in the project (memoized by mtime).
 
