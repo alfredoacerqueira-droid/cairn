@@ -213,6 +213,10 @@ class RetrievalConfig(BaseModel):
     # Offline mode: disable reranker entirely (skip FlashRank load).
     # Useful behind corporate proxies where model download fails/hangs.
     offline: bool = False
+    # Lexical (ripgrep) bounding: cap the number of files parsed per query
+    # and the number of matches per file to bound latency on large repos.
+    lexical_max_files: int = 25
+    lexical_max_count_per_file: int = 50
     # Custom CA bundle path for HTTPS certificate validation (e.g., corporate proxies).
     # If set, overrides CAIRN_CA_BUNDLE / REQUESTS_CA_BUNDLE / SSL_CERT_FILE.
     # Passed to flashrank via os.environ before model load.

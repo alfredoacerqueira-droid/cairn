@@ -125,6 +125,8 @@ class ContextAssembler:
         if self._retriever is not None and self._retriever_commit == commit:
             return self._retriever
 
+        total_start = time.perf_counter()
+
         cfg = load_config(self.project_path)
         profile = get_profile(cfg.profile)
 
@@ -146,10 +148,9 @@ class ContextAssembler:
 
         bm25 = BM25Retriever()
 
-        start = time.perf_counter()
+        load_start = time.perf_counter()
         bm25_items, ast_items = self._load_function_texts()
-        load_elapsed = (time.perf_counter() - start) * 1000
-        logger.debug("Loaded %d indexed blocks in %.1fms", len(bm25_items), load_elapsed)
+        load_elapsed = (time.perf_counter() - load_start) * 1000
 
         bm25.index(bm25_items)
 
@@ -186,6 +187,8 @@ class ContextAssembler:
             exclude_patterns=cfg.indexing.exclude_patterns,
             source_roots=cfg.indexing.source_roots,
             fallback_items=bm25_items,
+            max_files=cfg.retrieval.lexical_max_files,
+            max_count_per_file=cfg.retrieval.lexical_max_count_per_file,
         )
 
         # Structural leg: exact block-identity + reference matching.
@@ -194,7 +197,18 @@ class ContextAssembler:
         from pipeline.retrieval.structural import StructuralRetriever
 
         structural = StructuralRetriever()
+        struct_start = time.perf_counter()
         structural.index(bm25_items)
+        struct_elapsed = (time.perf_counter() - struct_start) * 1000
+
+        total_elapsed = (time.perf_counter() - total_start) * 1000
+        logger.debug(
+            "retriever build: load_texts=%.0fms structural_index=%.0fms total=%.0fms (blocks=%d)",
+            load_elapsed,
+            struct_elapsed,
+            total_elapsed,
+            len(bm25_items),
+        )
 
         self._retriever = HybridRetriever(
             bm25=bm25,
@@ -660,6 +674,8 @@ class ContextAssembler:
         return prompt
 
     def assemble_context(self, user_prompt: str) -> str:
+        import time
+
         from core.tokens import count_tokens
 
         commit = self._git_commit()
@@ -680,8 +696,11 @@ class ContextAssembler:
                 return cached
 
         logger.debug("Assembling context for query (cache MISS)")
+        total_start = time.perf_counter()
 
+        search_start = time.perf_counter()
         functions = self.semantic_search(user_prompt)
+        search_ms = (time.perf_counter() - search_start) * 1000
 
         if not self._passes_confidence_guard(functions, query=user_prompt):
             rescued = self._rescue_name_matches(user_prompt, functions)
@@ -695,8 +714,13 @@ class ContextAssembler:
                 logger.debug("Context assembly: confidence guard rejected results")
                 return "*No confident matches found for this query.*"
 
+        map_start = time.perf_counter()
         repo_map = self.get_repo_map()
+        map_ms = (time.perf_counter() - map_start) * 1000
+
+        mem_start = time.perf_counter()
         memory = self.get_memory()
+        mem_ms = (time.perf_counter() - mem_start) * 1000
 
         func_text = self._format_functions(functions)
         map_text = self._format_repo_map(repo_map)
@@ -717,7 +741,20 @@ class ContextAssembler:
 
         # Compress context before caching/returning so all consumers
         # (CLI, MCP, proxy) get the compressed form
+        compress_start = time.perf_counter()
         compressed = self._maybe_compress(prompt)
+        compress_ms = (time.perf_counter() - compress_start) * 1000
+
+        total_ms = (time.perf_counter() - total_start) * 1000
+        logger.debug(
+            "assemble: search=%.0fms repo_map=%.0fms memory=%.0fms compress=%.0fms total=%.0fms",
+            search_ms,
+            map_ms,
+            mem_ms,
+            compress_ms,
+            total_ms,
+        )
+
         compressed_tokens = count_tokens(compressed)
         if compressed != prompt:
             reduction = 100 * (1.0 - compressed_tokens / raw_tokens) if raw_tokens > 0 else 0

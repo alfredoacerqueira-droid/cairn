@@ -154,6 +154,8 @@ class RipgrepRetriever:
         exclude_patterns: list[str] | None = None,
         source_roots: list[str] | None = None,
         fallback_items: list[dict[str, Any]] | None = None,
+        max_files: int = 25,
+        max_count_per_file: int = 50,
     ):
         """Initialize ripgrep retriever.
 
@@ -163,12 +165,16 @@ class RipgrepRetriever:
             exclude_patterns: Patterns to exclude
             source_roots: Subdirs within project to search (e.g., ["src"])
             fallback_items: List of dicts with 'id' and 'text' for BM25 fallback
+            max_files: Max number of files to parse per query (caps latency)
+            max_count_per_file: Max rg matches per file (--max-count)
         """
         self.project_path = Path(project_path)
         self.file_patterns = file_patterns or ["*.py"]
         self.exclude_patterns = exclude_patterns or []
         self.source_roots = source_roots or ["."]
         self.fallback_items = fallback_items or []
+        self.max_files = max_files
+        self.max_count_per_file = max_count_per_file
 
         # Lazy-initialized BM25 fallback
         self._bm25: Optional[BM25Retriever] = None
@@ -233,6 +239,8 @@ class RipgrepRetriever:
             cmd = ["rg", "--json", "-i"]  # -i for case-insensitive
             for term in terms:
                 cmd.extend(["-e", term])
+            if self.max_count_per_file > 0:
+                cmd.extend(["--max-count", str(self.max_count_per_file)])
             cmd.extend(search_paths)
 
             # Run ripgrep with timeout
@@ -271,6 +279,18 @@ class RipgrepRetriever:
 
             function_scores: dict[str, tuple[str, int]] = {}
             # Map: function_id -> (code, score)
+
+            # Bound the number of files parsed: aggregate hits per file, keep
+            # only the top max_files by total hit count. This caps parse_file
+            # calls and is the primary latency fix for common-term queries on
+            # large repos (hundreds of files -> max_files).
+            if self.max_files > 0 and len(hit_map) > 0:
+                file_hits: dict[str, int] = defaultdict(int)
+                for (abs_path, _line_number), count in hit_map.items():
+                    file_hits[abs_path] += count
+                top_files = sorted(file_hits, key=file_hits.get, reverse=True)[: self.max_files]
+                top_files_set = set(top_files)
+                hit_map = {k: v for k, v in hit_map.items() if k[0] in top_files_set}
 
             for (abs_path, line_number), count in hit_map.items():
                 try:

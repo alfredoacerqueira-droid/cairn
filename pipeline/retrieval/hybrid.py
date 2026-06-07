@@ -168,92 +168,82 @@ class HybridRetriever:
             results = self.embeddings.search(query, top_k=top_k, commit=commit)
             return self._normalize_single_mode(results, "score")
         if self.mode == "hybrid":
+            total_start = time.perf_counter()
             result_sets: list[list[dict[str, Any]]] = []
             active_weights: list[float] = []
 
             # Lexical leg: ripgrep (fresh, exact-match) if available, else BM25.
-            start = time.perf_counter()
+            leg_start = time.perf_counter()
             if self.lexical is not None:
                 lex_results = self.lexical.search(query, top_k=top_k * 2)
                 result_sets.append(lex_results)
-                lex_ms = (time.perf_counter() - start) * 1000
-                logger.debug(
-                    "Lexical/ripgrep leg: %d results in %.1fms",
-                    len(lex_results),
-                    lex_ms,
-                )
                 active_weights.append(self.weights[0])
             else:
                 bm25_results = self.bm25.search(query, top_k=top_k * 2)
                 result_sets.append(bm25_results)
-                bm25_ms = (time.perf_counter() - start) * 1000
-                logger.debug(
-                    "Lexical/BM25 leg: %d results in %.1fms",
-                    len(bm25_results),
-                    bm25_ms,
-                )
                 active_weights.append(self.weights[0])
+            lex_ms = (time.perf_counter() - leg_start) * 1000
 
+            emb_ms = 0.0
             if self.embeddings:
-                start = time.perf_counter()
+                leg_start = time.perf_counter()
                 emb_results = self.embeddings.search(query, top_k=top_k * 2, commit=commit)
-                emb_ms = (time.perf_counter() - start) * 1000
-                logger.debug(
-                    "Embeddings leg: %d results in %.1fms",
-                    len(emb_results),
-                    emb_ms,
-                )
+                emb_ms = (time.perf_counter() - leg_start) * 1000
                 result_sets.append(emb_results)
                 active_weights.append(self.weights[2])
 
-            # Optional structural leg: exact block-identity + reference matching.
-            # Complements lexical and embeddings with deterministic struct
+            struct_ms = 0.0
             if self.structural is not None:
-                start = time.perf_counter()
+                leg_start = time.perf_counter()
                 struct_results = self.structural.search(query, top_k=top_k * 2)
-                struct_ms = (time.perf_counter() - start) * 1000
-                logger.debug(
-                    "Structural leg: %d results in %.1fms",
-                    len(struct_results),
-                    struct_ms,
-                )
+                struct_ms = (time.perf_counter() - leg_start) * 1000
                 result_sets.append(struct_results)
-                # Add structural weight (default same as embeddings)
                 if len(active_weights) >= 2:
-                    # weights[2] is embeddings weight, use same for structural
                     active_weights.append(self.weights[2])
                 else:
                     active_weights.append(0.3)
 
-            start = time.perf_counter()
+            leg_start = time.perf_counter()
             fused = reciprocal_rank_fusion(result_sets, k=self.rrf_k, weights=active_weights)
-            fusion_elapsed = (time.perf_counter() - start) * 1000
-            logger.debug(
-                "RRF fusion: %d legs → %d fused results in %.1fms",
-                len(result_sets),
-                len(fused),
-                fusion_elapsed,
-            )
+            fusion_ms = (time.perf_counter() - leg_start) * 1000
             normalized = _normalize_scores(fused, raw_key="score")
 
-            # If reranking enabled, expand candidates and rerank by cross-encoder
+            rerank_ms = 0.0
+            candidates_count = 0
             if self.rerank_enabled and self.reranker:
-                # Use a wider candidate pool for reranking (e.g. top ~40)
                 candidates = normalized[: max(top_k * 4, 40)]
-                start = time.perf_counter()
+                candidates_count = len(candidates)
+                leg_start = time.perf_counter()
                 reranked = self.reranker.rerank(query, candidates, top_k=top_k)
-                rerank_elapsed = (time.perf_counter() - start) * 1000
-                if reranked:
-                    top_rerank_score = float(reranked[0].get("rerank_score", 0.0))
-                    logger.debug(
-                        "Reranking: %d candidates → %d results in %.1fms (top_score=%.3f)",
-                        len(candidates),
-                        len(reranked),
-                        rerank_elapsed,
-                        top_rerank_score,
-                    )
+                rerank_ms = (time.perf_counter() - leg_start) * 1000
+                total_ms = (time.perf_counter() - total_start) * 1000
+                logger.debug(
+                    "retrieval timing: lexical=%.0fms structural=%.0fms "
+                    "embeddings=%.0fms fusion=%.0fms rerank=%.0fms "
+                    "total=%.0fms (candidates=%d)",
+                    lex_ms,
+                    struct_ms,
+                    emb_ms,
+                    fusion_ms,
+                    rerank_ms,
+                    total_ms,
+                    candidates_count,
+                )
                 return reranked
 
+            total_ms = (time.perf_counter() - total_start) * 1000
+            logger.debug(
+                "retrieval timing: lexical=%.0fms structural=%.0fms "
+                "embeddings=%.0fms fusion=%.0fms rerank=%.0fms "
+                "total=%.0fms (candidates=%d)",
+                lex_ms,
+                struct_ms,
+                emb_ms,
+                fusion_ms,
+                rerank_ms,
+                total_ms,
+                candidates_count,
+            )
             return normalized[:top_k]
 
         # Fallback to bm25
