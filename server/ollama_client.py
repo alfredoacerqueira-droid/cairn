@@ -43,11 +43,13 @@ class OllamaClient:
         embed_model: str | None = None,
         generate_model: str | None = None,
         options: dict | None = None,
+        gen_timeout: float = 300.0,
     ):
         self.base_url = (base_url or _default_base_url()).rstrip("/")
         self.embed_model = embed_model or _default_embed_model()
         self.generate_model = generate_model or _default_generate_model()
         self._options = dict(options or {})
+        self.gen_timeout = gen_timeout
 
     def _gen_options(self) -> dict:
         merged = {"num_ctx": _worker_num_ctx()}
@@ -92,7 +94,7 @@ class OllamaClient:
                 "stream": stream,
                 "options": self._gen_options(),
             },
-            timeout=60.0,
+            timeout=self.gen_timeout,
         )
         response.raise_for_status()
         return response.json()["response"]
@@ -125,7 +127,7 @@ class OllamaClient:
                     "stream": False,
                     "options": self._gen_options(),
                 },
-                timeout=60.0,
+                timeout=self.gen_timeout,
             )
             response.raise_for_status()
             return response.json()["response"]
@@ -176,12 +178,14 @@ class OpenAICompatibleClient:
         model: str | None = None,
         embed_model: str | None = None,
         options: dict | None = None,
+        gen_timeout: float = 300.0,
     ):
         self.base_url = base_url.rstrip("/")
         # For OpenAI-compatible servers, we typically use the same model for both
         # embedding and generation, unless explicitly specified
         self.embed_model = embed_model or model or "model"
         self.generate_model = model or "model"
+        self.gen_timeout = gen_timeout
 
     def embed(self, text: str, model: str | None = None) -> list[float]:
         """Generate embedding vector for text."""
@@ -213,7 +217,7 @@ class OpenAICompatibleClient:
                 "messages": [{"role": "user", "content": prompt}],
                 "stream": stream,
             },
-            timeout=60.0,
+            timeout=self.gen_timeout,
         )
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
@@ -241,7 +245,7 @@ class OpenAICompatibleClient:
                     "messages": [{"role": "user", "content": prompt}],
                     "stream": False,
                 },
-                timeout=60.0,
+                timeout=self.gen_timeout,
             )
             response.raise_for_status()
             return response.json()["choices"][0]["message"]["content"]
@@ -306,6 +310,11 @@ def make_llm_client(
         local_llm.get("embed_model") if isinstance(local_llm, dict) else None
     )
     opts = getattr(local_llm, "ollama_options", None) or {}
+    gen_timeout = getattr(local_llm, "request_timeout_s", None)
+    if gen_timeout is None and isinstance(local_llm, dict):
+        gen_timeout = local_llm.get("request_timeout_s", 300.0)
+    if gen_timeout is None:
+        gen_timeout = 300.0
 
     if backend == "openai_compatible":
         if not base_url:
@@ -317,6 +326,7 @@ def make_llm_client(
             model=model,
             embed_model=embed_model,
             options=opts,
+            gen_timeout=gen_timeout,
         )
     else:
         # Ollama backend (default)
@@ -325,4 +335,5 @@ def make_llm_client(
             embed_model=embed_model,
             generate_model=model,
             options=opts,
+            gen_timeout=gen_timeout,
         )

@@ -243,6 +243,8 @@ class LocalLLMConfig(BaseModel):
     # Model name for embeddings (semantic search).
     # For Ollama: nomic-embed-text (default). For OpenAI-compatible: model ID.
     embed_model: str | None = None
+    # HTTP timeout for local LLM generation; generous for slow CPU/GPU boxes.
+    request_timeout_s: float = 300.0
     # The local model's true context window (tokens).
     context_window: int = 8192
     # Usable input budget per local call (context minus output reserve).

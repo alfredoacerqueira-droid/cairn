@@ -97,20 +97,26 @@ def _map_hit_to_function(
     hit_line: int,
     ast_cache: dict[str, Any],
     parser: ASTParser,
+    id_path: str | None = None,
 ) -> Optional[tuple[str, str]]:
     """Map a hit line to the enclosing function.
 
     Args:
-        filepath: Path to the file
+        filepath: Path to the file (used for parsing; may be absolute)
         hit_line: Line number of the hit (1-indexed)
         ast_cache: Dict mapping filepath -> FileAST
         parser: ASTParser instance
+        id_path: Optional path to use in the returned func_id. Defaults to
+            filepath if not provided. Use this when the id should use a
+            relative path while filepath is absolute.
 
     Returns:
         Tuple of (function_id, function_code) if found, else None.
-        ID format: "filepath:function_name:line_start" or
-        "filepath:ClassName.method_name:line_start" for methods.
+        ID format: "id_path:function_name:line_start" or
+        "id_path:ClassName.method_name:line_start" for methods.
     """
+    id_path = id_path if id_path is not None else filepath
+
     # Parse file if not in cache
     if filepath not in ast_cache:
         try:
@@ -125,14 +131,14 @@ def _map_hit_to_function(
     # Check top-level functions first
     for func in ast.functions:
         if func.line_start <= hit_line <= func.line_end:
-            func_id = f"{filepath}:{func.name}:{func.line_start}"
+            func_id = f"{id_path}:{func.name}:{func.line_start}"
             return (func_id, func.code)
 
     # Check methods in classes
     for cls in ast.classes:
         for method in cls.methods:
             if method.line_start <= hit_line <= method.line_end:
-                func_id = f"{filepath}:{cls.name}.{method.name}:{method.line_start}"
+                func_id = f"{id_path}:{cls.name}.{method.name}:{method.line_start}"
                 return (func_id, method.code)
 
     return None
@@ -255,13 +261,7 @@ class RipgrepRetriever:
                     line_number = data.get("line_number", 0)
 
                     if filepath and line_number:
-                        # Normalize filepath to relative
-                        try:
-                            rel_path = str(Path(filepath).relative_to(self.project_path))
-                        except ValueError:
-                            rel_path = filepath
-
-                        hit_map[(rel_path, line_number)] += 1
+                        hit_map[(filepath, line_number)] += 1
                 except json.JSONDecodeError:
                     continue
 
@@ -272,8 +272,14 @@ class RipgrepRetriever:
             function_scores: dict[str, tuple[str, int]] = {}
             # Map: function_id -> (code, score)
 
-            for (filepath, line_number), count in hit_map.items():
-                result_tuple = _map_hit_to_function(filepath, line_number, ast_cache, parser)
+            for (abs_path, line_number), count in hit_map.items():
+                try:
+                    rel_path = str(Path(abs_path).relative_to(self.project_path))
+                except ValueError:
+                    rel_path = abs_path
+                result_tuple = _map_hit_to_function(
+                    abs_path, line_number, ast_cache, parser, id_path=rel_path
+                )
                 if result_tuple:
                     func_id, func_code = result_tuple
                     if func_id in function_scores:
