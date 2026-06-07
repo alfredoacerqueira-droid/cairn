@@ -55,6 +55,7 @@ class VectorIndexer:
         project_root: Optional[str | Path] = None,
         embedder: Optional[EmbeddingFn] = None,
         cfg=None,
+        embed_truncate_chars: int = 1000,
     ):
         self.chroma_path = str(chroma_path)
         self.ollama = ollama_client or OllamaClient()
@@ -71,17 +72,25 @@ class VectorIndexer:
         # AND embeddings_enabled, used instead of self.ollama.embed/embed_batch
         # so that fastembed works without Ollama.
         self.embedder = embedder
-        # Auto-derive embedder from config when none explicitly passed.
+        # Truncate chars per code block sent to the embedder (reranker/storage
+        # still use the full code). 0 = no truncation.
+        self.embed_truncate_chars = embed_truncate_chars
+        # Auto-derive embedder-from-cfg AND embed_truncate_chars from cfg when
+        # cfg is available.
         # fastembed → use fastembed embedder (384d, no Ollama).
         # ollama   → leave None so self.ollama (injected or default) is used.
-        if self.embedder is None and embeddings_enabled and cfg is not None:
-            from core.config import embeddings_available
+        if cfg is not None:
+            if self.embedder is None and embeddings_enabled:
+                from core.config import embeddings_available
 
-            avail, name = embeddings_available(cfg)
-            if avail and name == "fastembed":
-                from pipeline.store.embedders import make_embedder
+                avail, name = embeddings_available(cfg)
+                if avail and name == "fastembed":
+                    from pipeline.store.embedders import make_embedder
 
-                self.embedder = make_embedder(cfg)
+                    self.embedder = make_embedder(cfg)
+            self.embed_truncate_chars = getattr(
+                cfg.indexing, "embed_truncate_chars", embed_truncate_chars
+            )
 
         # Multi-repo isolation: namespace the collection per project and stamp
         # provenance metadata on every record. project_root may be passed
@@ -113,9 +122,11 @@ class VectorIndexer:
         """Generate embedding for a code snippet."""
         if not self.embeddings_enabled:
             return list(self._PLACEHOLDER_EMBEDDING)
+        n = self.embed_truncate_chars
+        truncated = code[:n] if n > 0 else code
         if self.embedder is not None:
-            return self.embedder([code])[0]
-        return self.ollama.embed(code, model=self.embedding_model)
+            return self.embedder([truncated])[0]
+        return self.ollama.embed(truncated, model=self.embedding_model)
 
     def _embed_query(self, query: str) -> list[float]:
         """Generate embedding for a query string.
@@ -200,11 +211,13 @@ class VectorIndexer:
             return
 
         codes = [item["code"] for item in items]
+        n = self.embed_truncate_chars
+        embed_codes = [c[:n] if n > 0 else c for c in codes]
         if self.embeddings_enabled:
             if self.embedder is not None:
-                embeddings = self.embedder(codes)
+                embeddings = self.embedder(embed_codes)
             else:
-                embeddings = self.ollama.embed_batch(codes, model=self.embedding_model)
+                embeddings = self.ollama.embed_batch(embed_codes, model=self.embedding_model)
         else:
             # embeddings=OFF: store placeholders, never call Ollama (saves the
             # embed model load + one call per block on iac/shell profiles).

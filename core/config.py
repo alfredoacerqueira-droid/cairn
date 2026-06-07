@@ -94,6 +94,10 @@ class IndexingConfig(BaseModel):
     # Maximum time in seconds to spend parsing a single file. If exceeded, the file
     # is skipped with a warning log. Set to 0 to disable (no timeout).
     parse_timeout_s: float = 10.0
+    # Max chars of each block's code sent to the embedder (the reranker/storage
+    # still use the full code). 0 = no truncation. Lower = faster indexing,
+    # slightly coarser embeddings.
+    embed_truncate_chars: int = 1000
     # Embedding model for semantic code search via Ollama.
     # Default "nomic-embed-text" is a general-purpose embedder.
     # For better code retrieval discrimination, use a code-trained model
