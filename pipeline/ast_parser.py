@@ -1,6 +1,6 @@
 # ruff: noqa: E501  # Regex patterns are inherently long, not breakable
 
-"""Deterministic AST parsing using tree-sitter (Python/HCL/YAML/C#/bash) + regex (others)."""
+"""Deterministic AST parsing using tree-sitter for Python/Go/Rust/Java/JS/TS/HCL/YAML/C#/bash + regex fallback."""
 
 import concurrent.futures
 import logging
@@ -22,6 +22,9 @@ except ImportError:
 
 PY_LANGUAGE = Language(tspython.language())
 PY_PARSER = Parser(PY_LANGUAGE)
+
+# Cache for tree-sitter parsers from language pack
+_PARSER_CACHE: dict[str, Any] = {}
 
 # ── Language patterns for regex-based extraction ──────────────────────────────
 
@@ -190,6 +193,13 @@ class FileAST:
 
 
 class ASTParser:
+    # Hard ceiling for tree-sitter language-pack parsers (Go/Rust/Java/JS/TS).
+    # These are ~linear with input size, but pathological inputs (deeply nested,
+    # huge minified, etc.) can stall indexing on slow FSes (/mnt/c on WSL2).
+    # 1500 KB is ~100K lines of source, well above typical files but prevents
+    # indexing a multi-MB bundle from hanging the janitor.
+    TREESITTER_ML_MAX_KB = 1500
+
     def __init__(
         self,
         max_file_kb: int = 0,
@@ -234,7 +244,26 @@ class ASTParser:
         if lang == "unknown":
             lang = "python"
 
-        # PARSE TIMEOUT: wrap the parse operation with a timeout if configured
+        # INPUT-SIZE CEILING for language-pack parsers (Go/Rust/Java/JS/TS/TSX/C++/Ruby).
+        # These are ~linear with input size but can stall on pathological files
+        # (minified, deeply nested, huge). Language-pack parsers are not thread-safe,
+        # so we cannot use thread-based timeout. Input-size ceiling is the hang guard.
+        ml_languages = {"go", "rust", "java", "javascript", "typescript", "tsx", "cpp", "ruby"}
+        if lang in ml_languages:
+            code_bytes = code.encode("utf-8")
+            code_kb = len(code_bytes) / 1024
+            if code_kb > self.TREESITTER_ML_MAX_KB:
+                logger.warning(
+                    f"Skipping {filepath}: {code_kb:.1f}KB exceeds "
+                    f"max for tree-sitter ML parsers ({self.TREESITTER_ML_MAX_KB}KB); "
+                    f"falling back to regex"
+                )
+                return self._regex_parse(code, filepath, lang)
+            # Skip thread-based timeout for language-pack (not thread-safe)
+            return self._parse_impl(code, filepath, lang)
+
+        # PARSE TIMEOUT: wrap the parse operation with a timeout if configured.
+        # Python parser is thread-safe, so we can use thread-based timeout.
         if self.parse_timeout_s > 0:
             try:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
@@ -254,6 +283,15 @@ class ASTParser:
         # Route to appropriate parser
         if lang == "python":
             return self._tree_sitter_parse(code, filepath)
+        elif lang in ("go", "rust", "java", "javascript", "typescript", "tsx", "cpp", "ruby"):
+            # Real tree-sitter AST for these languages
+            try:
+                return self._treesitter_parse_ml(code, filepath, lang)
+            except Exception as e:
+                logger.warning(
+                    f"Tree-sitter parse failed for {lang} in {filepath}: {e}; falling back to regex"
+                )
+                return self._regex_parse(code, filepath, lang)
         elif lang in ("hcl", "yaml", "csharp", "bash"):
             try:
                 return self._treesitter_parse_generic(code, filepath, lang)
@@ -334,6 +372,744 @@ class ASTParser:
         code_lines = lines[node.start_point[0] : node.end_point[0] + 1]
         code = "\n".join(code_lines).strip()
         return ClassDef(name=name, line_start=line_start, line_end=line_end, code=code)
+
+    # ── Tree-sitter multi-language (Go/Rust/Java/JS/TS) ───────
+
+    def _get_cached_parser(self, lang: str):
+        """Get or cache a tree-sitter parser for the given language."""
+        if lang not in _PARSER_CACHE:
+            if get_parser is None:
+                raise ImportError("tree-sitter-language-pack not installed")
+            _PARSER_CACHE[lang] = get_parser(lang)
+        return _PARSER_CACHE[lang]
+
+    def _treesitter_parse_ml(self, code: str, filepath: str, lang: str) -> FileAST:
+        """Parse Go/Rust/Java/JavaScript/TypeScript/C++/Ruby using tree-sitter language pack.
+
+        Extracts top-level functions, classes/types, and methods (for class members).
+        Method names are prefixed with their class/receiver type (e.g., 'Class.method').
+
+        Note: language-pack parsers do not expose timeout_micros (thread-safe timeout).
+        Hang safety relies on the input-size ceiling applied in parse_string().
+        """
+        parser = self._get_cached_parser(lang)
+        code = code.lstrip("﻿")  # Strip BOM
+
+        tree = parser.parse(code)
+        if tree is None:
+            # Parser returned None (unlikely with language-pack, but be safe).
+            logger.debug(f"Parse returned None for {filepath} ({lang}); falling back to regex")
+            return self._regex_parse(code, filepath, lang)
+
+        lines = code.split("\n")
+        code_bytes = code.encode("utf-8")
+        result = FileAST(filepath)
+
+        if lang == "go":
+            self._extract_go_defs(tree.root_node(), lines, code_bytes, result)
+        elif lang == "rust":
+            self._extract_rust_defs(tree.root_node(), lines, code_bytes, result)
+        elif lang == "java":
+            self._extract_java_defs(tree.root_node(), lines, code_bytes, result)
+        elif lang in ("javascript", "typescript", "tsx"):
+            self._extract_js_defs(tree.root_node(), lines, code_bytes, result, lang)
+        elif lang == "cpp":
+            self._extract_cpp_defs(tree.root_node(), lines, code_bytes, result)
+        elif lang == "ruby":
+            self._extract_ruby_defs(tree.root_node(), lines, code_bytes, result)
+
+        return result
+
+    # ── Go extraction ────────────────────────────────────────────
+
+    def _extract_go_defs(self, node, lines: list[str], code_bytes: bytes, result: FileAST):
+        """Extract Go functions, methods, and types (structs/interfaces)."""
+        kind = node.kind()
+
+        if kind == "function_declaration":
+            name = self._get_go_func_name(node, code_bytes)
+            if name:
+                self._add_function(node, lines, name, result)
+
+        elif kind == "method_declaration":
+            name, receiver = self._get_go_method_name(node, code_bytes)
+            if name:
+                # For Go methods, prefix with receiver type (e.g., "Receiver.method")
+                full_name = f"{receiver}.{name}" if receiver else name
+                self._add_function(node, lines, full_name, result)
+
+        elif kind == "type_declaration":
+            # Go type_declaration contains type_spec nodes
+            # Extract each type_spec within
+            for i in range(node.child_count()):
+                child = node.child(i)
+                if child.kind() == "type_spec":
+                    self._extract_go_type_spec(child, lines, code_bytes, result)
+
+        # Recurse
+        for i in range(node.child_count()):
+            self._extract_go_defs(node.child(i), lines, code_bytes, result)
+
+    def _get_go_func_name(self, node, code_bytes: bytes) -> Optional[str]:
+        """Extract function name from function_declaration."""
+        for i in range(node.child_count()):
+            child = node.child(i)
+            if child.kind() == "identifier":
+                return code_bytes[child.start_byte() : child.end_byte()].decode("utf-8", "replace")
+        return None
+
+    def _get_go_method_name(self, node, code_bytes: bytes) -> tuple[Optional[str], Optional[str]]:
+        """Extract method name and receiver type from method_declaration.
+
+        Returns (method_name, receiver_type_name) or (None, None) if extraction fails.
+        """
+        method_name = None
+        receiver_type = None
+        param_list_seen = False
+
+        for i in range(node.child_count()):
+            child = node.child(i)
+            if child.kind() == "parameter_list":
+                # First parameter_list is the receiver, second is the actual parameters
+                if not param_list_seen:
+                    receiver_type = self._get_go_receiver_type(child, code_bytes)
+                    param_list_seen = True
+            elif child.kind() == "field_identifier":
+                # Method name comes after receiver
+                method_name = code_bytes[child.start_byte() : child.end_byte()].decode(
+                    "utf-8", "replace"
+                )
+
+        return method_name, receiver_type
+
+    def _get_go_receiver_type(self, param_list_node, code_bytes: bytes) -> Optional[str]:
+        """Extract receiver type name from parameter list (e.g., *Calculator from (c *Calculator))."""
+        for i in range(param_list_node.child_count()):
+            child = param_list_node.child(i)
+            if child.kind() == "parameter_declaration":
+                # Look for type identifier or pointer within this parameter
+                for j in range(child.child_count()):
+                    type_child = child.child(j)
+                    kind = type_child.kind()
+                    if kind == "type_identifier":
+                        return code_bytes[type_child.start_byte() : type_child.end_byte()].decode(
+                            "utf-8", "replace"
+                        )
+                    elif kind == "pointer_type":
+                        # Extract type from *Type
+                        for k in range(type_child.child_count()):
+                            ptr_child = type_child.child(k)
+                            if ptr_child.kind() == "type_identifier":
+                                return code_bytes[
+                                    ptr_child.start_byte() : ptr_child.end_byte()
+                                ].decode("utf-8", "replace")
+        return None
+
+    def _extract_go_type_spec(self, node, lines: list[str], code_bytes: bytes, result: FileAST):
+        """Extract a single Go type specification (from within type_declaration)."""
+        # type_spec contains: type_identifier struct_type/interface_type
+        type_name = None
+        for i in range(node.child_count()):
+            child = node.child(i)
+            if child.kind() == "type_identifier":
+                type_name = code_bytes[child.start_byte() : child.end_byte()].decode(
+                    "utf-8", "replace"
+                )
+                break
+
+        if type_name:
+            # Record as a class
+            start_row = node.start_position().row
+            end_row = node.end_position().row
+            code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+            if len(code_text) < 100000:
+                result.classes.append(
+                    ClassDef(
+                        name=type_name,
+                        line_start=start_row + 1,
+                        line_end=end_row + 1,
+                        code=code_text,
+                    )
+                )
+
+    # ── Rust extraction ──────────────────────────────────────────
+
+    def _extract_rust_defs(
+        self, node, lines: list[str], code_bytes: bytes, result: FileAST, class_map: dict = None
+    ):
+        """Extract Rust functions, methods, and types (struct/enum/trait)."""
+        if class_map is None:
+            class_map = {}
+
+        kind = node.kind()
+
+        if kind == "function_item":
+            name = self._get_identifier_name(node, code_bytes)
+            if name:
+                self._add_function(node, lines, name, result)
+
+        elif kind == "impl_item":
+            # Extract impl block and its methods
+            self._extract_rust_impl(node, lines, code_bytes, result, class_map)
+
+        elif kind in ("struct_item", "enum_item", "trait_item"):
+            # Types/classes
+            name = self._get_identifier_name(node, code_bytes)
+            if name:
+                start_row = node.start_position().row
+                end_row = node.end_position().row
+                code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+                if len(code_text) < 100000:
+                    cls = ClassDef(
+                        name=name,
+                        line_start=start_row + 1,
+                        line_end=end_row + 1,
+                        code=code_text,
+                    )
+                    result.classes.append(cls)
+                    # Store in map for later impl blocks
+                    class_map[name] = cls
+
+        # Recurse
+        for i in range(node.child_count()):
+            self._extract_rust_defs(node.child(i), lines, code_bytes, result, class_map)
+
+    def _extract_rust_impl(
+        self, node, lines: list[str], code_bytes: bytes, result: FileAST, class_map: dict
+    ):
+        """Extract methods from Rust impl blocks."""
+        # Find impl<T> Type or impl Type
+        impl_type = self._get_rust_impl_type(node, code_bytes)
+
+        # Find or create the class/type
+        if impl_type and impl_type in class_map:
+            cls = class_map[impl_type]
+            # Add methods to existing class (recursively find function_items)
+            self._collect_impl_methods(node, lines, code_bytes, cls)
+        else:
+            # No corresponding type definition, add as top-level functions
+            self._collect_impl_methods_as_functions(node, lines, code_bytes, result, impl_type)
+
+    def _collect_impl_methods(self, node, lines: list[str], code_bytes: bytes, cls: ClassDef):
+        """Recursively collect function_items from impl block and add as methods."""
+        if node.kind() == "function_item":
+            method_name = self._get_identifier_name(node, code_bytes)
+            if method_name:
+                start_row = node.start_position().row
+                end_row = node.end_position().row
+                code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+                if len(code_text) < 100000:
+                    cls.methods.append(
+                        FunctionDef(
+                            name=method_name,
+                            line_start=start_row + 1,
+                            line_end=end_row + 1,
+                            code=code_text,
+                        )
+                    )
+
+        for i in range(node.child_count()):
+            self._collect_impl_methods(node.child(i), lines, code_bytes, cls)
+
+    def _collect_impl_methods_as_functions(
+        self, node, lines: list[str], code_bytes: bytes, result: FileAST, impl_type: Optional[str]
+    ):
+        """Recursively collect function_items from impl block and add as top-level functions."""
+        if node.kind() == "function_item":
+            method_name = self._get_identifier_name(node, code_bytes)
+            if method_name and impl_type:
+                full_name = f"{impl_type}.{method_name}"
+                self._add_function(node, lines, full_name, result)
+
+        for i in range(node.child_count()):
+            self._collect_impl_methods_as_functions(
+                node.child(i), lines, code_bytes, result, impl_type
+            )
+
+    def _get_rust_impl_type(self, impl_node, code_bytes: bytes) -> Optional[str]:
+        """Extract type name from impl block (e.g., 'MyStruct' from 'impl MyStruct')."""
+        for i in range(impl_node.child_count()):
+            child = impl_node.child(i)
+            kind = child.kind()
+            if kind == "type_identifier":
+                return code_bytes[child.start_byte() : child.end_byte()].decode("utf-8", "replace")
+            elif kind == "generic_type":
+                # For generic types, try to extract the base type name
+                for j in range(child.child_count()):
+                    sub_child = child.child(j)
+                    if sub_child.kind() == "type_identifier":
+                        return code_bytes[sub_child.start_byte() : sub_child.end_byte()].decode(
+                            "utf-8", "replace"
+                        )
+        return None
+
+    # ── Java extraction ──────────────────────────────────────────
+
+    def _extract_java_defs(self, node, lines: list[str], code_bytes: bytes, result: FileAST):
+        """Extract Java classes, interfaces, enums, and methods."""
+        kind = node.kind()
+
+        if kind in ("class_declaration", "interface_declaration", "enum_declaration"):
+            # Extract class and its methods
+            class_name = self._get_identifier_name(node, code_bytes)
+            if class_name:
+                start_row = node.start_position().row
+                end_row = node.end_position().row
+                code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+                if len(code_text) < 100000:
+                    cls = ClassDef(
+                        name=class_name,
+                        line_start=start_row + 1,
+                        line_end=end_row + 1,
+                        code=code_text,
+                    )
+                    result.classes.append(cls)
+                    # Extract methods
+                    self._extract_java_methods(node, lines, code_bytes, cls)
+
+        # Recurse (for nested types)
+        for i in range(node.child_count()):
+            self._extract_java_defs(node.child(i), lines, code_bytes, result)
+
+    def _extract_java_methods(self, node, lines: list[str], code_bytes: bytes, cls: ClassDef):
+        """Extract methods from Java class."""
+        kind = node.kind()
+
+        if kind in ("method_declaration", "constructor_declaration"):
+            # For methods: skip modifiers and return type, get the identifier before formal_parameters
+            method_name = self._get_java_method_name(node, code_bytes)
+            if method_name:
+                start_row = node.start_position().row
+                end_row = node.end_position().row
+                code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+                if len(code_text) < 100000:
+                    cls.methods.append(
+                        FunctionDef(
+                            name=method_name,
+                            line_start=start_row + 1,
+                            line_end=end_row + 1,
+                            code=code_text,
+                        )
+                    )
+
+        # Recurse
+        for i in range(node.child_count()):
+            self._extract_java_methods(node.child(i), lines, code_bytes, cls)
+
+    # ── JavaScript/TypeScript extraction ─────────────────────────
+
+    def _extract_js_defs(
+        self, node, lines: list[str], code_bytes: bytes, result: FileAST, lang: str
+    ):
+        """Extract JS/TS functions, classes, methods, arrow functions."""
+        kind = node.kind()
+
+        if kind == "function_declaration":
+            name = self._get_identifier_name(node, code_bytes)
+            if name:
+                self._add_function(node, lines, name, result)
+
+        elif kind == "class_declaration":
+            class_name = self._get_identifier_name(node, code_bytes)
+            if class_name:
+                start_row = node.start_position().row
+                end_row = node.end_position().row
+                code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+                if len(code_text) < 100000:
+                    cls = ClassDef(
+                        name=class_name,
+                        line_start=start_row + 1,
+                        line_end=end_row + 1,
+                        code=code_text,
+                    )
+                    result.classes.append(cls)
+                    # Extract methods
+                    self._extract_js_methods(node, lines, code_bytes, cls)
+
+        elif kind == "lexical_declaration":
+            # Handle const/let NAME = () => {} or const NAME = function() {}
+            func_info = self._extract_js_arrow_or_func_expr(node, lines, code_bytes)
+            if func_info:
+                name, line_start, line_end, code_text = func_info
+                result.functions.append(
+                    FunctionDef(
+                        name=name,
+                        line_start=line_start,
+                        line_end=line_end,
+                        code=code_text,
+                    )
+                )
+
+        elif lang in ("typescript", "tsx") and kind in (
+            "interface_declaration",
+            "type_alias_declaration",
+        ):
+            # TypeScript-specific types
+            type_name = self._get_identifier_name(node, code_bytes)
+            if type_name:
+                start_row = node.start_position().row
+                end_row = node.end_position().row
+                code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+                if len(code_text) < 100000:
+                    result.classes.append(
+                        ClassDef(
+                            name=type_name,
+                            line_start=start_row + 1,
+                            line_end=end_row + 1,
+                            code=code_text,
+                        )
+                    )
+
+        # Recurse
+        for i in range(node.child_count()):
+            self._extract_js_defs(node.child(i), lines, code_bytes, result, lang)
+
+    def _extract_js_methods(self, node, lines: list[str], code_bytes: bytes, cls: ClassDef):
+        """Extract methods from JS/TS class body."""
+        kind = node.kind()
+
+        if kind == "method_definition":
+            method_name = self._get_identifier_name(node, code_bytes)
+            if method_name:
+                start_row = node.start_position().row
+                end_row = node.end_position().row
+                code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+                if len(code_text) < 100000:
+                    cls.methods.append(
+                        FunctionDef(
+                            name=method_name,
+                            line_start=start_row + 1,
+                            line_end=end_row + 1,
+                            code=code_text,
+                        )
+                    )
+
+        # Recurse
+        for i in range(node.child_count()):
+            self._extract_js_methods(node.child(i), lines, code_bytes, cls)
+
+    def _extract_js_arrow_or_func_expr(
+        self, node, lines: list[str], code_bytes: bytes
+    ) -> Optional[tuple[str, int, int, str]]:
+        """Extract name and function from 'const NAME = () => {}' or 'const NAME = function() {}'.
+
+        Returns (name, line_start, line_end, code) or None if not a function expression.
+        """
+        # lexical_declaration has structure: const/let/var NAME = arrow_function/function_expression
+        var_declarator = None
+        for i in range(node.child_count()):
+            child = node.child(i)
+            if child.kind() == "variable_declarator":
+                var_declarator = child
+                break
+
+        if not var_declarator:
+            return None
+
+        name = None
+        func_expr = None
+
+        for i in range(var_declarator.child_count()):
+            child = var_declarator.child(i)
+            if child.kind() == "identifier" and not name:
+                name = code_bytes[child.start_byte() : child.end_byte()].decode("utf-8", "replace")
+            elif child.kind() in ("arrow_function", "function_expression"):
+                func_expr = child
+                break
+
+        if name and func_expr:
+            start_row = var_declarator.start_position().row
+            end_row = var_declarator.end_position().row
+            code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+            if len(code_text) < 100000:
+                return (name, start_row + 1, end_row + 1, code_text)
+
+        return None
+
+    # ── C++ extraction ──────────────────────────────────────────
+
+    def _extract_cpp_defs(
+        self, node, lines: list[str], code_bytes: bytes, result: FileAST, class_map: dict = None
+    ):
+        """Extract C++ functions, methods, classes, and structs."""
+        if class_map is None:
+            class_map = {}
+
+        kind = node.kind()
+
+        if kind == "function_definition":
+            name = self._get_cpp_func_name(node, code_bytes)
+            if name:
+                self._add_function(node, lines, name, result)
+
+        elif kind in ("class_specifier", "struct_specifier"):
+            # Extract class/struct and its methods
+            class_name = self._get_cpp_class_name(node, code_bytes)
+            if class_name:
+                start_row = node.start_position().row
+                end_row = node.end_position().row
+                code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+                if len(code_text) < 100000:
+                    cls = ClassDef(
+                        name=class_name,
+                        line_start=start_row + 1,
+                        line_end=end_row + 1,
+                        code=code_text,
+                    )
+                    result.classes.append(cls)
+                    class_map[class_name] = cls
+                    # Extract methods from the class body
+                    self._extract_cpp_methods(node, lines, code_bytes, cls)
+
+        elif kind == "namespace_definition":
+            # Recurse into namespace
+            for i in range(node.child_count()):
+                child = node.child(i)
+                if child.kind() == "declaration_list":
+                    for j in range(child.child_count()):
+                        self._extract_cpp_defs(child.child(j), lines, code_bytes, result, class_map)
+
+        # Recurse
+        for i in range(node.child_count()):
+            self._extract_cpp_defs(node.child(i), lines, code_bytes, result, class_map)
+
+    def _get_cpp_func_name(self, node, code_bytes: bytes) -> Optional[str]:
+        """Extract function name from C++ function_definition.
+
+        C++ functions have a declarator that contains the name.
+        """
+        for i in range(node.child_count()):
+            child = node.child(i)
+            if child.kind() == "function_declarator":
+                # function_declarator has the actual declarator inside
+                for j in range(child.child_count()):
+                    decl_child = child.child(j)
+                    if decl_child.kind() in ("identifier", "field_identifier"):
+                        return code_bytes[decl_child.start_byte() : decl_child.end_byte()].decode(
+                            "utf-8", "replace"
+                        )
+                    elif decl_child.kind() == "qualified_identifier":
+                        # For qualified names like Foo::bar, extract the last part
+                        last_id = None
+                        for k in range(decl_child.child_count()):
+                            qual_child = decl_child.child(k)
+                            if qual_child.kind() in ("identifier", "field_identifier"):
+                                last_id = code_bytes[
+                                    qual_child.start_byte() : qual_child.end_byte()
+                                ].decode("utf-8", "replace")
+                        if last_id:
+                            return last_id
+            elif child.kind() == "pointer_declarator":
+                # Handle pointer declarators
+                return self._get_cpp_func_name_from_declarator(child, code_bytes)
+        return None
+
+    def _get_cpp_func_name_from_declarator(self, decl_node, code_bytes: bytes) -> Optional[str]:
+        """Extract function name from a declarator (handles pointer_declarator, etc)."""
+        for i in range(decl_node.child_count()):
+            child = decl_node.child(i)
+            if child.kind() == "function_declarator":
+                for j in range(child.child_count()):
+                    func_child = child.child(j)
+                    if func_child.kind() in ("identifier", "field_identifier"):
+                        return code_bytes[func_child.start_byte() : func_child.end_byte()].decode(
+                            "utf-8", "replace"
+                        )
+            elif child.kind() in ("identifier", "field_identifier", "qualified_identifier"):
+                return code_bytes[child.start_byte() : child.end_byte()].decode("utf-8", "replace")
+        return None
+
+    def _get_cpp_class_name(self, node, code_bytes: bytes) -> Optional[str]:
+        """Extract class/struct name from class_specifier or struct_specifier."""
+        for i in range(node.child_count()):
+            child = node.child(i)
+            if child.kind() in ("type_identifier", "identifier"):
+                return code_bytes[child.start_byte() : child.end_byte()].decode("utf-8", "replace")
+        return None
+
+    def _extract_cpp_methods(self, node, lines: list[str], code_bytes: bytes, cls: ClassDef):
+        """Extract methods from C++ class/struct body."""
+        kind = node.kind()
+
+        if kind == "function_definition":
+            method_name = self._get_cpp_func_name(node, code_bytes)
+            if method_name:
+                start_row = node.start_position().row
+                end_row = node.end_position().row
+                code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+                if len(code_text) < 100000:
+                    cls.methods.append(
+                        FunctionDef(
+                            name=method_name,
+                            line_start=start_row + 1,
+                            line_end=end_row + 1,
+                            code=code_text,
+                        )
+                    )
+
+        elif kind == "field_declaration_list":
+            # Recurse into field_declaration_list to find functions
+            for i in range(node.child_count()):
+                self._extract_cpp_methods(node.child(i), lines, code_bytes, cls)
+            return
+
+        # Recurse
+        for i in range(node.child_count()):
+            self._extract_cpp_methods(node.child(i), lines, code_bytes, cls)
+
+    # ── Ruby extraction ─────────────────────────────────────────
+
+    def _extract_ruby_defs(self, node, lines: list[str], code_bytes: bytes, result: FileAST):
+        """Extract Ruby methods, classes, and modules."""
+        kind = node.kind()
+
+        if kind == "method":
+            # Top-level method definition (not inside a class)
+            # Check if we're at the top level by looking at parent context
+            name = self._get_ruby_method_name(node, code_bytes)
+            if name:
+                self._add_function(node, lines, name, result)
+
+        elif kind == "class":
+            # Extract class and its methods
+            class_name = self._get_ruby_class_name(node, code_bytes)
+            if class_name:
+                start_row = node.start_position().row
+                end_row = node.end_position().row
+                code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+                if len(code_text) < 100000:
+                    cls = ClassDef(
+                        name=class_name,
+                        line_start=start_row + 1,
+                        line_end=end_row + 1,
+                        code=code_text,
+                    )
+                    result.classes.append(cls)
+                    # Extract methods from the class body
+                    self._extract_ruby_methods(node, lines, code_bytes, cls)
+
+        elif kind == "module":
+            # Extract module and its methods
+            module_name = self._get_ruby_module_name(node, code_bytes)
+            if module_name:
+                start_row = node.start_position().row
+                end_row = node.end_position().row
+                code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+                if len(code_text) < 100000:
+                    cls = ClassDef(
+                        name=module_name,
+                        line_start=start_row + 1,
+                        line_end=end_row + 1,
+                        code=code_text,
+                    )
+                    result.classes.append(cls)
+                    # Extract methods from the module
+                    self._extract_ruby_methods(node, lines, code_bytes, cls)
+
+        # Recurse
+        for i in range(node.child_count()):
+            self._extract_ruby_defs(node.child(i), lines, code_bytes, result)
+
+    def _get_ruby_method_name(self, node, code_bytes: bytes) -> Optional[str]:
+        """Extract method name from Ruby method node."""
+        # Method node has children: def, identifier, method_parameters, body_statement, end
+        for i in range(node.child_count()):
+            child = node.child(i)
+            if child.kind() == "identifier":
+                return code_bytes[child.start_byte() : child.end_byte()].decode("utf-8", "replace")
+        return None
+
+    def _get_ruby_class_name(self, node, code_bytes: bytes) -> Optional[str]:
+        """Extract class name from Ruby class node."""
+        # Class node has: class, constant, body_statement, end
+        for i in range(node.child_count()):
+            child = node.child(i)
+            if child.kind() == "constant":
+                return code_bytes[child.start_byte() : child.end_byte()].decode("utf-8", "replace")
+        return None
+
+    def _get_ruby_module_name(self, node, code_bytes: bytes) -> Optional[str]:
+        """Extract module name from Ruby module node."""
+        # Module node has: module, constant, body_statement, end
+        for i in range(node.child_count()):
+            child = node.child(i)
+            if child.kind() == "constant":
+                return code_bytes[child.start_byte() : child.end_byte()].decode("utf-8", "replace")
+        return None
+
+    def _extract_ruby_methods(self, node, lines: list[str], code_bytes: bytes, cls: ClassDef):
+        """Extract methods from Ruby class/module body."""
+        kind = node.kind()
+
+        if kind == "method":
+            method_name = self._get_ruby_method_name(node, code_bytes)
+            if method_name:
+                start_row = node.start_position().row
+                end_row = node.end_position().row
+                code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+                if len(code_text) < 100000:
+                    cls.methods.append(
+                        FunctionDef(
+                            name=method_name,
+                            line_start=start_row + 1,
+                            line_end=end_row + 1,
+                            code=code_text,
+                        )
+                    )
+
+        # Recurse
+        for i in range(node.child_count()):
+            self._extract_ruby_methods(node.child(i), lines, code_bytes, cls)
+
+    # ── Helpers ──────────────────────────────────────────────────
+
+    def _get_identifier_name(self, node, code_bytes: bytes) -> Optional[str]:
+        """Get the identifier/name of a node (first identifier-like child)."""
+        id_kinds = {"identifier", "type_identifier", "property_identifier", "field_identifier"}
+        for i in range(node.child_count()):
+            child = node.child(i)
+            if child.kind() in id_kinds:
+                return code_bytes[child.start_byte() : child.end_byte()].decode("utf-8", "replace")
+        return None
+
+    def _get_java_method_name(self, node, code_bytes: bytes) -> Optional[str]:
+        """Extract method name from Java method/constructor declaration.
+
+        Method structure: modifiers? type_identifier identifier formal_parameters ...
+        We want the identifier that comes right before formal_parameters.
+        """
+        formal_params_idx = None
+        for i in range(node.child_count()):
+            child = node.child(i)
+            if child.kind() == "formal_parameters":
+                formal_params_idx = i
+                break
+
+        if formal_params_idx is not None and formal_params_idx > 0:
+            # Look backwards from formal_parameters for the first identifier
+            for i in range(formal_params_idx - 1, -1, -1):
+                child = node.child(i)
+                if child.kind() == "identifier":
+                    return code_bytes[child.start_byte() : child.end_byte()].decode(
+                        "utf-8", "replace"
+                    )
+
+        return None
+
+    def _add_function(self, node, lines: list[str], name: str, result: FileAST):
+        """Helper to add a function to the result."""
+        start_row = node.start_position().row
+        end_row = node.end_position().row
+        code_text = "\n".join(lines[start_row : end_row + 1]).strip()
+        if len(code_text) < 100000:
+            result.functions.append(
+                FunctionDef(
+                    name=name,
+                    line_start=start_row + 1,
+                    line_end=end_row + 1,
+                    code=code_text,
+                )
+            )
 
     # ── Tree-sitter generic (HCL/YAML/C#/bash) ───────────────
 
@@ -427,7 +1203,14 @@ class ASTParser:
             self._extract_hcl_blocks(child, lines, code_bytes, result)
 
     def _extract_yaml_blocks(self, lines: list[str], code: str, result: FileAST):
-        """Extract YAML documents by kind and name."""
+        """Extract YAML blocks by kind+name (k8s resources) or top-level keys (plain YAML).
+
+        For each YAML document:
+          - If it has a 'kind:' field (k8s/ArgoCD resource), emit one block per resource
+            with name '{kind}.{name}' or just '{kind}'.
+          - Otherwise (plain YAML like values.yaml), parse with PyYAML and emit one block
+            per top-level key. Each block spans from that key's line to the next top-level key.
+        """
         docs = code.split("\n---\n")
         start_line = 0
 
@@ -435,9 +1218,9 @@ class ASTParser:
             doc_lines = doc_text.split("\n")
             doc_line_count = len(doc_lines)
 
+            # Check for 'kind:' field (k8s/ArgoCD resource)
             kind = None
             name = None
-
             for line in doc_lines:
                 if line.strip().startswith("kind:"):
                     kind = line.split(":", 1)[1].strip()
@@ -448,18 +1231,95 @@ class ASTParser:
                             name = doc_lines[j].split(":", 1)[1].strip()
                             break
 
-            block_name = f"{kind}.{name}" if kind and name else (kind or doc_lines[0][:30])
-            if len(doc_text.strip()) > 0 and len(doc_text) < 100000:
-                result.functions.append(
-                    FunctionDef(
-                        name=block_name,
-                        line_start=start_line + 1,
-                        line_end=start_line + doc_line_count,
-                        code=doc_text.strip(),
+            if kind:
+                # K8s/ArgoCD resource: use per-resource naming
+                block_name = f"{kind}.{name}" if kind and name else kind
+                if len(doc_text.strip()) > 0 and len(doc_text) < 100000:
+                    result.functions.append(
+                        FunctionDef(
+                            name=block_name,
+                            line_start=start_line + 1,
+                            line_end=start_line + doc_line_count,
+                            code=doc_text.strip(),
+                        )
                     )
-                )
+            else:
+                # Plain YAML (no 'kind'): try to extract per top-level key
+                try:
+                    import yaml
+
+                    parsed = yaml.safe_load(doc_text)
+                    if isinstance(parsed, dict) and parsed:
+                        # Extract blocks for each top-level key
+                        self._extract_yaml_top_level_keys(doc_text, doc_lines, start_line, result)
+                    else:
+                        # Not a dict or empty: fall back to document-level block
+                        if len(doc_text.strip()) > 0 and len(doc_text) < 100000:
+                            result.functions.append(
+                                FunctionDef(
+                                    name=doc_lines[0][:30] if doc_lines else "yaml",
+                                    line_start=start_line + 1,
+                                    line_end=start_line + doc_line_count,
+                                    code=doc_text.strip(),
+                                )
+                            )
+                except Exception:
+                    # YAML parse error: fall back to document-level block
+                    if len(doc_text.strip()) > 0 and len(doc_text) < 100000:
+                        result.functions.append(
+                            FunctionDef(
+                                name=doc_lines[0][:30] if doc_lines else "yaml",
+                                line_start=start_line + 1,
+                                line_end=start_line + doc_line_count,
+                                code=doc_text.strip(),
+                            )
+                        )
 
             start_line += doc_line_count + 1
+
+    def _extract_yaml_top_level_keys(
+        self, doc_text: str, doc_lines: list[str], doc_start_line: int, result: FileAST
+    ):
+        """Extract YAML top-level keys as separate FunctionDef blocks.
+
+        For a plain YAML dict (no 'kind'), emits one block per top-level key.
+        Each block spans from the key's line to the next top-level key (or end).
+
+        Args:
+            doc_text: The YAML document text.
+            doc_lines: The document split into lines.
+            doc_start_line: The absolute line number where this document starts (in the file).
+            result: The FileAST to append blocks to.
+        """
+        # Find all top-level keys (column 0, no leading whitespace)
+        key_positions = []
+        for line_idx, line in enumerate(doc_lines):
+            if line and not line[0].isspace() and ":" in line:
+                key_name = line.split(":")[0].strip()
+                if key_name:
+                    key_positions.append((line_idx, key_name))
+
+        # For each top-level key, extract the block from that key to the next
+        for i, (key_line_idx, key_name) in enumerate(key_positions):
+            # Find the end line: either the next top-level key line or the end
+            if i + 1 < len(key_positions):
+                end_line_idx = key_positions[i + 1][0]
+            else:
+                end_line_idx = len(doc_lines)
+
+            # Extract code for this key (from key line to just before next key)
+            key_block_lines = doc_lines[key_line_idx:end_line_idx]
+            key_block_text = "\n".join(key_block_lines).rstrip()
+
+            if len(key_block_text) > 0 and len(key_block_text) < 100000:
+                result.functions.append(
+                    FunctionDef(
+                        name=key_name,
+                        line_start=doc_start_line + key_line_idx + 1,
+                        line_end=doc_start_line + end_line_idx,
+                        code=key_block_text,
+                    )
+                )
 
     def _extract_csharp_types(self, node, lines: list[str], code_bytes: bytes, result: FileAST):
         """Extract C# classes, interfaces, structs, records."""
@@ -674,7 +1534,7 @@ class ASTParser:
         return indent_block
 
     def diff_update(self, filepath: str | Path, old_ast: FileAST) -> FileAST:
-        """Incremental update - re-parse only if file changed."""
+        """Full re-parse of the file (AST-diffing is not implemented). For genuine incremental behaviour see the indexer's content-hash file skipping in cairn reindex --mode quick and IndexManifest."""
         filepath = Path(filepath)
         if not filepath.exists():
             return FileAST(str(filepath))

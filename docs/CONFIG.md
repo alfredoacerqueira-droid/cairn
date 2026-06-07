@@ -116,11 +116,16 @@ resources:
 
 ### `indexing` (object)
 
-Vector database and AST parsing configuration.
+Vector database and AST parsing configuration. Supports language-native and structured (YAML/Helm) granularity.
+
+**Granularity modes:**
+- **Python, Go, Rust, Java, TypeScript, C#, Bash, HCL/Terraform:** Function/method/class level (tree-sitter AST)
+- **YAML (Helm/Kubernetes):** Per-top-level-key granularity (e.g., each Helm `values.yaml` key like `image:`, `resources:`, `kubeseal:` is indexed separately)
+- **Multi-doc Kubernetes manifests:** Per-resource granularity (each `kind:` block is indexed separately)
 
 **Fields:**
 
-- **`file_patterns`** (list of strings) — Glob patterns to include in indexing. Default includes `.py`, `.rs`, `.go`, `.c`, `.h`, `.cpp`, `.hpp`, `.cs`, `.java`, `.rb`, `.sh`, `.bash`, `.tf`, `.tfvars`, `.toml`. Add `.js`/`.ts` explicitly if needed.
+- **`file_patterns`** (list of strings) — Glob patterns to include in indexing. Default includes `.py`, `.rs`, `.go`, `.c`, `.h`, `.cpp`, `.hpp`, `.cs`, `.java`, `.rb`, `.sh`, `.bash`, `.tf`, `.tfvars`, `.toml`, `.yaml`, `.yml`. Add `.js`/`.ts` explicitly if needed.
 
 - **`exclude_patterns`** (list of strings) — Glob patterns to exclude. Default excludes `node_modules/`, `.git/`, `tests/`, `examples/`, `vendor/`, `static/`, and build artifacts.
 
@@ -183,25 +188,56 @@ stale_db:
 
 ### `memory` (object)
 
-Git-diff memory configuration.
+Git-diff memory configuration with structured sections and per-section entry caps.
 
 **Fields:**
 - `trigger` (string) — When to summarize diffs. Default: `manual`
-  - `manual` — Only on `cairn memory update` command
+  - `manual` — Only on explicit commands
   - `post-commit` — After each commit (requires git hook)
   - `periodic` — Every N minutes (see `period_minutes`)
 
-- `max_entries` (int) — Max number of memory entries to keep. Default: `50`
+- `max_entries` (int) — Kept for compatibility; real limit is per-section caps. Default: `50`
 
 - `compaction_model` (string) — Ollama model for summarization. Default: `qwen2.5-coder:1.5b`
 
 - `period_minutes` (int) — For periodic trigger, how often to summarize (minutes). Default: `5`
 
+- `scope` (string) — Memory scope for multi-repo workspaces. Default: `auto`
+  - `auto` — Follow session scope (workspace or single repo)
+  - `both` — Track both workspace-level and per-repo memory separately
+  - `workspace` — Only workspace-level memory (shared across repos)
+  - `repo` — Only per-repo memory (isolated per repository)
+
+- `max_tasks` (int) — Max entries in "Open Tasks" section. Default: `20`
+
+- `max_decisions` (int) — Max entries in "Decisions" section. Default: `40`
+
+- `max_conventions` (int) — Max entries in "Conventions" section. Default: `40`
+
+- `max_changes` (int) — Max entries in "Recent Changes" section. Default: `40`
+
+- `max_prompts` (int) — Max entries in "Recent User Prompts" section. Default: `10`
+
+The memory document is stored in `.cairn/memory.md` with fixed section headers:
+- `## Open Tasks` — recorded via `remember(note, kind="task")`
+- `## Decisions` — recorded via `remember(note, kind="decision")`
+- `## Conventions` — recorded via `remember(note, kind="convention")`
+- `## Recent Changes` — recorded via `remember(note, kind="change")` or auto-summarized diffs
+- `## Recent User Prompts` — recorded via `remember(note, kind="prompt")`
+
+When `recall()` is called, the memory is returned as a structured, budget-trimmed markdown document respecting per-section caps.
+
 **Example:**
 ```yaml
 memory:
   trigger: manual
+  scope: auto
   max_entries: 50
+  max_tasks: 20
+  max_decisions: 40
+  max_conventions: 40
+  max_changes: 40
+  max_prompts: 10
   compaction_model: qwen2.5-coder:1.5b
   period_minutes: 5
 ```
@@ -265,7 +301,7 @@ budget:
 
 ### `retrieval` (object)
 
-Semantic search and reranking.
+Semantic search, reranking, and multi-repo fusion.
 
 **Fields:**
 - `mode` (string) — Retrieval strategy. Default: `hybrid`
@@ -276,6 +312,12 @@ Semantic search and reranking.
 
 - `weights` (list of floats) — Fusion weights for `hybrid` mode. Default: `[0.4, 0.3, 0.3]` (bm25, ast, embeddings)
 
+- `rrf_k` (int) — RRF (Reciprocal Rank Fusion) k parameter. Default: `60`. Higher k flattens the rank curve (more candidates stay relevant); use 0–100 range depending on desired diversity.
+
+- `max_merged` (int) — Max results when assembling multi-repo answers (workspace router). Default: `24`. Higher = more diverse context from multiple repos; lower = faster assembly.
+
+- `per_repo_min` (int) — Minimum results per repo in multi-repo fusion. Default: `3`. Ensures each repo contributes even if lower scores (good for balanced workspace retrieval).
+
 - `rerank_enabled` (bool) — Use cross-encoder reranking. Default: `true`
 
 - `reranker_type` (string) — Which reranker to use. Default: `cross_encoder`
@@ -283,7 +325,7 @@ Semantic search and reranking.
   - `llm` — Score with local Ollama (slow; ~19–39s per generation on 6GB GPU)
   - `none` — No reranking
 
-- `rerank_min_score` (float) — Confidence threshold (0–1 scale). Default: `0.47` (measured on Django; separates relevant from off-topic queries)
+- `rerank_min_score` (float) — Confidence threshold (0–1 scale). Default: `0.47` (measured on Django; separates relevant from off-topic queries). Set 0.0 to disable the guard.
 
 - `min_confidence` (float) — Minimum embedding cosine (fallback when reranking off). Default: `0.82` (model-specific; measured on Django)
 
@@ -291,16 +333,28 @@ Semantic search and reranking.
 
 - `ca_bundle` (string or null) — Custom CA certificate bundle path. Default: `null`. Overrides `CAIRN_CA_BUNDLE`/`REQUESTS_CA_BUNDLE`/`SSL_CERT_FILE`.
 
-**Example:**
+**Example (single repo):**
 ```yaml
 retrieval:
   mode: hybrid
+  rrf_k: 60
   rerank_enabled: true
   reranker_type: cross_encoder
   rerank_min_score: 0.47
   min_confidence: 0.82
   offline: false
   ca_bundle: null
+```
+
+**Example (multi-repo workspace):**
+```yaml
+retrieval:
+  mode: hybrid
+  rrf_k: 60
+  max_merged: 24      # Total results across all repos
+  per_repo_min: 3     # At least 3 from each repo
+  rerank_enabled: true
+  reranker_type: cross_encoder
 ```
 
 ### `compression` (object)
@@ -323,12 +377,15 @@ compression:
 
 ### `local_llm` (object)
 
-Local LLM configuration (optional; disabled by default).
+Local LLM and embedding configuration. **Entirely optional** — indexing and search work without it.
+
+**Key point:** The `embedder` field controls embeddings (Ollama, fastembed, or disabled).
+The `enabled` field only controls local text generation (which is rarely used; most workloads rely on cloud LLM).
 
 **Fields:**
-- `enabled` (bool) — Enable local LLM (Ollama or OpenAI-compatible). Default: `false`
+- `enabled` (bool) — Enable local text generation (Ollama or OpenAI-compatible). Default: `false`
 
-- `backend` (string) — Backend type. Default: `ollama`
+- `backend` (string) — Backend type for text generation. Default: `ollama`
   - `ollama` — Ollama
   - `openai_compatible` — LM Studio, llama.cpp, vLLM, etc.
 
@@ -336,7 +393,7 @@ Local LLM configuration (optional; disabled by default).
 
 - `model` (string or null) — Text generation model. Default: `null` (uses profile-specific: qwen2.5-coder:1.5b)
 
-- `embed_model` (string or null) — Embedding model. Default: `null` (uses profile-specific: nomic-embed-text)
+- `embed_model` (string or null) — Embedding model name (for Ollama embedder). Default: `null` (uses profile-specific: nomic-embed-text)
 
 - `context_window` (int) — Local model's true context window (tokens). Default: `8192`
 
@@ -348,24 +405,40 @@ Local LLM configuration (optional; disabled by default).
 
 - `one_shot_threshold` (float) — Work <= this fraction of `max_local_tokens` → single call (vs. map/reduce). Default: `0.75`
 
-- `embedder` (string) — Embedder type. Default: `ollama`
-  - `ollama` — Use Ollama embedding model
-  - `fastembed` — In-process ONNX (requires `pip install -e ".[local]"`)
-  - `none` — No embeddings (structural + lexical only)
+- `embedder` (string) — Embeddings backend. Default: `ollama`
+  - `ollama` — Use Ollama embedding service (requires Ollama running; pulls `embed_model`)
+  - `fastembed` — In-process ONNX embeddings (requires `pip install -e ".[local]"`, ~50MB), no Ollama needed
+  - `none` — No embeddings; retrieval uses lexical + structural only
 
-- `fastembed_model` (string) — ONNX model name (for fastembed). Default: `BAAI/bge-small-en-v1.5`
+- `fastembed_model` (string) — ONNX model name (for fastembed embedder). Default: `BAAI/bge-small-en-v1.5`
 
-- `map_concurrency` (int) — Parallel local LLM map calls. Default: `1`. Increase for fast local inference (Apple Silicon) on 6GB+ VRAM; risks OOM on smaller GPUs.
+- `map_concurrency` (int) — Parallel local LLM map calls (only when `enabled: true`). Default: `1`. Increase for fast local inference (Apple Silicon) on 6GB+ VRAM; risks OOM on smaller GPUs.
 
-**Example (Disabled):**
+**Example (Disabled — default, no LLM, no embeddings):**
 ```yaml
 local_llm:
   enabled: false
-  backend: ollama
-  embedder: ollama
+  embedder: none    # No embeddings; use lexical + structural only
 ```
 
-**Example (Enabled with Ollama):**
+**Example (Disabled, with Ollama embeddings):**
+```yaml
+local_llm:
+  enabled: false    # No local text generation
+  backend: ollama
+  embedder: ollama  # Use Ollama for embeddings only
+  embed_model: nomic-embed-text
+```
+
+**Example (Disabled, with fastembed embeddings):**
+```yaml
+local_llm:
+  enabled: false    # No local text generation
+  embedder: fastembed  # In-process ONNX embeddings, no Ollama
+  fastembed_model: BAAI/bge-small-en-v1.5
+```
+
+**Example (Enabled with Ollama for both text generation and embeddings):**
 ```yaml
 local_llm:
   enabled: true
@@ -376,14 +449,6 @@ local_llm:
   context_window: 8192
   max_local_tokens: 6000
   embedder: ollama
-```
-
-**Example (Enabled with fastembed, no Ollama):**
-```yaml
-local_llm:
-  enabled: false  # fastembed only, no LLM generation
-  embedder: fastembed
-  fastembed_model: BAAI/bge-small-en-v1.5
 ```
 
 ## Environment Variables
@@ -466,6 +531,8 @@ local_llm:
 - Reduce `indexing.batch_size` (default 50)
 - Set `OLLAMA_MAX_LOADED_MODELS=1` in your environment
 - Use IaC profile (embeddings_enabled: false) to avoid loading embedding model
+- Or switch to fastembed embedder (in-process, no Ollama): `local_llm.embedder: fastembed`
+- Or disable embeddings entirely: `local_llm.embedder: none` (lexical + structural still work)
 
 ### Token budget exceeded
 - Reduce `memory.max_entries` (fewer memory lines in context)

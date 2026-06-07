@@ -25,9 +25,9 @@ logger = logging.getLogger(__name__)
 # (e.g., behind a proxy), we bail out after this window.
 FLASHRANK_LOAD_TIMEOUT_S = 20
 
-# Singleton Ranker instance — loaded on first use
-_ranker: Any = None
-_ranker_failed: bool = False
+# Singleton Ranker cache — one instance per model_name (keyed by model_name).
+# A value of None means the model previously failed to load.
+_ranker_cache: dict[str, Any] = {}
 
 
 def _configure_ca_bundle(ca_bundle: str | None) -> None:
@@ -52,27 +52,33 @@ def _configure_ca_bundle(ca_bundle: str | None) -> None:
         logger.debug(f"Configured CA bundle: {bundle_path}")
 
 
-def _get_ranker(ca_bundle: str | None = None, offline: bool = False) -> Any | None:
-    """Lazy-load the FlashRank Ranker as a singleton.
+def _get_ranker(
+    model_name: str = "ms-marco-MiniLM-L-12-v2",
+    ca_bundle: str | None = None,
+    offline: bool = False,
+) -> Any | None:
+    """Lazy-load the FlashRank Ranker, cached per model_name.
 
     Args:
+        model_name: FlashRank model identifier (e.g. "ms-marco-MiniLM-L-12-v2").
         ca_bundle: Path to custom CA certificate bundle (corporate proxy).
         offline: If True, skip model load entirely; return None immediately.
 
     Returns None if flashrank is not available, model fails to load, times out,
-    or offline mode is enabled. Sets a flag to avoid repeated attempts after failure.
+    or offline mode is enabled. Caches failures per model_name to avoid repeated
+    attempts.
     """
-    global _ranker, _ranker_failed
+    global _ranker_cache
 
     if offline:
         logger.debug("Reranking disabled (offline mode)")
         return None
 
-    if _ranker_failed:
-        return None
-
-    if _ranker is not None:
-        return _ranker
+    if model_name in _ranker_cache:
+        instance = _ranker_cache[model_name]
+        if instance is None:
+            return None  # previously failed
+        return instance
 
     # Configure CA bundle before attempting import/load
     _configure_ca_bundle(ca_bundle)
@@ -83,29 +89,30 @@ def _get_ranker(ca_bundle: str | None = None, offline: bool = False) -> Any | No
         # Wrap Ranker construction in a timeout to prevent hangs
         # (e.g., Zscaler SSL stall during model download from huggingface.co)
         def _load():
-            return Ranker(model_name="ms-marco-MiniLM-L-12-v2")
+            return Ranker(model_name=model_name)
 
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(_load)
             try:
-                _ranker = future.result(timeout=FLASHRANK_LOAD_TIMEOUT_S)
-                logger.info("FlashRank reranker initialized (ms-marco-MiniLM-L-12-v2)")
-                return _ranker
+                ranker = future.result(timeout=FLASHRANK_LOAD_TIMEOUT_S)
+                _ranker_cache[model_name] = ranker
+                logger.info("FlashRank reranker initialized (%s)", model_name)
+                return ranker
             except FuturesTimeoutError:
                 logger.warning(
                     f"FlashRank model load timed out after {FLASHRANK_LOAD_TIMEOUT_S}s "
-                    "(possibly blocked by proxy); reranking disabled"
+                    f"(possibly blocked by proxy); reranking disabled for {model_name}"
                 )
-                _ranker_failed = True
+                _ranker_cache[model_name] = None
                 return None
 
     except ImportError:
         logger.warning("flashrank not available; reranking disabled (install via pip)")
-        _ranker_failed = True
+        _ranker_cache[model_name] = None
         return None
     except Exception as e:
-        logger.warning(f"Failed to load FlashRank model: {e}; reranking disabled")
-        _ranker_failed = True
+        logger.warning(f"Failed to load FlashRank model {model_name}: {e}; reranking disabled")
+        _ranker_cache[model_name] = None
         return None
 
 
@@ -124,14 +131,23 @@ class Reranker:
     for corporate proxies.
     """
 
-    def __init__(self, ca_bundle: str | None = None, offline: bool = False):
+    def __init__(
+        self,
+        model_name: str = "ms-marco-MiniLM-L-12-v2",
+        truncate_chars: int = 2000,
+        ca_bundle: str | None = None,
+        offline: bool = False,
+    ):
         """Initialize the reranker (lazy-loads model on first rerank call).
 
         Args:
+            model_name: FlashRank model identifier (e.g. "ms-marco-MiniLM-L-12-v2").
+            truncate_chars: Max chars per candidate snippet sent to cross-encoder.
             ca_bundle: Path to custom CA certificate bundle.
             offline: If True, disable reranker (no model load attempt).
         """
-        self.ranker = None
+        self.model_name = model_name
+        self.truncate_chars = truncate_chars
         self.ca_bundle = ca_bundle
         self.offline = offline
 
@@ -158,7 +174,9 @@ class Reranker:
         if not candidates:
             return []
 
-        ranker = _get_ranker(ca_bundle=self.ca_bundle, offline=self.offline)
+        ranker = _get_ranker(
+            model_name=self.model_name, ca_bundle=self.ca_bundle, offline=self.offline
+        )
         if ranker is None:
             # Graceful no-op: attach rerank_score from existing similarity
             for c in candidates:
@@ -171,9 +189,10 @@ class Reranker:
             passages = []
             for i, candidate in enumerate(candidates):
                 text = candidate.get("text", "")
-                # Truncate very long code (~2000 chars) to bound cross-encoder latency
-                if len(text) > 2000:
-                    text = text[:2000] + "..."
+                # Truncate long code to bound cross-encoder latency
+                limit = self.truncate_chars
+                if len(text) > limit:
+                    text = text[:limit] + "..."
                 passages.append({"id": i, "text": text, "meta": {}})
 
             # Run the cross-encoder

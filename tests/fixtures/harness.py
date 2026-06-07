@@ -86,6 +86,7 @@ def fresh_index(repo_path: Path, *, embeddings: bool = False) -> Path:
         chroma_path=repo.get_chroma_path(),
         ollama_client=_ExplodingOllama() if not embeddings else None,
         embeddings_enabled=embeddings,
+        project_root=repo_path,
     )
 
     parser = ASTParser()

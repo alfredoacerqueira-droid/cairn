@@ -1,15 +1,21 @@
 """ChromaDB vector indexer for semantic code search."""
 
+from __future__ import annotations
+
 import logging
 import time
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import chromadb
 from chromadb.config import Settings as ChromaSettings
+from chromadb.errors import InvalidArgumentError
 
 from core.repo import project_id
 from server.ollama_client import OllamaClient
+
+if TYPE_CHECKING:
+    from pipeline.store.base import EmbeddingFn
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +53,9 @@ class VectorIndexer:
         cache=None,
         embeddings_enabled: bool = True,
         project_root: Optional[str | Path] = None,
+        embedder: Optional[EmbeddingFn] = None,
+        cfg=None,
+        embed_truncate_chars: int = 1000,
     ):
         self.chroma_path = str(chroma_path)
         self.ollama = ollama_client or OllamaClient()
@@ -59,6 +68,29 @@ class VectorIndexer:
         # When False (iac/shell profiles), skip Ollama embedding at index time and
         # store a placeholder vector instead — see _PLACEHOLDER_EMBEDDING.
         self.embeddings_enabled = embeddings_enabled
+        # Embedding callable (e.g. FastEmbedEmbedder, OllamaEmbedder). When set
+        # AND embeddings_enabled, used instead of self.ollama.embed/embed_batch
+        # so that fastembed works without Ollama.
+        self.embedder = embedder
+        # Truncate chars per code block sent to the embedder (reranker/storage
+        # still use the full code). 0 = no truncation.
+        self.embed_truncate_chars = embed_truncate_chars
+        # Auto-derive embedder-from-cfg AND embed_truncate_chars from cfg when
+        # cfg is available.
+        # fastembed → use fastembed embedder (384d, no Ollama).
+        # ollama   → leave None so self.ollama (injected or default) is used.
+        if cfg is not None:
+            if self.embedder is None and embeddings_enabled:
+                from core.config import embeddings_available
+
+                avail, name = embeddings_available(cfg)
+                if avail and name == "fastembed":
+                    from pipeline.store.embedders import make_embedder
+
+                    self.embedder = make_embedder(cfg)
+            self.embed_truncate_chars = getattr(
+                cfg.indexing, "embed_truncate_chars", embed_truncate_chars
+            )
 
         # Multi-repo isolation: namespace the collection per project and stamp
         # provenance metadata on every record. project_root may be passed
@@ -90,7 +122,21 @@ class VectorIndexer:
         """Generate embedding for a code snippet."""
         if not self.embeddings_enabled:
             return list(self._PLACEHOLDER_EMBEDDING)
-        return self.ollama.embed(code, model=self.embedding_model)
+        n = self.embed_truncate_chars
+        truncated = code[:n] if n > 0 else code
+        if self.embedder is not None:
+            return self.embedder([truncated])[0]
+        return self.ollama.embed(truncated, model=self.embedding_model)
+
+    def _embed_query(self, query: str) -> list[float]:
+        """Generate embedding for a query string.
+
+        Uses the embedder callable when set (fastembed / OllamaEmbedder),
+        otherwise falls back to the legacy ollama-client path.
+        """
+        if self.embedder is not None and self.embeddings_enabled:
+            return self.embedder([query])[0]
+        return self.ollama.embed(query, model=self.embedding_model)
 
     def index_function(
         self,
@@ -116,10 +162,10 @@ class VectorIndexer:
             metadata["project_id"] = self.project_id
             metadata["project_root"] = self.project_root
 
-        self.collection.upsert(  # type: ignore[arg-type]  # ChromaDB v1.x stubs
+        self._upsert_with_dimension_fallback(
             ids=[doc_id],
-            embeddings=[embedding],  # type: ignore[arg-type]
-            metadatas=[metadata],  # type: ignore[arg-type]
+            embeddings=[embedding],
+            metadatas=[metadata],
             documents=[code],
         )
 
@@ -139,6 +185,17 @@ class VectorIndexer:
             )
 
         for cls in ast_result.classes:
+            # Index the class definition itself
+            items.append(
+                {
+                    "filepath": ast_result.filepath,
+                    "function_name": cls.name,
+                    "code": cls.code,
+                    "line_start": cls.line_start,
+                    "line_end": cls.line_end,
+                }
+            )
+            # Index class methods
             for method in cls.methods:
                 items.append(
                     {
@@ -154,8 +211,13 @@ class VectorIndexer:
             return
 
         codes = [item["code"] for item in items]
+        n = self.embed_truncate_chars
+        embed_codes = [c[:n] if n > 0 else c for c in codes]
         if self.embeddings_enabled:
-            embeddings = self.ollama.embed_batch(codes, model=self.embedding_model)
+            if self.embedder is not None:
+                embeddings = self.embedder(embed_codes)
+            else:
+                embeddings = self.ollama.embed_batch(embed_codes, model=self.embedding_model)
         else:
             # embeddings=OFF: store placeholders, never call Ollama (saves the
             # embed model load + one call per block on iac/shell profiles).
@@ -184,6 +246,12 @@ class VectorIndexer:
             metadatas.append(metadata)
             documents.append(item["code"])
 
+        # Proactively check if the collection dimension has changed (e.g. user
+        # toggled embeddings on/off or switched embed models).  If the stored
+        # vectors have a different shape, drop and recreate before upserting so
+        # ChromaDB doesn't reject every batch with a dimension error.
+        self._check_collection_dimension(embeddings)
+
         # Determine the ChromaDB max batch size defensively, falling back to 5000.
         try:
             client_max = self.client.get_max_batch_size()
@@ -195,10 +263,10 @@ class VectorIndexer:
         num_items = len(ids)
         for i in range(0, num_items, max_batch):
             end_idx = min(i + max_batch, num_items)
-            self.collection.upsert(  # type: ignore[arg-type]  # ChromaDB v1.x stubs
+            self._upsert_with_dimension_fallback(
                 ids=ids[i:end_idx],
-                embeddings=all_embeddings[i:end_idx],  # type: ignore[arg-type]
-                metadatas=metadatas[i:end_idx],  # type: ignore[arg-type]
+                embeddings=all_embeddings[i:end_idx],
+                metadatas=metadatas[i:end_idx],
                 documents=documents[i:end_idx],
             )
 
@@ -224,10 +292,10 @@ class VectorIndexer:
             if cached_embedding is not None:
                 query_embedding = cached_embedding
             else:
-                query_embedding = self.ollama.embed(query, model=self.embedding_model)
+                query_embedding = self._embed_query(query)
                 self.cache.set(query_embedding, "embedding", query, self.embedding_model)
         else:
-            query_embedding = self.ollama.embed(query, model=self.embedding_model)
+            query_embedding = self._embed_query(query)
 
         where_filter = None
         if filepath_prefix:
@@ -314,10 +382,61 @@ class VectorIndexer:
         """Get total number of indexed functions."""
         return self.collection.count()
 
+    def _recreate_collection(self):
+        name = self.collection.name
+        metadata = self.collection.metadata
+        self.client.delete_collection(name)
+        self.collection = self.client.get_or_create_collection(
+            name=name,
+            metadata=metadata or {"hnsw:space": "cosine"},
+        )
+
+    def _check_collection_dimension(self, embeddings):
+        if not embeddings:
+            return
+        new_dim = len(embeddings[0])
+        try:
+            existing = self.collection.get(limit=1, include=["embeddings"])
+            if existing and existing.get("embeddings") and existing["embeddings"]:
+                existing_embedding = existing["embeddings"][0]
+                if existing_embedding:
+                    old_dim = len(existing_embedding)
+                    if old_dim != new_dim:
+                        logger.info(
+                            "embedding dimension changed (old=%d new=%d) — "
+                            "rebuilding collection %s",
+                            old_dim,
+                            new_dim,
+                            self.collection.name,
+                        )
+                        self._recreate_collection()
+        except Exception:
+            pass
+
+    def _upsert_with_dimension_fallback(self, ids, embeddings, metadatas, documents):
+        try:
+            self.collection.upsert(
+                ids=ids,
+                embeddings=embeddings,
+                metadatas=metadatas,
+                documents=documents,
+            )
+        except InvalidArgumentError as e:
+            if "dimension" in str(e).lower():
+                logger.info(
+                    "embedding dimension mismatch — rebuilding collection %s",
+                    self.collection.name,
+                )
+                self._recreate_collection()
+                self.collection.upsert(
+                    ids=ids,
+                    embeddings=embeddings,
+                    metadatas=metadatas,
+                    documents=documents,
+                )
+            else:
+                raise
+
     def clear(self):
         """Delete all vectors from the collection."""
-        self.client.delete_collection("functions")
-        self.collection = self.client.get_or_create_collection(
-            name="functions",
-            metadata={"hnsw:space": "cosine"},
-        )
+        self._recreate_collection()

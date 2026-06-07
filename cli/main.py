@@ -10,21 +10,37 @@ from typing import TYPE_CHECKING
 
 import click
 
-from core.config import Config, load_config
+from core.config import Config, embeddings_available, load_config
+from core.logging_setup import configure_logging
 from core.profiles import detect_profile, get_profile
 from core.repo import census_extensions, detect_infra_markers
 
 if TYPE_CHECKING:
     from server.ollama_client import OllamaClient
 
+logger = logging.getLogger(__name__)
 
-def _setup_logging(verbose: bool = False):
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+
+def debug_option(f):
+    """Decorator that adds a --debug flag to enable debug logging on a subcommand.
+
+    Works alongside the root group's --debug option: both ``cairn --debug search q``
+    and ``cairn search q --debug`` will enable debug logging.
+    """
+
+    def _debug_callback(ctx, param, value):
+        if value:
+            configure_logging(debug=True)
+        return value
+
+    return click.option(
+        "--debug",
+        is_flag=True,
+        default=False,
+        help="Enable debug logging (or CAIRN_DEBUG=1)",
+        callback=_debug_callback,
+        expose_value=False,
+    )(f)
 
 
 def _detect_workspace_siblings(project_path: Path) -> list[Path]:
@@ -52,8 +68,18 @@ def _detect_workspace_siblings(project_path: Path) -> list[Path]:
 
 
 def _get_embeddings_enabled(cfg: Config) -> bool:
-    """Get effective embeddings flag: both config and local_llm must be enabled."""
-    return cfg.embeddings_enabled and cfg.local_llm.enabled
+    """Get effective embeddings flag: uses the helper so fastembed works without Ollama."""
+    return embeddings_available(cfg)[0]
+
+
+def _fastembed_available() -> bool:
+    """Check if the fastembed package is importable (guarded try/except ImportError)."""
+    try:
+        import fastembed  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
 
 
 def _select_worker_model(installed: list[str], free_vram_mib: int | None, current: str) -> str:
@@ -116,10 +142,10 @@ def _select_worker_model(installed: list[str], free_vram_mib: int | None, curren
 
 
 @click.group()
-@click.option("-v", "--verbose", is_flag=True, help="Enable debug logging")
-def main(verbose: bool):
+@click.option("--debug/--no-debug", default=False, help="Enable debug logging (or CAIRN_DEBUG=1)")
+def main(debug: bool):
     """Cairn - Intelligent context engine for OpenCode."""
-    _setup_logging(verbose)
+    configure_logging(debug=debug)
 
 
 def _run_preflight_checks(skip_ollama: bool = False) -> bool:
@@ -257,12 +283,28 @@ def init(no_index: bool, yes: bool, force: bool, offline: bool):
     # STEP 3: Detect layout
     click.echo("3. Detecting source layout:")
     detected_roots, detected_patterns = detect_source_layout(project_path)
-    click.echo(f"  Detected source roots: {detected_roots}")
+
+    # Get extension census from ENTIRE repo (not just source_roots) to detect all file types
+    entire_repo_census = census_extensions(project_path, source_roots=None)
+
+    # For mixed repos (multiple language types), expand source_roots to ["."] to ensure
+    # all source directories are indexed (not just the "best" one)
+    from pipeline.ast_parser import EXTENSION_MAP
+
+    detected_extensions = set(ext for ext in entire_repo_census if ext in EXTENSION_MAP)
+    is_mixed_repo = len(detected_extensions) > 1
+    if is_mixed_repo and detected_roots != ["."]:
+        detected_roots = ["."]
+        click.echo(f"  Detected source roots: {detected_roots} (mixed repo, indexing all)")
+    else:
+        click.echo(f"  Detected source roots: {detected_roots}")
+
     click.echo(f"  Detected languages: {', '.join(detected_patterns)}")
     click.echo()
 
     # STEP 3b: Detect profile and retrieval strategy
     click.echo("3b. Detecting repository profile:")
+    # Get census from detected source roots for profile detection
     ext_census = census_extensions(project_path, source_roots=detected_roots)
     has_infra_markers = detect_infra_markers(project_path, source_roots=detected_roots)
     detected_profile_name = detect_profile(ext_census, has_infra_markers=has_infra_markers)
@@ -275,6 +317,34 @@ def init(no_index: bool, yes: bool, force: bool, offline: bool):
     if detected_profile.description:
         click.echo(f"  Description: {detected_profile.description}")
     click.echo()
+
+    # Build file_patterns: UNION of (detected patterns + broad default) to avoid silent drops
+    # This ensures mixed-language repos index all source types, not just dominant ones.
+    default_config = Config()
+    default_patterns = set(default_config.indexing.file_patterns)
+    detected_patterns_set = set(detected_patterns)
+
+    # Add patterns for any language extensions found in entire repo.
+    # Include .yaml/.yml for IaC repos (Kubernetes, Helm), but exclude pure config
+    # formats like .json and .toml that are only metadata (not source).
+    for ext in entire_repo_census:
+        if ext in EXTENSION_MAP and ext not in {".json", ".toml"}:
+            # Skip non-language config formats; include .yaml (legitimate IaC source)
+            pattern = f"*{ext}"
+            detected_patterns_set.add(pattern)
+
+    # Union with defaults to respect broad coverage
+    final_patterns = sorted(list(detected_patterns_set | default_patterns))
+
+    # Report file type breakdown if mixed
+    if is_mixed_repo:
+        breakdown = [
+            f"{count} {ext[1:] if ext.startswith('.') else ext}"
+            for ext, count in sorted(entire_repo_census.items())
+        ]
+        breakdown_str = ", ".join(breakdown)
+        click.echo(f"  Mixed repo: indexing {breakdown_str} (profile={detected_profile_name})")
+        click.echo()
 
     # STEP 4: Write config
     click.echo("4. Writing configuration:")
@@ -291,10 +361,10 @@ def init(no_index: bool, yes: bool, force: bool, offline: bool):
             click.echo(f"  Updated source_roots: {detected_roots}")
 
         # Update file_patterns if still default (all patterns)
-        default_config = Config()
-        if cfg.indexing.file_patterns == default_config.indexing.file_patterns:
-            cfg.indexing.file_patterns = detected_patterns
-            click.echo(f"  Updated file_patterns: {detected_patterns}")
+        default_cfg = Config()
+        if cfg.indexing.file_patterns == default_cfg.indexing.file_patterns:
+            cfg.indexing.file_patterns = final_patterns
+            click.echo(f"  Updated file_patterns: {final_patterns}")
 
         # Update profile if still default
         if cfg.profile == "code":
@@ -309,13 +379,23 @@ def init(no_index: bool, yes: bool, force: bool, offline: bool):
         # Create fresh config with detected values
         cfg = Config()
         cfg.indexing.source_roots = detected_roots
-        cfg.indexing.file_patterns = detected_patterns
+        cfg.indexing.file_patterns = final_patterns
         # Apply profile settings
         cfg.profile = detected_profile_name
         cfg.embeddings_enabled = detected_profile.embedding_enabled
         if detected_profile.embedding_enabled:
             cfg.indexing.embedding_model = detected_profile.embedding_model
         click.echo("  Created new config with profile settings")
+
+    # Auto-select fastembed as the default embedder when available and Ollama not enabled
+    if detected_profile.embedding_enabled and not cfg.local_llm.enabled:
+        if _fastembed_available():
+            cfg.local_llm.embedder = "fastembed"
+            click.echo("  Semantic search: ON (offline via fastembed, no server needed)")
+        elif cfg.local_llm.embedder == "ollama":
+            click.echo(
+                "  [i] Semantic search needs fastembed or a local LLM " "(pip install fastembed)"
+            )
 
     # Apply --offline flag if set (disables reranker)
     if offline:
@@ -504,7 +584,10 @@ memory.md
         repo = RepoManager(project_path)
         parser = ASTParser()
         indexer = VectorIndexer(
-            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
+            chroma_path=repo.get_chroma_path(),
+            embeddings_enabled=_get_embeddings_enabled(cfg),
+            project_root=project_path,
+            cfg=cfg,
         )
         freshness = DBFreshness(
             project_path,
@@ -642,6 +725,7 @@ def profile(name: str | None):
 
 
 @main.command()
+@debug_option
 def status():
     """Check indexing status and DB freshness."""
     from core.freshness import DBFreshness
@@ -681,9 +765,26 @@ def status():
 
     try:
         indexer = VectorIndexer(
-            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
+            chroma_path=repo.get_chroma_path(),
+            embeddings_enabled=_get_embeddings_enabled(cfg),
+            project_root=project_path,
+            cfg=cfg,
         )
-        click.echo(f"Indexed functions: {indexer.count()}")
+        count = indexer.count()
+        click.echo(f"Indexed functions: {count}")
+
+        # ISSUE 2 FIX: Warn if current index location is empty but alternate has data
+        if count == 0:
+            # Check if alternate location has data
+            alt_location = "native" if index_location == "in_project" else "in_project"
+            alt_base = repo.index_base_dir(alt_location)
+            alt_chroma = alt_base / "chroma"
+            if alt_chroma.exists() and any(alt_chroma.iterdir()):
+                click.echo(
+                    f"\n⚠ WARNING: Index at {index_base} is EMPTY but data exists at "
+                    f"{alt_base} — index_location may have changed. "
+                    "Run 'cairn reindex' to sync."
+                )
     except Exception as e:
         click.echo(f"Indexer: {e}")
 
@@ -753,6 +854,134 @@ def doctor():
             click.echo(f"[!] LLM health check error: {e}")
     else:
         click.echo("[i] Local LLM: disabled (lexical/structural + cross-encoder only)")
+
+    # Active embedder and offline capability
+    emb_available, emb_source = embeddings_available(cfg)
+    if emb_available and emb_source == "fastembed":
+        fast_model = cfg.local_llm.fastembed_model
+        click.echo(f"[✓] Embeddings: fastembed (offline, no server) — {fast_model}")
+    elif emb_available and emb_source == "ollama":
+        emb_model = cfg.indexing.embedding_model
+        click.echo(f"[✓] Embeddings: ollama ({emb_model}) — requires server")
+    else:
+        click.echo(
+            "[i] Embeddings: OFF (lexical+structural only) — "
+            "install fastembed or enable local LLM for semantic search"
+        )
+
+    # System resources and model recommendations
+    from core.resources import (
+        get_system_resources,
+        list_installed_ollama_models,
+        recommend_local_models,
+    )
+
+    resources = get_system_resources()
+    installed_models = list_installed_ollama_models()
+    rec = recommend_local_models(resources, installed_models)
+
+    def _res(key):
+        return resources[key]
+
+    click.echo()
+    click.echo("[i] System Resources:")
+    click.echo(
+        f"    RAM: {_res('ram_total_gb')} GB total, " f"{_res('ram_available_gb')} GB available"
+    )
+    click.echo(f"    CPU: {_res('cpu_count')} cores")
+    if resources["gpu_name"]:
+        click.echo(
+            f"    GPU: {_res('gpu_name')} "
+            f"({_res('vram_total_gb')} GB VRAM, "
+            f"{_res('vram_free_gb')} GB free)"
+        )
+    else:
+        click.echo("    GPU: no GPU detected (CPU-only)")
+    click.echo(f"    Budget: {rec['budget_gb']:.1f} GB")
+    click.echo(f"    Recommended worker: {rec['worker']['model']} " f"({rec['worker']['reason']})")
+    click.echo(f"    Recommended embed:  {rec['embed']['model']} " f"({rec['embed']['reason']})")
+    click.echo(f"    Suggested num_ctx: {rec['suggested_num_ctx']}")
+
+    # fastembed GPU availability (honest: probe ACTIVE providers, not compiled-in list)
+    try:
+        import onnxruntime as ort
+
+        avail = set(ort.get_available_providers())
+        gpu_providers_list = [
+            p
+            for p in ("CUDAExecutionProvider", "ROCMExecutionProvider", "CoreMLExecutionProvider")
+            if p in avail
+        ]
+        if not gpu_providers_list and not resources["gpu_name"]:
+            click.echo()
+            click.echo(
+                "[i] fastembed embedding runs on CPU "
+                "(set local_llm.embed_threads to use more cores)."
+            )
+        elif gpu_providers_list:
+            # Actually probe: build FastEmbedEmbedder(device="cuda") and read .gpu_active
+            click.echo()
+            try:
+                from pipeline.store.embedders import FastEmbedEmbedder
+
+                probe = FastEmbedEmbedder(model=cfg.local_llm.fastembed_model, device="cuda")
+                probe._ensure()
+                if probe.gpu_active:
+                    active = [p for p in probe._active_providers if p in gpu_providers_list]
+                    first = active[0] if active else gpu_providers_list[0]
+                    click.echo(f"[OK] fastembed GPU acceleration ACTIVE ({first}).")
+                else:
+                    click.echo(
+                        "[!] fastembed GPU provider present but NOT loadable "
+                        "(fell back to CPU). "
+                        "Install the matching CUDA 12.x + cuDNN 9.x runtime libs and ensure "
+                        "they're on LD_LIBRARY_PATH; on WSL2 these are usually missing. "
+                        "Embedding currently runs on CPU."
+                    )
+            except Exception:
+                click.echo("[i] fastembed GPU probe failed — embedding runs on CPU.")
+        else:
+            click.echo()
+            click.echo(
+                "[i] GPU detected but fastembed runs on CPU. "
+                "For faster indexing: pip install fastembed-gpu (replaces onnxruntime "
+                "with onnxruntime-gpu)."
+            )
+    except Exception:
+        pass
+
+    # Local LLM load test
+    if cfg.local_llm.enabled:
+        click.echo()
+        click.echo("[i] Local LLM load test:")
+        try:
+            from concurrent.futures import (
+                ThreadPoolExecutor,
+            )
+            from concurrent.futures import (
+                TimeoutError as FuturesTimeoutError,
+            )
+
+            from server.ollama_client import make_llm_client
+
+            def _test_generate():
+                client = make_llm_client(cfg.local_llm)
+                client.generate("ok")
+                return True
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_test_generate)
+                future.result(timeout=30)
+            model_name = cfg.local_llm.model or "(default)"
+            click.echo(f"    [✓] local model {model_name} loads")
+        except FuturesTimeoutError:
+            model_name = cfg.local_llm.model or "(default)"
+            click.echo(f"    [!] local model {model_name} " "FAILED to load: timed out after 30s")
+        except Exception as e:
+            model_name = cfg.local_llm.model or "(default)"
+            click.echo(f"    [!] local model {model_name} FAILED to load: {e}")
+    else:
+        click.echo("    [i] local LLM disabled (indexing/search work without it)")
 
     # Ollama check (only if embeddings+llm are enabled)
     if cfg.embeddings_enabled and cfg.local_llm.enabled and cfg.local_llm.backend == "ollama":
@@ -922,7 +1151,10 @@ def doctor():
         from pipeline.indexer import VectorIndexer
 
         indexer = VectorIndexer(
-            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
+            chroma_path=repo.get_chroma_path(),
+            embeddings_enabled=_get_embeddings_enabled(cfg),
+            project_root=project_path,
+            cfg=cfg,
         )
         collection_name = indexer.collection.name if indexer.collection else "unknown"
         pid = project_id(project_path)
@@ -937,6 +1169,18 @@ def doctor():
             click.echo("[i] Index location: in-project (.cairn/)")
         else:
             click.echo(f"[i] Index location: native ({index_base})")
+
+        # ISSUE 2 FIX: Warn if current index location is empty but alternate has data
+        count = indexer.count()
+        if count == 0:
+            alternate_location = "native" if index_location == "in_project" else "in_project"
+            alternate_base = repo.index_base_dir(alternate_location)
+            alternate_chroma = alternate_base / "chroma"
+            if alternate_chroma.exists() and any(alternate_chroma.iterdir()):
+                click.echo(
+                    f"[!] Index at {index_base} is EMPTY but data exists at "
+                    f"{alternate_base} — index_location may have changed. Run 'cairn reindex'."
+                )
     except Exception as e:
         click.echo(f"[i] Collection: error ({e})")
 
@@ -1098,7 +1342,10 @@ def _start_all_impl(
         info = freshness.check_freshness()
         repo = RepoManager(Path.cwd())
         idx = VectorIndexer(
-            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
+            chroma_path=repo.get_chroma_path(),
+            embeddings_enabled=_get_embeddings_enabled(cfg),
+            project_root=Path.cwd(),
+            cfg=cfg,
         )
 
         if info["last_indexed_commit"] is None:
@@ -1149,7 +1396,10 @@ def _start_all_impl(
         repo = RepoManager(project_path)
         parser = ASTParser()
         indexer = VectorIndexer(
-            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
+            chroma_path=repo.get_chroma_path(),
+            embeddings_enabled=_get_embeddings_enabled(cfg),
+            project_root=project_path,
+            cfg=cfg,
         )
 
         cpu = CPUThrottler(max_cpu_percent=cfg.resources.max_cpu_percent)
@@ -1244,7 +1494,10 @@ def _run_quick_reindex(cfg, freshness):
     repo = RepoManager(Path.cwd())
     parser = ASTParser()
     indexer = VectorIndexer(
-        chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
+        chroma_path=repo.get_chroma_path(),
+        embeddings_enabled=_get_embeddings_enabled(cfg),
+        project_root=Path.cwd(),
+        cfg=cfg,
     )
     total = 0
 
@@ -1279,7 +1532,10 @@ def _print_status(cfg):
         from pipeline.indexer import VectorIndexer
 
         idx = VectorIndexer(
-            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
+            chroma_path=repo.get_chroma_path(),
+            embeddings_enabled=_get_embeddings_enabled(cfg),
+            project_root=Path.cwd(),
+            cfg=cfg,
         )
         count = idx.count()
     except Exception:
@@ -1298,6 +1554,7 @@ def _print_status(cfg):
 @main.command()
 @click.argument("query")
 @click.option("-k", "--top-k", default=5, help="Number of results")
+@debug_option
 def search(query: str, top_k: int):
     """Search the indexed codebase semantically.
 
@@ -1309,9 +1566,12 @@ def search(query: str, top_k: int):
 
     assembler = ContextAssembler(project_path=Path.cwd(), top_k=top_k)
 
+    logger.debug("Starting semantic search: query='%s', top_k=%d", query, top_k)
     start_time = time.perf_counter()
     results = assembler.semantic_search(query, top_k=top_k, apply_guard=True)
     elapsed_ms = (time.perf_counter() - start_time) * 1000
+
+    logger.debug("Semantic search completed: %d results in %.1fms", len(results), elapsed_ms)
 
     # Record search metrics
     try:
@@ -1322,7 +1582,27 @@ def search(query: str, top_k: int):
         pass
 
     if not results:
-        click.echo("No confident matches found for this query.")
+        # ISSUE 2 FIX: Hint if index is empty
+        try:
+            from core.repo import RepoManager
+
+            cfg = load_config()
+            repo = RepoManager(Path.cwd())
+            from pipeline.indexer import VectorIndexer
+
+            idx = VectorIndexer(
+                chroma_path=repo.get_chroma_path(),
+                embeddings_enabled=_get_embeddings_enabled(cfg),
+                project_root=Path.cwd(),
+                cfg=cfg,
+            )
+            if idx.count() == 0:
+                click.echo("No confident matches found for this query.")
+                click.echo("(index is empty — run 'cairn reindex')", err=True)
+            else:
+                click.echo("No confident matches found for this query.")
+        except Exception:
+            click.echo("No confident matches found for this query.")
         return
 
     for i, r in enumerate(results, 1):
@@ -1341,6 +1621,7 @@ def search(query: str, top_k: int):
 
 @main.command()
 @click.option("--mode", type=click.Choice(["quick", "full"]), default="quick")
+@debug_option
 def reindex(mode: str):
     """Re-index the current project."""
     import time as _time
@@ -1351,7 +1632,8 @@ def reindex(mode: str):
     click.echo(f"Re-indexing in {mode} mode...")
 
     from core.freshness import DBFreshness
-    from core.repo import RepoManager, collect_source_files
+    from core.manifest import IndexManifest, sha256_of_file
+    from core.repo import RepoManager, collect_source_files, project_id
     from pipeline.ast_parser import ASTParser
     from pipeline.indexer import VectorIndexer
 
@@ -1365,8 +1647,13 @@ def reindex(mode: str):
 
     parser = ASTParser()
     indexer = VectorIndexer(
-        chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
+        chroma_path=repo.get_chroma_path(),
+        embeddings_enabled=_get_embeddings_enabled(cfg),
+        project_root=project_path,
+        cfg=cfg,
     )
+
+    pid = project_id(project_path)
 
     if mode == "full":
         indexer.clear()
@@ -1378,6 +1665,23 @@ def reindex(mode: str):
         getattr(cfg.indexing, "source_roots", ["."]),
     )
 
+    manifest = None
+    changed_count = 0
+    skipped_count = 0
+    removed_count = 0
+    if mode == "quick":
+        manifest = IndexManifest.load(repo, pid)
+        filtered_relpaths = {
+            str(f.resolve().relative_to(project_path.resolve())) for f in filtered_files
+        }
+        for relpath in list(manifest.files.keys()):
+            if relpath not in filtered_relpaths:
+                indexer.remove_file(str(project_path / relpath))
+                manifest.remove_entry(relpath)
+                removed_count += 1
+    else:
+        manifest = IndexManifest(repo.get_manifest_path(), pid)
+
     total = 0
     repo_map: dict[str, dict] = {}
     with click.progressbar(
@@ -1388,11 +1692,30 @@ def reindex(mode: str):
     ) as bar:
         for filepath in bar:
             try:
+                relpath = str(filepath.relative_to(project_path))
+                fhash = sha256_of_file(filepath)
+
+                if mode == "quick":
+                    if manifest.has_same_hash(relpath, fhash):
+                        skipped_count += 1
+                        continue
+                    indexer.remove_file(str(filepath))
+
                 ast = parser.parse_file(filepath)
                 indexer.index_ast(ast)
                 total += len(ast.functions)
                 for cls in ast.classes:
                     total += len(cls.methods)
+
+                if mode in ("quick", "full"):
+                    if manifest is None:
+                        manifest = IndexManifest(repo.get_manifest_path(), pid)
+                    blocks = len(ast.functions) + sum(len(c.methods) for c in ast.classes)
+                    if mode == "quick":
+                        manifest.set_entry(relpath, fhash, blocks)
+                        changed_count += 1
+                    else:
+                        manifest.set_entry(relpath, fhash, blocks)
 
                 if len(repo_map) < cfg.indexing.batch_size:
                     repo_map[str(filepath)] = ast.to_dict()
@@ -1406,6 +1729,9 @@ def reindex(mode: str):
         if fp.exists():
             repo_map[str(fp)] = parser.parse_file(fp).to_dict()
     repo.save_repo_map(repo_map)
+
+    if manifest is not None:
+        manifest.save()
 
     try:
         import time as _time
@@ -1421,7 +1747,13 @@ def reindex(mode: str):
     except Exception:
         pass
 
-    click.echo(f"Indexed {total} functions from {len(filtered_files)} files")
+    if mode == "quick":
+        click.echo(
+            f"Indexed {total} functions from {len(filtered_files)} files "
+            f"({changed_count} changed, {skipped_count} unchanged-skipped, {removed_count} removed)"
+        )
+    else:
+        click.echo(f"Indexed {total} functions from {len(filtered_files)} files")
 
 
 @main.group()
@@ -1449,7 +1781,10 @@ def janitor_start(debounce: float | None):
     repo = RepoManager(project_path)
     parser = ASTParser()
     indexer = VectorIndexer(
-        chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg)
+        chroma_path=repo.get_chroma_path(),
+        embeddings_enabled=_get_embeddings_enabled(cfg),
+        project_root=project_path,
+        cfg=cfg,
     )
 
     cpu = CPUThrottler(max_cpu_percent=cfg.resources.max_cpu_percent)
@@ -1583,7 +1918,13 @@ def memory_update(commits: int):
             import subprocess
 
             result = subprocess.run(
-                ["git", "diff", f"HEAD~{i+1}", f"HEAD~{i}" if i > 0 else "HEAD"],
+                [
+                    "git",
+                    "diff",
+                    f"HEAD~{i+1}",
+                    f"HEAD~{i}" if i > 0 else "HEAD",
+                    ":(exclude).cairn",
+                ],
                 cwd=project_path,
                 capture_output=True,
                 text=True,
@@ -1731,8 +2072,48 @@ def token_history(limit: int):
 def suggest_local(query: str):
     """Show whether a query looks simple enough for local model handling."""
     from core.config import load_config
+    from core.resources import (
+        get_system_resources,
+        list_installed_ollama_models,
+        recommend_local_models,
+    )
 
     cfg = load_config()
+
+    click.echo("== System Resources ==")
+    resources = get_system_resources()
+
+    def _res(key):
+        return resources[key]
+
+    click.echo(
+        f"  RAM: {_res('ram_total_gb')} GB total, " f"{_res('ram_available_gb')} GB available"
+    )
+    click.echo(f"  CPU: {_res('cpu_count')} cores")
+    if resources["gpu_name"]:
+        click.echo(
+            f"  GPU: {_res('gpu_name')} "
+            f"({_res('vram_total_gb')} GB VRAM, "
+            f"{_res('vram_free_gb')} GB free)"
+        )
+    else:
+        click.echo("  GPU: no GPU detected (CPU-only)")
+    click.echo()
+
+    installed = list_installed_ollama_models()
+    rec = recommend_local_models(resources, installed)
+    click.echo("== Local Model Recommendations ==")
+    click.echo(f"  Budget: {rec['budget_gb']:.1f} GB " "(available RAM + VRAM - 2 GB headroom)")
+    click.echo(f"  Worker: {rec['worker']['model']} " f"— {rec['worker']['reason']}")
+    click.echo(f"  Embed:  {rec['embed']['model']} " f"— {rec['embed']['reason']}")
+    click.echo(f"  Suggested num_ctx: {rec['suggested_num_ctx']}")
+    if installed:
+        names = ", ".join(m["name"] for m in installed)
+        click.echo(f"  Installed models: {names}")
+    else:
+        click.echo("  No installed models detected via `ollama list`")
+    click.echo()
+
     if cfg.routing.mode == "cloud_only":
         click.echo("Routing mode is 'cloud_only'. All queries go to cloud.")
         click.echo("Change routing.mode in config to enable local suggestions.")
@@ -1769,6 +2150,7 @@ def suggest_local(query: str):
 @click.argument("query")
 @click.option("-k", "--top-k", default=5, help="Number of results")
 @click.option("--show-prompt", is_flag=True, help="Show full assembled prompt")
+@debug_option
 def dry_run(query: str, top_k: int, show_prompt: bool):
     """Show what would be sent to the cloud model without actually sending."""
     from server.context_assembler import ContextAssembler
@@ -1929,7 +2311,6 @@ def _render_dashboard():
             click.echo()
     except Exception:
         pass
-
 
     # Janitor stats
     jan = summary["janitor"]
@@ -2107,6 +2488,7 @@ def _sparkline(values: list[float]) -> str:
 
 
 @main.command()
+@debug_option
 def mcp():
     """Run as an MCP server (for Claude Code / OpenCode)."""
     # Import inside function to avoid loading mcp at CLI startup

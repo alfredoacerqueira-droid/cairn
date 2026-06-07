@@ -269,3 +269,62 @@ class TestRipgrepRetrieverWithRipgrep:
         results = retriever.search("func", top_k=3)
 
         assert len(results) <= 3
+
+    def test_max_files_bounds_results_to_top_files(self, tmp_path):
+        """With max_files=2, results come from at most 2 distinct files."""
+        num_files = 10
+        for i in range(num_files):
+            f = tmp_path / f"mod{i}.py"
+            f.write_text(f"def handle_common_thing_{i}():\n    # common_term_xyz\n    pass\n")
+
+        retriever = RipgrepRetriever(
+            project_path=tmp_path,
+            source_roots=["."],
+            file_patterns=["*.py"],
+            max_files=2,
+            max_count_per_file=50,
+        )
+
+        results = retriever.search("common_term_xyz", top_k=20)
+
+        assert len(results) > 0
+        distinct_files = set(r["id"].split(":", 1)[0] for r in results)
+        assert len(distinct_files) <= 2
+
+    def test_small_repo_search_unchanged_with_bounding(self, tmp_path):
+        """Bounding does not change results for a small repo."""
+        test_file = tmp_path / "test.py"
+        test_file.write_text("def unique_fn_abc():\n    pass\n")
+
+        retriever = RipgrepRetriever(
+            project_path=tmp_path,
+            source_roots=["."],
+            file_patterns=["*.py"],
+            max_files=5,
+            max_count_per_file=50,
+        )
+
+        results = retriever.search("unique_fn_abc", top_k=5)
+        assert len(results) > 0
+        assert any("unique_fn_abc" in r["id"] for r in results)
+        assert all(r["source"] == "ripgrep" for r in results)
+
+    def test_max_files_zero_disables_file_bounding(self, tmp_path):
+        """max_files=0 disables file-level bounding."""
+        num_files = 10
+        for i in range(num_files):
+            f = tmp_path / f"mod{i}.py"
+            f.write_text(f"def fn_{i}():\n    # common_term_abc\n    pass\n")
+
+        retriever = RipgrepRetriever(
+            project_path=tmp_path,
+            source_roots=["."],
+            file_patterns=["*.py"],
+            max_files=0,
+            max_count_per_file=50,
+        )
+
+        results = retriever.search("common_term_abc", top_k=20)
+        assert len(results) > 0
+        distinct_files = set(r["id"].split(":", 1)[0] for r in results)
+        assert len(distinct_files) >= 3

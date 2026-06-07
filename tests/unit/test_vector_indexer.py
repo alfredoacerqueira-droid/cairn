@@ -206,3 +206,91 @@ def logout():
 
         # Should work correctly; model consistency is implicit in the design
         assert len(results) >= 0  # Just ensure search doesn't crash
+
+    def test_embed_truncate_chars_truncates_before_embedder(self, tmp_path):
+        """embed_truncate_chars truncates codes passed to the embedder in index_ast
+        (full code still stored in documents)."""
+        captured_codes = []
+
+        def fake_embedder(codes):
+            captured_codes.extend(codes)
+            return [[0.0] * 16 for _ in codes]
+
+        indexer = VectorIndexer(
+            chroma_path=str(tmp_path / "chroma"),
+            embeddings_enabled=True,
+            embedder=fake_embedder,
+            embed_truncate_chars=20,
+        )
+
+        from pipeline.ast_parser import ASTParser
+
+        long_code = "def very_long_function_name(arg1, arg2, arg3):\n    return arg1 + arg2 + arg3"
+        assert len(long_code) > 20
+
+        parser = ASTParser()
+        ast = parser.parse_string(long_code, "test.py")
+        indexer.index_ast(ast)
+
+        assert len(captured_codes) == 1
+        assert len(captured_codes[0]) <= 20
+        assert captured_codes[0] == long_code[:20]
+
+        results = indexer.search("test", top_k=1)
+        assert len(results) == 1
+        assert results[0]["code"] == long_code
+
+    def test_embed_truncate_chars_zero_passes_full_code(self, tmp_path):
+        """embed_truncate_chars=0 passes full code to the embedder."""
+        captured_codes = []
+
+        def fake_embedder(codes):
+            captured_codes.extend(codes)
+            return [[0.0] * 16 for _ in codes]
+
+        indexer = VectorIndexer(
+            chroma_path=str(tmp_path / "chroma"),
+            embeddings_enabled=True,
+            embedder=fake_embedder,
+            embed_truncate_chars=0,
+        )
+
+        from pipeline.ast_parser import ASTParser
+
+        long_code = "def very_long_function_name(arg1, arg2, arg3):\n    return arg1 + arg2 + arg3"
+
+        parser = ASTParser()
+        ast = parser.parse_string(long_code, "test.py")
+        indexer.index_ast(ast)
+
+        assert len(captured_codes) == 1
+        assert captured_codes[0] == long_code
+
+    def test_embed_truncate_chars_does_not_truncate_stored_document(self, tmp_path):
+        """Documents stored in ChromaDB retain the full code regardless of truncation."""
+        long_code = """def long_fn():
+    line2
+    line3
+    line4
+    line5
+    line6"""
+
+        def fake_embedder(codes):
+            return [[0.0] * 16 for _ in codes]
+
+        indexer = VectorIndexer(
+            chroma_path=str(tmp_path / "chroma"),
+            embeddings_enabled=True,
+            embedder=fake_embedder,
+            embed_truncate_chars=10,
+        )
+
+        from pipeline.ast_parser import ASTParser
+
+        parser = ASTParser()
+        ast = parser.parse_string(long_code, "test.py")
+        indexer.index_ast(ast)
+
+        results = indexer.collection.get(include=["documents"])
+        assert len(results["documents"]) == 1
+        assert results["documents"][0] == long_code

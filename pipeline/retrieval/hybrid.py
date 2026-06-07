@@ -9,11 +9,15 @@ rankers while respecting that each score distribution differs.
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import Any
 
 from pipeline.retrieval.ast_rank import ASTRankRetriever
 from pipeline.retrieval.bm25 import BM25Retriever
 from pipeline.retrieval.embeddings import EmbeddingRetriever
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_scores(results: list[dict], raw_key: str = "score") -> list[dict]:
@@ -119,6 +123,9 @@ class HybridRetriever:
         lexical: Any = None,
         structural: Any = None,
         profile_legs: list[str] | None = None,
+        rrf_k: int = 60,
+        rerank_candidate_multiplier: int = 4,
+        rerank_min_candidates: int = 40,
     ):
         self.bm25 = bm25
         self.ast_rank = ast_rank
@@ -127,6 +134,9 @@ class HybridRetriever:
         self.weights = weights or [0.4, 0.3, 0.3]  # bm25, ast, embeddings
         self.reranker = reranker
         self.rerank_enabled = rerank_enabled
+        self.rrf_k = rrf_k
+        self.rerank_candidate_multiplier = rerank_candidate_multiplier
+        self.rerank_min_candidates = rerank_min_candidates
         # Optional lexical leg (RipgrepRetriever). When set, it REPLACES the
         # bm25+ast legs in hybrid fusion: lexical (fresh, exact) + embeddings,
         # then the cross-encoder reranks. The AST keyword-graph leg degraded
@@ -162,42 +172,84 @@ class HybridRetriever:
             results = self.embeddings.search(query, top_k=top_k, commit=commit)
             return self._normalize_single_mode(results, "score")
         if self.mode == "hybrid":
+            total_start = time.perf_counter()
             result_sets: list[list[dict[str, Any]]] = []
             active_weights: list[float] = []
 
             # Lexical leg: ripgrep (fresh, exact-match) if available, else BM25.
+            leg_start = time.perf_counter()
             if self.lexical is not None:
-                result_sets.append(self.lexical.search(query, top_k=top_k * 2))
+                lex_results = self.lexical.search(query, top_k=top_k * 2)
+                result_sets.append(lex_results)
                 active_weights.append(self.weights[0])
             else:
-                result_sets.append(self.bm25.search(query, top_k=top_k * 2))
+                bm25_results = self.bm25.search(query, top_k=top_k * 2)
+                result_sets.append(bm25_results)
                 active_weights.append(self.weights[0])
+            lex_ms = (time.perf_counter() - leg_start) * 1000
 
+            emb_ms = 0.0
             if self.embeddings:
-                result_sets.append(self.embeddings.search(query, top_k=top_k * 2, commit=commit))
+                leg_start = time.perf_counter()
+                emb_results = self.embeddings.search(query, top_k=top_k * 2, commit=commit)
+                emb_ms = (time.perf_counter() - leg_start) * 1000
+                result_sets.append(emb_results)
                 active_weights.append(self.weights[2])
 
-            # Optional structural leg: exact block-identity + reference matching.
-            # Complements lexical and embeddings with deterministic struct
+            struct_ms = 0.0
             if self.structural is not None:
-                result_sets.append(self.structural.search(query, top_k=top_k * 2))
-                # Add structural weight (default same as embeddings)
+                leg_start = time.perf_counter()
+                struct_results = self.structural.search(query, top_k=top_k * 2)
+                struct_ms = (time.perf_counter() - leg_start) * 1000
+                result_sets.append(struct_results)
                 if len(active_weights) >= 2:
-                    # weights[2] is embeddings weight, use same for structural
                     active_weights.append(self.weights[2])
                 else:
                     active_weights.append(0.3)
 
-            fused = reciprocal_rank_fusion(result_sets, k=60, weights=active_weights)
+            leg_start = time.perf_counter()
+            fused = reciprocal_rank_fusion(result_sets, k=self.rrf_k, weights=active_weights)
+            fusion_ms = (time.perf_counter() - leg_start) * 1000
             normalized = _normalize_scores(fused, raw_key="score")
 
-            # If reranking enabled, expand candidates and rerank by cross-encoder
+            rerank_ms = 0.0
+            candidates_count = 0
             if self.rerank_enabled and self.reranker:
-                # Use a wider candidate pool for reranking (e.g. top ~40)
-                candidates = normalized[: max(top_k * 4, 40)]
+                candidates = normalized[
+                    : max(top_k * self.rerank_candidate_multiplier, self.rerank_min_candidates)
+                ]
+                candidates_count = len(candidates)
+                leg_start = time.perf_counter()
                 reranked = self.reranker.rerank(query, candidates, top_k=top_k)
+                rerank_ms = (time.perf_counter() - leg_start) * 1000
+                total_ms = (time.perf_counter() - total_start) * 1000
+                logger.debug(
+                    "retrieval timing: lexical=%.0fms structural=%.0fms "
+                    "embeddings=%.0fms fusion=%.0fms rerank=%.0fms "
+                    "total=%.0fms (candidates=%d)",
+                    lex_ms,
+                    struct_ms,
+                    emb_ms,
+                    fusion_ms,
+                    rerank_ms,
+                    total_ms,
+                    candidates_count,
+                )
                 return reranked
 
+            total_ms = (time.perf_counter() - total_start) * 1000
+            logger.debug(
+                "retrieval timing: lexical=%.0fms structural=%.0fms "
+                "embeddings=%.0fms fusion=%.0fms rerank=%.0fms "
+                "total=%.0fms (candidates=%d)",
+                lex_ms,
+                struct_ms,
+                emb_ms,
+                fusion_ms,
+                rerank_ms,
+                total_ms,
+                candidates_count,
+            )
             return normalized[:top_k]
 
         # Fallback to bm25

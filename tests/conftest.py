@@ -37,16 +37,17 @@ def _preserve_cwd_and_env():
 def _reset_reranker_singleton():
     """Reset the FlashRank reranker singleton between tests.
 
-    pipeline.retrieval.reranker caches a module-level `_ranker` / `_ranker_failed`.
-    Tests that force the reranker to fail (offline-resilience) would otherwise
+    pipeline.retrieval.reranker caches a module-level ``_ranker_cache`` dict
+    keyed by model_name. Tests that force the reranker to fail would otherwise
     leave it disabled for every test that runs afterwards, making the suite
     order-dependent (e.g. router routing then fail-closes spuriously).
     """
     import pipeline.retrieval.reranker as _rr
 
-    before = (_rr._ranker, _rr._ranker_failed)
-    _rr._ranker, _rr._ranker_failed = None, False
+    before = dict(_rr._ranker_cache)
+    _rr._ranker_cache.clear()
     try:
         yield
     finally:
-        _rr._ranker, _rr._ranker_failed = before
+        _rr._ranker_cache.clear()
+        _rr._ranker_cache.update(before)

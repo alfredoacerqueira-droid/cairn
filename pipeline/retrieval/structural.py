@@ -48,6 +48,47 @@ def _tokenize_block_name(name: str) -> set[str]:
     return tokens
 
 
+GENERIC_TOKENS: set[str] = {
+    "function",
+    "func",
+    "method",
+    "handler",
+    "resource",
+    "value",
+    "val",
+    "data",
+    "type",
+    "name",
+    "item",
+    "object",
+    "obj",
+    "get",
+    "set",
+    "new",
+    "init",
+    "index",
+    "main",
+    "util",
+    "utils",
+    "common",
+    "base",
+    "default",
+    "list",
+    "map",
+    "dict",
+    "args",
+    "kwargs",
+    "self",
+    "cls",
+    "return",
+    "class",
+    "module",
+    "file",
+    "path",
+    "test",
+}
+
+
 def _extract_identifiers(text: str) -> set[str]:
     """Extract identifiers and references from block text.
 
@@ -170,9 +211,11 @@ class StructuralRetriever:
             score = 0.0
 
             # 1. Block-name token overlap (high weight)
-            name_overlap = len(name_tokens & query_terms)
-            if name_overlap > 0:
-                score += 100.0 * name_overlap
+            name_overlap_set = name_tokens & query_terms
+            if name_overlap_set:
+                non_generic_name = name_overlap_set - GENERIC_TOKENS
+                if non_generic_name or len(name_overlap_set) >= 2:
+                    score += 100.0 * len(name_overlap_set)
 
             # 2. Query identifier found as reference in block (medium)
             block_refs = _extract_identifiers(text)
@@ -185,13 +228,17 @@ class StructuralRetriever:
             block_ref_terms = set()
             for ref in block_refs:
                 block_ref_terms.update(re.findall(r"[a-z0-9]+", ref.lower()))
-            term_overlap = len(query_terms & block_ref_terms)
-            if term_overlap > 0:
-                score += 25.0 * term_overlap
+            term_overlap_set = query_terms & block_ref_terms
+            if term_overlap_set:
+                non_generic_term = term_overlap_set - GENERIC_TOKENS
+                if non_generic_term or len(term_overlap_set) >= 2:
+                    score += 25.0 * len(term_overlap_set)
 
             # 4. Substring matching: query terms in block type
             block_type_parts = re.split(r"[._-]+", block_name.lower())
             for query_term in query_terms:
+                if query_term in GENERIC_TOKENS:
+                    continue
                 for part in block_type_parts:
                     if query_term in part and query_term != part:
                         score += 5.0

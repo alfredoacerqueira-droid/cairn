@@ -78,7 +78,9 @@ def run_sync(project_path: Path, vram: VRAMPriority) -> dict:
 
                 if modified or deleted:
                     repo = RepoManager(project_path)
-                    indexer = VectorIndexer(chroma_path=repo.get_chroma_path())
+                    indexer = VectorIndexer(
+                        chroma_path=repo.get_chroma_path(), project_root=project_path
+                    )
                     parser = ASTParser()
 
                     # Reindex modified/added files

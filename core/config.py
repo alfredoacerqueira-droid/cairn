@@ -4,7 +4,10 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+# Module-level cache for config: (str_path, mtime_ns) -> Config
+_config_cache: dict[tuple[str, int], "Config"] = {}
 
 
 class EnabledConfig(BaseModel):
@@ -91,6 +94,10 @@ class IndexingConfig(BaseModel):
     # Maximum time in seconds to spend parsing a single file. If exceeded, the file
     # is skipped with a warning log. Set to 0 to disable (no timeout).
     parse_timeout_s: float = 10.0
+    # Max chars of each block's code sent to the embedder (the reranker/storage
+    # still use the full code). 0 = no truncation. Lower = faster indexing,
+    # slightly coarser embeddings.
+    embed_truncate_chars: int = 1000
     # Embedding model for semantic code search via Ollama.
     # Default "nomic-embed-text" is a general-purpose embedder.
     # For better code retrieval discrimination, use a code-trained model
@@ -117,6 +124,13 @@ class MemoryConfig(BaseModel):
     max_entries: int = 50
     compaction_model: str = "qwen2.5-coder:1.5b"
     period_minutes: int = 5
+    scope: str = "auto"  # "auto" | "both" | "workspace" | "repo"
+    # Per-section caps for sectioned memory document
+    max_tasks: int = 20
+    max_decisions: int = 40
+    max_conventions: int = 40
+    max_changes: int = 40
+    max_prompts: int = 10
 
 
 class RoutingConfig(BaseModel):
@@ -149,6 +163,15 @@ class RetrievalConfig(BaseModel):
     # repos). "embeddings" / "bm25" / "ast" force a single leg (no rerank fusion).
     mode: str = "hybrid"  # hybrid | embeddings | bm25 | ast
     weights: list[float] = [0.4, 0.3, 0.3]  # bm25, ast, embeddings
+    # RRF k parameter: higher k pushes the rank-fusion curve flatter
+    # (more candidates stay relevant). Default 60 is appropriate for top-k queries.
+    rrf_k: int = 60
+    # Max number of merged results in multi-repo assembly (workspace router).
+    # Higher = more diverse context from multiple repos; lower = faster.
+    max_merged: int = 24
+    # Minimum results per repo when merging multi-repo results.
+    # Ensures each repo contributes even if it has lower scores.
+    per_repo_min: int = 3
     rerank_enabled: bool = True
     # Which reranker to use when rerank_enabled:
     #   "cross_encoder" (default) — FlashRank, CPU, ~milliseconds. Recommended.
@@ -194,10 +217,28 @@ class RetrievalConfig(BaseModel):
     # Offline mode: disable reranker entirely (skip FlashRank load).
     # Useful behind corporate proxies where model download fails/hangs.
     offline: bool = False
+    # Lexical (ripgrep) bounding: cap the number of files parsed per query
+    # and the number of matches per file to bound latency on large repos.
+    lexical_max_files: int = 25
+    lexical_max_count_per_file: int = 50
     # Custom CA bundle path for HTTPS certificate validation (e.g., corporate proxies).
     # If set, overrides CAIRN_CA_BUNDLE / REQUESTS_CA_BUNDLE / SSL_CERT_FILE.
     # Passed to flashrank via os.environ before model load.
     ca_bundle: str | None = None
+
+    # --- Reranker tunables ---
+    # Which FlashRank cross-encoder model to use. Default L-12-v2 (~2.8s/query
+    # for ~26 candidates on CPU). Swap to "ms-marco-MiniLM-L-6-v2" for ~1.5-2×
+    # speedup at a small quality cost. Other FlashRank-compatible models also
+    # work (e.g. "ms-marco-MiniLM-L-4-v2", "ce-msmarco-MiniLM-L6-v2").
+    reranker_model: str = "ms-marco-MiniLM-L-12-v2"
+    # How many fusion candidates to feed the reranker: max(top_k * multiplier, min).
+    # Raising these increases recall but costs more cross-encoder latency.
+    rerank_candidate_multiplier: int = 4
+    rerank_min_candidates: int = 40
+    # Maximum characters per candidate snippet sent to the cross-encoder.
+    # Lower = faster reranking; higher = more context for the model to score.
+    rerank_truncate_chars: int = 2000
 
 
 class CompressionConfig(BaseModel):
@@ -224,6 +265,8 @@ class LocalLLMConfig(BaseModel):
     # Model name for embeddings (semantic search).
     # For Ollama: nomic-embed-text (default). For OpenAI-compatible: model ID.
     embed_model: str | None = None
+    # HTTP timeout for local LLM generation; generous for slow CPU/GPU boxes.
+    request_timeout_s: float = 300.0
     # The local model's true context window (tokens).
     context_window: int = 8192
     # Usable input budget per local call (context minus output reserve).
@@ -236,10 +279,21 @@ class LocalLLMConfig(BaseModel):
     one_shot_threshold: float = 0.75
     # Embedder type: "ollama" | "fastembed" | "none"
     embedder: str = "ollama"
+    # auto|cpu|cuda — fastembed execution device; auto uses GPU if an onnxruntime
+    # GPU provider is installed, else CPU.
+    embed_device: str = "auto"
+    # CPU-only embedding parallelism: ONNX intra-op threads for fastembed.
+    # 0 = use all cores; N pins to N.
+    embed_threads: int = 0
     # In-process ONNX embedder for the no-LLM mode.
     fastembed_model: str = "BAAI/bge-small-en-v1.5"
     # Parallel local-LLM map calls (1-2 on 6GB VRAM).
     map_concurrency: int = 1
+    # llama.cpp/Ollama per-request options forwarded to /api/generate and
+    # /api/embeddings (e.g. num_gpu, num_ctx, low_vram, num_thread, num_batch).
+    # Lower num_gpu offloads more layers to system RAM so a bigger model fits.
+    # Ollama backend only.
+    ollama_options: dict = Field(default_factory=dict)
 
 
 class Config(BaseModel):
@@ -261,8 +315,25 @@ class Config(BaseModel):
     local_llm: LocalLLMConfig = LocalLLMConfig()
 
 
+def embeddings_available(cfg: Config) -> tuple[bool, str | None]:
+    """True + embedder name when a REAL embedder is available (no Ollama required for fastembed)."""
+    if not getattr(cfg, "embeddings_enabled", False):
+        return (False, None)
+    embedder = getattr(cfg.local_llm, "embedder", "ollama")
+    if embedder == "none":
+        return (False, None)
+    if embedder == "fastembed":
+        return (True, "fastembed")
+    if getattr(cfg.local_llm, "enabled", False):
+        return (True, "ollama")
+    return (False, None)
+
+
 def load_config(project_path: Optional[Path] = None) -> Config:
-    """Load configuration from .cairn/config.yaml in the project.
+    """Load configuration from .cairn/config.yaml in the project (memoized by mtime).
+
+    Cache key is (resolved path string, file mtime_ns). If the file hasn't changed
+    (same mtime), returns the cached Config. If mtime changes, reloads from disk.
 
     If a stale config is loaded (old exclude_patterns without new excludes),
     merges in the new standard excludes to prevent index pollution.
@@ -274,6 +345,20 @@ def load_config(project_path: Optional[Path] = None) -> Config:
 
     if not config_file.exists():
         return Config()
+
+    # Get file mtime for cache key
+    try:
+        mtime_ns = config_file.stat().st_mtime_ns
+    except OSError:
+        # File disappeared or permission error; reload without caching
+        mtime_ns = 0
+
+    path_key = str(config_file.resolve())
+    cache_key = (path_key, mtime_ns)
+
+    # Return cached config if still fresh
+    if cache_key in _config_cache:
+        return _config_cache[cache_key]
 
     with open(config_file) as f:
         data = yaml.safe_load(f) or {}
@@ -296,11 +381,32 @@ def load_config(project_path: Optional[Path] = None) -> Config:
     if not config.indexing.source_roots:
         config.indexing.source_roots = ["."]
 
+    # Cache the config before returning
+    _config_cache[cache_key] = config
     return config
 
 
+def clear_config_cache(path: Optional[Path] = None) -> None:
+    """Invalidate config cache for a given path.
+
+    If path is None, clears all cached configs (useful for testing).
+    Otherwise, clears only the cache entry for the specified path's config.yaml.
+    """
+    global _config_cache
+    if path is None:
+        _config_cache.clear()
+    else:
+        config_file = path / ".cairn" / "config.yaml"
+        path_key = str(config_file.resolve())
+        # Remove all cache entries for this path (they may have different mtimes)
+        _config_cache = {k: v for k, v in _config_cache.items() if k[0] != path_key}
+
+
 def save_config(config: Config, project_path: Optional[Path] = None):
-    """Save configuration to .cairn/config.yaml in the project."""
+    """Save configuration to .cairn/config.yaml in the project.
+
+    Invalidates the config cache for this path after writing.
+    """
     if project_path is None:
         project_path = Path.cwd()
 
@@ -310,3 +416,6 @@ def save_config(config: Config, project_path: Optional[Path] = None):
 
     with open(config_file, "w") as f:
         yaml.safe_dump(config.model_dump(), f, default_flow_style=False)
+
+    # Invalidate cache for this path so next load_config reads fresh
+    clear_config_cache(project_path)

@@ -57,6 +57,7 @@ def logout(user):
             c = Config()
             c.retrieval.min_confidence = 0.0
             c.retrieval.rerank_enabled = False  # no reranker in this mock pipeline
+            c.local_llm.enabled = True  # embeddings must be on for semantic_search to find results
             return c
 
         monkeypatch.setattr(
@@ -84,13 +85,22 @@ def logout(user):
         repo = RepoManager(repo_path)
         repo.save_repo_map({"src/auth.py": ast.to_dict()})
 
-        # Assemble context
-        prompt = assembler.assemble("How does authentication work?")
+        # Assemble context with a query that matches the indexed fixture
+        prompt = assembler.assemble("login")
 
         assert "Codebase Context" in prompt
         assert "Relevant Functions" in prompt
         assert "Repository Structure" in prompt
-        assert "How does authentication work?" in prompt
+        assert "login" in prompt
+
+        # A clearly-absent query must fail-closed (real guard must be active)
+        monkeypatch.undo()
+        assembler2 = ContextAssembler(
+            project_path=repo_path,
+            ollama_client=MockOllamaClient(),
+        )
+        absent = assembler2.assemble("zznotpresentzz")
+        assert "No confident matches" in absent
 
     def test_memory_summarizer_no_git(self, tmp_path):
         """Test memory summarizer with no git repo."""

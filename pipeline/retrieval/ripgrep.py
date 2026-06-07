@@ -97,20 +97,26 @@ def _map_hit_to_function(
     hit_line: int,
     ast_cache: dict[str, Any],
     parser: ASTParser,
+    id_path: str | None = None,
 ) -> Optional[tuple[str, str]]:
     """Map a hit line to the enclosing function.
 
     Args:
-        filepath: Path to the file
+        filepath: Path to the file (used for parsing; may be absolute)
         hit_line: Line number of the hit (1-indexed)
         ast_cache: Dict mapping filepath -> FileAST
         parser: ASTParser instance
+        id_path: Optional path to use in the returned func_id. Defaults to
+            filepath if not provided. Use this when the id should use a
+            relative path while filepath is absolute.
 
     Returns:
         Tuple of (function_id, function_code) if found, else None.
-        ID format: "filepath:function_name:line_start" or
-        "filepath:ClassName.method_name:line_start" for methods.
+        ID format: "id_path:function_name:line_start" or
+        "id_path:ClassName.method_name:line_start" for methods.
     """
+    id_path = id_path if id_path is not None else filepath
+
     # Parse file if not in cache
     if filepath not in ast_cache:
         try:
@@ -125,14 +131,14 @@ def _map_hit_to_function(
     # Check top-level functions first
     for func in ast.functions:
         if func.line_start <= hit_line <= func.line_end:
-            func_id = f"{filepath}:{func.name}:{func.line_start}"
+            func_id = f"{id_path}:{func.name}:{func.line_start}"
             return (func_id, func.code)
 
     # Check methods in classes
     for cls in ast.classes:
         for method in cls.methods:
             if method.line_start <= hit_line <= method.line_end:
-                func_id = f"{filepath}:{cls.name}.{method.name}:{method.line_start}"
+                func_id = f"{id_path}:{cls.name}.{method.name}:{method.line_start}"
                 return (func_id, method.code)
 
     return None
@@ -148,6 +154,8 @@ class RipgrepRetriever:
         exclude_patterns: list[str] | None = None,
         source_roots: list[str] | None = None,
         fallback_items: list[dict[str, Any]] | None = None,
+        max_files: int = 25,
+        max_count_per_file: int = 50,
     ):
         """Initialize ripgrep retriever.
 
@@ -157,12 +165,16 @@ class RipgrepRetriever:
             exclude_patterns: Patterns to exclude
             source_roots: Subdirs within project to search (e.g., ["src"])
             fallback_items: List of dicts with 'id' and 'text' for BM25 fallback
+            max_files: Max number of files to parse per query (caps latency)
+            max_count_per_file: Max rg matches per file (--max-count)
         """
         self.project_path = Path(project_path)
         self.file_patterns = file_patterns or ["*.py"]
         self.exclude_patterns = exclude_patterns or []
         self.source_roots = source_roots or ["."]
         self.fallback_items = fallback_items or []
+        self.max_files = max_files
+        self.max_count_per_file = max_count_per_file
 
         # Lazy-initialized BM25 fallback
         self._bm25: Optional[BM25Retriever] = None
@@ -227,6 +239,8 @@ class RipgrepRetriever:
             cmd = ["rg", "--json", "-i"]  # -i for case-insensitive
             for term in terms:
                 cmd.extend(["-e", term])
+            if self.max_count_per_file > 0:
+                cmd.extend(["--max-count", str(self.max_count_per_file)])
             cmd.extend(search_paths)
 
             # Run ripgrep with timeout
@@ -255,13 +269,7 @@ class RipgrepRetriever:
                     line_number = data.get("line_number", 0)
 
                     if filepath and line_number:
-                        # Normalize filepath to relative
-                        try:
-                            rel_path = str(Path(filepath).relative_to(self.project_path))
-                        except ValueError:
-                            rel_path = filepath
-
-                        hit_map[(rel_path, line_number)] += 1
+                        hit_map[(filepath, line_number)] += 1
                 except json.JSONDecodeError:
                     continue
 
@@ -272,8 +280,26 @@ class RipgrepRetriever:
             function_scores: dict[str, tuple[str, int]] = {}
             # Map: function_id -> (code, score)
 
-            for (filepath, line_number), count in hit_map.items():
-                result_tuple = _map_hit_to_function(filepath, line_number, ast_cache, parser)
+            # Bound the number of files parsed: aggregate hits per file, keep
+            # only the top max_files by total hit count. This caps parse_file
+            # calls and is the primary latency fix for common-term queries on
+            # large repos (hundreds of files -> max_files).
+            if self.max_files > 0 and len(hit_map) > 0:
+                file_hits: dict[str, int] = defaultdict(int)
+                for (abs_path, _line_number), count in hit_map.items():
+                    file_hits[abs_path] += count
+                top_files = sorted(file_hits, key=file_hits.get, reverse=True)[: self.max_files]
+                top_files_set = set(top_files)
+                hit_map = {k: v for k, v in hit_map.items() if k[0] in top_files_set}
+
+            for (abs_path, line_number), count in hit_map.items():
+                try:
+                    rel_path = str(Path(abs_path).relative_to(self.project_path))
+                except ValueError:
+                    rel_path = abs_path
+                result_tuple = _map_hit_to_function(
+                    abs_path, line_number, ast_cache, parser, id_path=rel_path
+                )
                 if result_tuple:
                     func_id, func_code = result_tuple
                     if func_id in function_scores:

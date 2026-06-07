@@ -41,10 +41,14 @@ _semantic_caches: dict[Path, SemanticCache] = {}
 def _classify_binding() -> tuple[str, Path | None, str | None]:
     """Classify CAIRN_PROJECT/GATEWAY_PROJECT as SINGLE, WORKSPACE, or UNBOUND.
 
+    Robustly handles the case where a path has both .cairn/ (could be SINGLE)
+    AND indexed child repos (WORKSPACE). Prefers WORKSPACE when >=2 child repos
+    are discovered, to better support multi-repo workspaces.
+
     Returns:
         (mode, path, error) where:
-          - SINGLE: path has .cairn/, error is None
-          - WORKSPACE: path has no .cairn/ but children do, error is None
+          - SINGLE: path has .cairn/ and no indexed children, error is None
+          - WORKSPACE: path has >=2 indexed child repos (even if root has .cairn/), error is None
           - UNBOUND: path is None, error is an explanatory message
     """
     env_path = os.getenv("CAIRN_PROJECT") or os.getenv("GATEWAY_PROJECT")
@@ -62,13 +66,17 @@ def _classify_binding() -> tuple[str, Path | None, str | None]:
     if not path.exists():
         return "UNBOUND", None, f"CAIRN_PROJECT path does not exist: {env_path}"
 
+    # Check for WORKSPACE mode first: this path has >=2 indexed children
+    discovered = WorkspaceRouter.discover_repos(path)
+    if len(discovered) >= 2:
+        return "WORKSPACE", path, None
+
     # Check for SINGLE mode: this path itself has .cairn/
     cairn_dir = path / ".cairn"
     if cairn_dir.exists():
         return "SINGLE", path, None
 
-    # Check for WORKSPACE mode: this path has children with .cairn/
-    discovered = WorkspaceRouter.discover_repos(path)
+    # Check for WORKSPACE mode with 1 child (edge case: single repo in a folder)
     if discovered:
         return "WORKSPACE", path, None
 
@@ -194,19 +202,17 @@ def search_code(query: str, top_k: int = 5) -> str:
     try:
         if _BIND_ERROR is not None:
             return _BIND_ERROR
-        # If workspace router is bound, delegate to it
+        # If workspace router is bound, use multi-repo search
         if _router is not None:
             from core.config import load_config
 
-            # Resolve the best repo's config for budget wrapping
-            best_repo, _ = _router.route(query, top_k=top_k)
-            if best_repo is None:
-                return (
-                    "Could not confidently determine which repo answers this query "
-                    "(no confident match in any workspace repo)."
-                )
-            cfg = load_config(best_repo)
-            result = _router.search(query, top_k=top_k)
+            result = _router.search_all(query, top_k=top_k)
+            # For budget wrapping, use the first repo's config (or workspace root)
+            # They share the same budget config in practice
+            if _router.repo_paths:
+                cfg = load_config(_router.repo_paths[0])
+            else:
+                cfg = load_config(_router.workspace_root)
             return _emit(result, cfg)
         # Otherwise single-repo mode
         assembler = _get_assembler()
@@ -271,19 +277,16 @@ def assemble_context(query: str) -> str:
     try:
         if _BIND_ERROR is not None:
             return _BIND_ERROR
-        # If workspace router is bound, delegate to it
+        # If workspace router is bound, use multi-repo assembly
         if _router is not None:
             from core.config import load_config
 
-            # Resolve the best repo's config for budget wrapping
-            best_repo, _ = _router.route(query, top_k=5)
-            if best_repo is None:
-                return (
-                    "Could not confidently determine which repo answers this query "
-                    "(no confident match in any workspace repo)."
-                )
-            cfg = load_config(best_repo)
-            result = _router.assemble(query)
+            result = _router.assemble_all(query)
+            # For budget wrapping, use the first repo's config
+            if _router.repo_paths:
+                cfg = load_config(_router.repo_paths[0])
+            else:
+                cfg = load_config(_router.workspace_root)
             return _emit(result, cfg)
         # Otherwise single-repo mode
         assembler = _get_assembler()
@@ -405,14 +408,30 @@ def orchestrate(query: str, instruction: str = "", payload: str = "") -> str:
         if _BIND_ERROR is not None:
             return _BIND_ERROR
 
+        from core.config import load_config
+
         # Resolve project path and assembler (workspace or single)
         if _router is not None:
+            # Workspace mode: context-only queries fan out to all repos;
+            # instruction queries route to best repo for LLM execution.
+            if not instruction:
+                # Context-only: return multi-repo context (no single repo routing)
+                result = _router.assemble_all(query)
+                # Use workspace root config for budget wrapping
+                if _router.repo_paths:
+                    cfg = load_config(_router.repo_paths[0])
+                else:
+                    cfg = load_config(_router.workspace_root)
+                return _emit(result, cfg)
+
+            # Instruction provided: route to best repo for LLM execution
             best_repo, _ = _router.route(query, top_k=5)
             if best_repo is None:
                 return (
                     "Could not confidently determine which repo answers this query "
                     "(no confident match in any workspace repo)."
                 )
+            # Use best repo's assembler (for consistent execution)
             assembler = _router.assembler_for(best_repo)
             cfg_path = best_repo
         else:
@@ -423,8 +442,6 @@ def orchestrate(query: str, instruction: str = "", payload: str = "") -> str:
                     "indexed repo (a dir containing .cairn/)."
                 )
             cfg_path = _PROJECT_PATH
-
-        from core.config import load_config
 
         cfg = load_config(cfg_path)
 
@@ -526,13 +543,203 @@ def cache_set(query: str, value: str, ttl_seconds: int = 0) -> str:
         return f"Cache write error: {str(e)}"
 
 
+@mcp.tool(
+    description="List repos in the workspace with profiles and indexed block counts"
+)
+def list_repos() -> str:
+    """List the repos in the current workspace with their profile and indexed block count.
+
+    In WORKSPACE mode, shows all discovered indexed repos with their profile
+    and block count. In SINGLE mode, shows just the bound repo. The agent can
+    use this to understand the workspace scope and target searches appropriately.
+
+    Returns:
+        Formatted text listing repos: one line per repo with name, profile,
+        block count, and path. Prefixed with workspace info if in WORKSPACE mode.
+    """
+    try:
+        if _BIND_ERROR is not None:
+            return _BIND_ERROR
+
+        if _router is not None:
+            # WORKSPACE mode: list all discovered repos
+            overview = _router.overview()
+
+            if not overview:
+                return (
+                    f"Workspace at {_router.workspace_root} has no indexed repos "
+                    "(no .cairn/ directories found in children)."
+                )
+
+            lines = [f"Workspace: {_router.workspace_root} ({len(overview)} repos)"]
+            lines.append("")
+
+            for item in overview:
+                name = item.get("name", "unknown")
+                profile = item.get("profile", "unknown")
+                blocks = item.get("blocks", 0)
+                path = item.get("path", "")
+                lines.append(f"{name}  profile={profile}  blocks={blocks}  ({path})")
+
+            result = "\n".join(lines)
+            from core.config import load_config
+
+            # Use first repo's config for budget wrapping (or workspace root)
+            if _router.repo_paths:
+                cfg = load_config(_router.repo_paths[0])
+            else:
+                cfg = load_config(_router.workspace_root)
+            return _emit(result, cfg)
+
+        else:
+            # SINGLE mode: list the bound repo
+            if _PROJECT_PATH is None:
+                return (
+                    "Cairn MCP server has no bound project. Set CAIRN_PROJECT to an "
+                    "indexed repo (a dir containing .cairn/)."
+                )
+
+            from core.config import load_config
+
+            cfg = load_config(_PROJECT_PATH)
+            assembler = _get_assembler()
+            if assembler is None:
+                return (
+                    "Cairn MCP server has no bound project. Set CAIRN_PROJECT to an "
+                    "indexed repo (a dir containing .cairn/)."
+                )
+
+            try:
+                blocks = assembler.store.count()
+            except Exception as e:
+                logger.warning("Error getting block count: %s", e)
+                blocks = 0
+
+            result = (
+                f"{_PROJECT_PATH.name}  profile={cfg.profile}  "
+                f"blocks={blocks}  (single-repo mode)"
+            )
+            return _emit(result, cfg)
+
+    except Exception as e:
+        return f"Error listing repos: {str(e)}"
+
+
+@mcp.tool(description="Record a durable note to Cairn memory for this session")
+def remember(note: str, kind: str = "change") -> str:
+    """Record a durable note to Cairn memory (continuous memory across the workspace/repo).
+
+    In WORKSPACE mode, writes to the workspace-level memory at <workspace>/.cairn/memory.md.
+    In SINGLE mode, writes to the repo-level memory at <repo>/.cairn/memory.md.
+    These notes persist across sessions and can be recalled with the recall() tool.
+
+    Args:
+        note: The memory note to record.
+        kind: Entry kind: 'task', 'decision', 'convention', 'change' (default), or 'prompt'.
+              Unknown kinds default to 'change'. Each kind is stored in its own section.
+
+    Returns:
+        Confirmation message indicating where the note was stored and which section.
+    """
+    try:
+        if _BIND_ERROR is not None:
+            return _BIND_ERROR
+
+        # Normalize kind: map 'note' to 'change' for backward compatibility
+        if kind == "note":
+            kind = "change"
+        # Validate kind and default unknown to 'change'
+        if kind not in ("task", "decision", "convention", "change", "prompt"):
+            kind = "change"
+
+        if _router is not None:
+            # WORKSPACE mode: write to workspace memory
+            _router.write_memory(note, kind=kind)
+            return f"remembered ({kind}, workspace)"
+        else:
+            # SINGLE mode: write to repo memory
+            if _PROJECT_PATH is None:
+                return (
+                    "Cairn MCP server has no bound project. Set CAIRN_PROJECT to an "
+                    "indexed repo (a dir containing .cairn/)."
+                )
+            from core.repo import RepoManager
+
+            repo = RepoManager(_PROJECT_PATH)
+            repo.append_memory(note, kind=kind)
+            return f"remembered ({kind}, repo: {_PROJECT_PATH.name})"
+    except Exception as e:
+        return f"Memory write error: {str(e)}"
+
+
+@mcp.tool(description="Recall recent Cairn memory (workspace + per-repo per memory.scope)")
+def recall(max_entries: int = 10) -> str:
+    """Recall recent Cairn memory entries.
+
+    In WORKSPACE mode, returns memory entries according to memory.scope config:
+      - 'workspace': workspace memory only
+      - 'repo': per-repo memories across all repos
+      - 'both' (default): workspace memory + per-repo memories
+    In SINGLE mode, returns the bound repo's memory.
+
+    Args:
+        max_entries: Maximum number of memory entries to recall (hint, not strict).
+
+    Returns:
+        Recent memory entries formatted with headers, or empty string if no memory.
+    """
+    try:
+        if _BIND_ERROR is not None:
+            return _BIND_ERROR
+
+        if _router is not None:
+            # WORKSPACE mode: read per scope, with token cap
+            from core.config import load_config
+
+            if _router.repo_paths:
+                cfg = load_config(_router.repo_paths[0])
+            else:
+                cfg = load_config(_router.workspace_root)
+            result = _router.read_memory(max_tokens=cfg.budget.tool_max_tokens)
+            return _emit(result, cfg) if result else ""
+        else:
+            # SINGLE mode: read repo memory
+            if _PROJECT_PATH is None:
+                return (
+                    "Cairn MCP server has no bound project. Set CAIRN_PROJECT to an "
+                    "indexed repo (a dir containing .cairn/)."
+                )
+            from core.config import load_config
+            from core.repo import RepoManager
+
+            cfg = load_config(_PROJECT_PATH)
+            repo = RepoManager(_PROJECT_PATH)
+            result = repo.load_memory(
+                last_n=max_entries, max_tokens=cfg.budget.tool_max_tokens
+            )
+            if result:
+                result = f"## Repo memory\n{result}"
+            return _emit(result, cfg) if result else ""
+    except Exception as e:
+        return f"Memory recall error: {str(e)}"
+
+
 def run_stdio() -> None:
     """Run the MCP server over stdio (for Claude Code / OpenCode).
 
     Resolves the binding mode (SINGLE, WORKSPACE, or UNBOUND) from
     CAIRN_PROJECT/GATEWAY_PROJECT and initializes accordingly.
+
+    Logging is configured to go to stderr or file (NEVER stdout) to preserve
+    the JSON-RPC protocol on stdout.
     """
+    from core.logging_setup import configure_logging
+
     global _PROJECT_PATH, _BIND_ERROR, _router
+
+    # Configure logging (respects CAIRN_DEBUG env var)
+    configure_logging()
+
     mode, path, error = _classify_binding()
 
     if mode == "SINGLE":

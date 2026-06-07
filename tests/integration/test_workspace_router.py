@@ -299,7 +299,7 @@ class TestMCPServerWorkspaceModeTools:
     """Test MCP tools when server is in WORKSPACE mode."""
 
     def test_search_code_workspace_mode(self, tmp_path):
-        """search_code tool delegates to router when in workspace mode."""
+        """search_code tool uses multi-repo search in workspace mode."""
         workspace = make_workspace(tmp_path)
         helm_repo = workspace / "helm-repo"
         tf_repo = workspace / "terraform-repo"
@@ -320,15 +320,17 @@ class TestMCPServerWorkspaceModeTools:
 
             result = search_code("helm chart deployment")
 
-            # Should include repo header
-            assert "Repo:" in result
+            # Should include "Searched N repos" header (multi-repo mode)
+            assert "Searched" in result or "[" in result
+            # Should include repo tags (e.g., [helm-repo])
+            assert "[helm-repo]" in result or "[terraform-repo]" in result
             # Should not be fail-closed
             assert "Could not confidently determine" not in result
         finally:
             mcp_module._router = None
 
     def test_assemble_context_workspace_mode(self, tmp_path):
-        """assemble_context tool delegates to router in workspace mode."""
+        """assemble_context uses multi-repo assembly in workspace mode."""
         workspace = make_workspace(tmp_path)
         helm_repo = workspace / "helm-repo"
 
@@ -349,10 +351,10 @@ class TestMCPServerWorkspaceModeTools:
             result = assemble_context("helm deployment")
 
             # Result is either:
-            # (1) Assembled context with "# Repo:" header (if match found), or
+            # (1) Multi-repo assembled context with "## Repo:" headers (if match found), or
             # (2) Fail-closed message (if no confident match)
-            if "# Repo:" in result:
-                # Success: has repo header
+            if "## Repo:" in result:
+                # Success: has repo headers
                 assert "helm" in result.lower() or "terraform" in result.lower()
             else:
                 # Fail-closed: clear message

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from core.cache import SessionCache
-from core.config import load_config
+from core.config import embeddings_available, load_config
 from core.persistent_cache import PersistentCache
 from core.profiles import get_profile
 from core.repo import RepoManager, project_id
@@ -82,14 +82,16 @@ class ContextAssembler:
         # Use factory to build client based on local_llm config
         self.ollama = ollama_client or make_llm_client(cfg.local_llm)
 
-        # Effective embeddings flag: only enable if both config and local LLM are enabled
-        emb_enabled = cfg.embeddings_enabled and cfg.local_llm.enabled
+        # Effective embeddings flag: use the helper so fastembed works without Ollama
+        emb_available, _ = embeddings_available(cfg)
+        emb_enabled = emb_available
         self.vector_indexer = VectorIndexer(
             chroma_path=self.repo.get_chroma_path(),
             ollama_client=self.ollama,
             cache=self.cache,
             embeddings_enabled=emb_enabled,
             project_root=self.project_path,
+            cfg=cfg,
         )
         # Wrap the indexer in ChromaStore for the read path
         self.store = ChromaStore(self.vector_indexer)
@@ -112,29 +114,51 @@ class ContextAssembler:
                 timeout=5,
             )
             return result.stdout.strip() if result.returncode == 0 else "unknown"
-        except Exception:
+        except Exception as e:
+            logger.debug("git commit lookup failed: %s", e)
             return "unknown"
 
     def _get_retriever(self) -> HybridRetriever:
+        import time
+
         commit = self._git_commit()
         if self._retriever is not None and self._retriever_commit == commit:
             return self._retriever
 
+        total_start = time.perf_counter()
+
         cfg = load_config(self.project_path)
         profile = get_profile(cfg.profile)
 
-        # Only build embeddings retriever if config, profile, AND local LLM all enable embeddings
+        # Log profile and indexing config once at init
+        emb_available, _ = embeddings_available(cfg)
+        logger.debug(
+            "Retriever init: profile=%s, embeddings=%s, backend=%s",
+            cfg.profile,
+            emb_available,
+            "chroma",  # Backend is currently hardcoded to chroma
+        )
+
+        # Only build embeddings retriever if config, profile, AND a real embedder are available
         emb = None
-        emb_enabled = cfg.embeddings_enabled and cfg.local_llm.enabled and profile.embedding_enabled
+        emb_available, _ = embeddings_available(cfg)
+        emb_enabled = emb_available and profile.embedding_enabled
         if emb_enabled:
             emb = EmbeddingRetriever(self.store, cache=self.cache)
 
         bm25 = BM25Retriever()
-        ast_rank = ASTRankRetriever()
 
+        load_start = time.perf_counter()
         bm25_items, ast_items = self._load_function_texts()
+        load_elapsed = (time.perf_counter() - load_start) * 1000
+
         bm25.index(bm25_items)
-        ast_rank.index(ast_items, repo_map=self.repo.load_repo_map())
+
+        if self._retrieval_mode == "ast":
+            ast_rank = ASTRankRetriever()
+            ast_rank.index(ast_items, repo_map=self.repo.load_repo_map())
+        else:
+            ast_rank = None
 
         # Choose reranker by config. cross_encoder=FlashRank (CPU, ms, default);
         # llm=local-model scoring (opt-in, slow); none=disabled.
@@ -149,7 +173,10 @@ class ContextAssembler:
                 reranker = LLMReranker(ollama_client=self.ollama)
             elif rtype != "none":
                 reranker = Reranker(
-                    ca_bundle=cfg.retrieval.ca_bundle, offline=cfg.retrieval.offline
+                    model_name=cfg.retrieval.reranker_model,
+                    truncate_chars=cfg.retrieval.rerank_truncate_chars,
+                    ca_bundle=cfg.retrieval.ca_bundle,
+                    offline=cfg.retrieval.offline,
                 )
 
         # Lexical leg: ripgrep over the live working tree (fresh, exact-match),
@@ -163,6 +190,8 @@ class ContextAssembler:
             exclude_patterns=cfg.indexing.exclude_patterns,
             source_roots=cfg.indexing.source_roots,
             fallback_items=bm25_items,
+            max_files=cfg.retrieval.lexical_max_files,
+            max_count_per_file=cfg.retrieval.lexical_max_count_per_file,
         )
 
         # Structural leg: exact block-identity + reference matching.
@@ -171,7 +200,18 @@ class ContextAssembler:
         from pipeline.retrieval.structural import StructuralRetriever
 
         structural = StructuralRetriever()
+        struct_start = time.perf_counter()
         structural.index(bm25_items)
+        struct_elapsed = (time.perf_counter() - struct_start) * 1000
+
+        total_elapsed = (time.perf_counter() - total_start) * 1000
+        logger.debug(
+            "retriever build: load_texts=%.0fms structural_index=%.0fms total=%.0fms (blocks=%d)",
+            load_elapsed,
+            struct_elapsed,
+            total_elapsed,
+            len(bm25_items),
+        )
 
         self._retriever = HybridRetriever(
             bm25=bm25,
@@ -184,6 +224,9 @@ class ContextAssembler:
             lexical=lexical,
             structural=structural,
             profile_legs=profile.legs,
+            rrf_k=cfg.retrieval.rrf_k,
+            rerank_candidate_multiplier=cfg.retrieval.rerank_candidate_multiplier,
+            rerank_min_candidates=cfg.retrieval.rerank_min_candidates,
         )
         self._retriever_commit = commit
         return self._retriever
@@ -217,31 +260,149 @@ class ContextAssembler:
 
         return bm25_items, ast_items
 
-    def _passes_confidence_guard(self, functions: list[dict]) -> bool:
-        """True if the top result is confident enough to inject/return.
+    def _passes_confidence_guard(self, functions: list[dict], query: str = "") -> bool:
+        """True if the result set is confident enough to inject/return.
 
         Shared by assemble_context AND semantic_search so EVERY path (CLI search,
-        MCP search_code, proxy) honors the same relevance gate — not just the
-        assemble path. When rerank is active, gates on the cross-encoder absolute
-        score; otherwise on raw embedding cosine. (The normalized 'similarity' is
-        min-max scaled so the top result is always ~1.0 — useless as a gate.)
-        Threshold 0 disables the guard.
-        """
-        cfg = load_config(self.project_path)
-        if cfg.retrieval.rerank_enabled:
-            # Prefer the PROFILE's rerank threshold (iac=0.15 for terse HCL,
-            # code=0.47 for prose-y code) over the global config value, so the
-            # gate matches the cross-encoder score distribution of the repo type.
-            profile = get_profile(cfg.profile)
-            threshold = getattr(profile, "rerank_min_score", cfg.retrieval.rerank_min_score)
-            top_score = functions[0].get("rerank_score", 0.0) if functions else 0.0
-        else:
-            threshold = cfg.retrieval.min_confidence
-            top_score = functions[0].get("raw_cosine", 0.0) if functions else 0.0
+        MCP search_code, proxy) honors the same relevance gate.
 
+        The guard distinguishes two cases:
+
+        1. Lexical/structural-only retrieval (the embeddings/vector leg did NOT
+           contribute): these legs are SELECTIVE — they only return functions
+           whose query terms or structure actually match. A non-empty result set
+           is itself the confidence signal → PASS. Off-topic queries naturally
+           fail-close because the selective legs return empty.
+
+           However, the structural leg can produce token-level false positives
+           (e.g. \"function\" in \"unindexed_function\" matching a terraform
+           ``aws_lambda_function`` block).  When *query* is provided we require
+           that at least one query term (3+ chars) appears in the top result's
+           code text — this is a cheap, leg-consistent gate that lets conceptual
+           queries through while blocking single-token false matches.
+
+        2. Embeddings/vector retrieval (the vector leg contributed): vector
+           search always returns top-k even for off-topic queries, so we require
+           a minimum raw embedding cosine (cfg.retrieval.min_confidence).
+
+        The FlashRank cross-encoder is a prose-relevance model and produces
+        near-zero absolute scores for CODE + CONCEPTUAL queries even when the
+        retrieval is correct. It is used to REORDER candidates (upstream) but
+        MUST NOT GATE — its absolute score provides ~no off-topic protection
+        while causing large recall loss on an agent's normal conceptual queries.
+        """
+        if not functions:
+            return False
+
+        cfg = load_config(self.project_path)
+
+        # raw_cosine > 0.0 signals that the embeddings/vector leg produced at
+        # least one result (even if RRF-fused lower).  Zero means the result
+        # set came from the selective lexical / structural legs alone.
+        embeddings_contributed = any(r.get("raw_cosine", 0.0) > 0.0 for r in functions)
+
+        if not embeddings_contributed:
+            # Selective legs already filtered to real matches, but the
+            # structural leg can false-match on a single generic token
+            # (e.g. "function" in "unindexed_function" matching an
+            # aws_lambda_function block).  Require that at least one
+            # *meaningful* query term (3+ chars, not a common code
+            # stop-token) appears in the top result's code text.
+            if query:
+                code = (functions[0].get("code") or "").lower()
+                query_terms = set(re.findall(r"[a-z0-9]{3,}", query.lower()))
+                # Tokens that are so common in code that the structural
+                # leg matching on them alone is not a confidence signal.
+                _stop_tokens = {
+                    "function",
+                    "resource",
+                    "service",
+                    "handler",
+                    "class",
+                    "method",
+                    "object",
+                    "module",
+                    "type",
+                    "data",
+                    "name",
+                    "value",
+                    "file",
+                    "return",
+                    "import",
+                    "config",
+                    "error",
+                    "result",
+                }
+                meaningful = query_terms - _stop_tokens
+                if meaningful and not any(t in code for t in meaningful):
+                    return False
+            return True
+
+        # Embeddings contributed: require a minimum raw embedding cosine.
+        threshold = cfg.retrieval.min_confidence
         if threshold <= 0:
             return True
-        return bool(functions) and top_score >= threshold
+        top_raw_cosine = max(r.get("raw_cosine", 0.0) for r in functions)
+        return top_raw_cosine >= threshold
+
+    def _name_matches_query(self, query: str, func_name: str) -> bool:
+        """True if the query matches a function/class name via token identity.
+
+        Normalizes both (lowercase, split camelCase / snake_case / dots into
+        tokens) and returns True if the query is a strong symbol-name match:
+        the joined normalized form is a substring of the target, all query tokens
+        are present, or the query equals a token.  Requires the query's alnum-
+        normalized form to be non-trivial (prevents noise-word matches).
+        """
+        if not query or not func_name:
+            return False
+
+        def tokenize(s: str) -> set[str]:
+            parts = re.split(r"[^a-zA-Z0-9]+", s.lower())
+            tokens: set[str] = set()
+            for part in parts:
+                if not part:
+                    continue
+                camel = re.split(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", part)
+                tokens.update(t.lower() for t in camel if t)
+            return tokens
+
+        q_tokens = tokenize(query)
+        fn_tokens = tokenize(func_name)
+
+        if not q_tokens:
+            return False  # non-trivial alnum required
+
+        q_joined = "".join(sorted(q_tokens))
+        fn_joined = "".join(sorted(fn_tokens))
+        if q_joined and q_joined in fn_joined:
+            return True
+
+        if q_tokens and q_tokens.issubset(fn_tokens):
+            return True
+
+        q_norm = query.lower().strip()
+        if q_norm in fn_tokens:
+            return True
+
+        return False
+
+    def _rescue_name_matches(self, query: str, results: list[dict]) -> list[dict]:
+        """Promote results whose symbol name matches the query to the front.
+
+        When the confidence guard rejects all results but one or more carry
+        a symbol name that *identically* matches the search query, return
+        those matches (promoted) instead of dropping everything.  Lexical /
+        structural legs correctly retrieve symbol-name candidates; the
+        cross-encoder rates them low because it evaluates prose relevance.
+        """
+        name_matches = [
+            r for r in results if self._name_matches_query(query, r.get("function", ""))
+        ]
+        if not name_matches:
+            return []
+        others = [r for r in results if r not in name_matches]
+        return name_matches + others
 
     def semantic_search(
         self, query: str, top_k: Optional[int] = None, apply_guard: bool = False
@@ -252,6 +413,8 @@ class ContextAssembler:
         guard (returns []), so CLI `search` and the MCP `search_code` tool reject
         off-topic queries instead of returning low-confidence noise.
         """
+        import time
+
         if top_k is None:
             top_k = self.top_k
 
@@ -260,8 +423,16 @@ class ContextAssembler:
 
         cached = self.cache.get(*cache_key) if self.cache else None
         if cached is not None:
+            logger.debug("Semantic search cache HIT for query (mode=%s)", self._retrieval_mode)
             results = cached
         else:
+            logger.debug(
+                "Semantic search cache MISS: query='%s' mode=%s top_k=%d",
+                query[:50],
+                self._retrieval_mode,
+                top_k,
+            )
+            start = time.perf_counter()
             if self._retrieval_mode == "embeddings":
                 results = self.store.search(query, top_k=top_k)
                 # Store.search returns real cosine in 'similarity'; mirror
@@ -272,6 +443,8 @@ class ContextAssembler:
                 retriever = self._get_retriever()
                 hybrid_results = retriever.search(query, top_k=top_k, commit=commit)
                 results = self._hybrid_results_to_legacy(hybrid_results)
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            logger.debug("Retrieval completed: %d results in %.1fms", len(results), elapsed_ms)
 
             if self.cache:
                 self.cache.set(results, *cache_key)
@@ -305,8 +478,25 @@ class ContextAssembler:
         # Apply the confidence guard so CLI search + MCP search_code reject
         # off-topic queries (not just the assemble path). Cache stores the raw
         # results; the guard is applied on return.
-        if apply_guard and not self._passes_confidence_guard(results):
-            return []
+        if apply_guard:
+            if results and not self._passes_confidence_guard(results, query=query):
+                rescued = self._rescue_name_matches(query, results)
+                if rescued:
+                    logger.debug(
+                        "Confidence guard rescued %d name-matched results",
+                        len(rescued),
+                    )
+                    return rescued
+                top_score = (
+                    results[0].get("rerank_score", 0.0)
+                    if "rerank_score" in results[0]
+                    else results[0].get("raw_cosine", 0.0)
+                )
+                logger.debug(
+                    "Confidence guard rejected results: top_score=%.3f below threshold",
+                    top_score,
+                )
+                return []
 
         return results
 
@@ -437,7 +627,7 @@ class ContextAssembler:
                 stats["reduction_pct"],
             )
             # Mark as already-compressed so proxy doesn't re-compress
-            marker = "# [already-compressed-by-gateway]\n"
+            marker = "# [already-compressed]\n"
             return marker + result
         except Exception as e:
             logger.warning("Compression failed, returning unmodified: %s", e)
@@ -489,6 +679,10 @@ class ContextAssembler:
         return prompt
 
     def assemble_context(self, user_prompt: str) -> str:
+        import time
+
+        from core.tokens import count_tokens
+
         commit = self._git_commit()
         cache_key = ("context", user_prompt, commit)
 
@@ -496,22 +690,42 @@ class ContextAssembler:
         if self.persistent_cache:
             cached = self.persistent_cache.get(*cache_key)
             if cached is not None:
-                logger.debug("Persistent cache hit for context query")
+                logger.debug("Persistent cache HIT for context query")
                 return cached
 
         # Fallback to in-memory cache
         if self.cache:
             cached = self.cache.get(*cache_key)
             if cached is not None:
+                logger.debug("Session cache HIT for context query")
                 return cached
 
-        functions = self.semantic_search(user_prompt)
+        logger.debug("Assembling context for query (cache MISS)")
+        total_start = time.perf_counter()
 
-        if not self._passes_confidence_guard(functions):
-            # Confidence-guard rejection: do not compress
-            return "*No confident matches found for this query.*"
+        search_start = time.perf_counter()
+        functions = self.semantic_search(user_prompt)
+        search_ms = (time.perf_counter() - search_start) * 1000
+
+        if not self._passes_confidence_guard(functions, query=user_prompt):
+            rescued = self._rescue_name_matches(user_prompt, functions)
+            if rescued:
+                logger.debug(
+                    "Context assembly: guard rescued %d name-matched results",
+                    len(rescued),
+                )
+                functions = rescued
+            else:
+                logger.debug("Context assembly: confidence guard rejected results")
+                return "*No confident matches found for this query.*"
+
+        map_start = time.perf_counter()
         repo_map = self.get_repo_map()
+        map_ms = (time.perf_counter() - map_start) * 1000
+
+        mem_start = time.perf_counter()
         memory = self.get_memory()
+        mem_ms = (time.perf_counter() - mem_start) * 1000
 
         func_text = self._format_functions(functions)
         map_text = self._format_repo_map(repo_map)
@@ -524,12 +738,37 @@ class ContextAssembler:
 ## Repository Structure
 {map_text}
 
-## Recent Changes
-{memory if memory else '*No recent changes recorded.*'}"""
+## Memory
+{memory if memory else '*No memory recorded.*'}"""
+
+        raw_tokens = count_tokens(prompt)
+        logger.debug("Assembled context: %d functions, %d tokens (raw)", len(functions), raw_tokens)
 
         # Compress context before caching/returning so all consumers
         # (CLI, MCP, proxy) get the compressed form
+        compress_start = time.perf_counter()
         compressed = self._maybe_compress(prompt)
+        compress_ms = (time.perf_counter() - compress_start) * 1000
+
+        total_ms = (time.perf_counter() - total_start) * 1000
+        logger.debug(
+            "assemble: search=%.0fms repo_map=%.0fms memory=%.0fms compress=%.0fms total=%.0fms",
+            search_ms,
+            map_ms,
+            mem_ms,
+            compress_ms,
+            total_ms,
+        )
+
+        compressed_tokens = count_tokens(compressed)
+        if compressed != prompt:
+            reduction = 100 * (1.0 - compressed_tokens / raw_tokens) if raw_tokens > 0 else 0
+            logger.debug(
+                "Context compression: %d → %d tokens (%.1f%% reduction)",
+                raw_tokens,
+                compressed_tokens,
+                reduction,
+            )
 
         # Cache compressed result in both in-memory and persistent
         if self.cache:

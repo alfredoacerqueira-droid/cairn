@@ -223,3 +223,16 @@ class TestHybridRetriever:
         assert len(hybrid_results) > 0
         assert bm25_results[0]["source"] == "bm25"
         assert hybrid_results[0]["source"] == "hybrid"
+
+    def test_hybrid_mode_without_ast_rank(self):
+        """HybridRetriever should work in hybrid mode with ast_rank=None.
+
+        Verifies that the default hybrid path does not require an ASTRankRetriever.
+        """
+        bm25 = BM25Retriever()
+        bm25.index([{"id": f["id"], "text": f["text"]} for f in SAMPLE_FUNCTIONS])
+
+        hybrid = HybridRetriever(bm25=bm25, ast_rank=None, embeddings=None, mode="hybrid")
+        results = hybrid.search("create nail order", top_k=3)
+        assert len(results) > 0
+        assert all(r["source"] == "hybrid" for r in results)

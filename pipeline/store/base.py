@@ -186,7 +186,7 @@ class IndexStore(Protocol):
 
 
 def blocks_from_ast(ast_result) -> list[Block]:
-    """Flatten an ASTParser result (top-level functions + class methods) into Blocks.
+    """Flatten a FileAST (top-level functions, class definitions, class methods) into Blocks.
 
     Mirrors pipeline/indexer.py::index_ast iteration logic, producing
     id=f'{filepath}:{name}:{line_start}'. Methods are named 'ClassName.method_name'.
@@ -195,7 +195,7 @@ def blocks_from_ast(ast_result) -> list[Block]:
         ast_result: FileAST result from ASTParser.parse_file() or .parse_string().
                     Must have: .filepath, .functions[], .classes[].
                     Each function/method must have: .name, .code, .line_start, .line_end.
-                    Each class must have: .name, .methods[].
+                    Each class must have: .name, .code, .line_start, .line_end, .methods[].
 
     Returns:
         List of Block objects ready for upsert.
@@ -216,8 +216,18 @@ def blocks_from_ast(ast_result) -> list[Block]:
             )
         )
 
-    # Class methods
+    # Class definitions + their methods
     for cls in ast_result.classes:
+        blocks.append(
+            Block(
+                id=f"{ast_result.filepath}:{cls.name}:{cls.line_start}",
+                filepath=ast_result.filepath,
+                function=cls.name,
+                code=cls.code,
+                line_start=cls.line_start,
+                line_end=cls.line_end,
+            )
+        )
         for method in cls.methods:
             method_name = f"{cls.name}.{method.name}"
             block_id = f"{ast_result.filepath}:{method_name}:{method.line_start}"

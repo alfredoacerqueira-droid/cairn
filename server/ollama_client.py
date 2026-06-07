@@ -42,17 +42,33 @@ class OllamaClient:
         base_url: str | None = None,
         embed_model: str | None = None,
         generate_model: str | None = None,
+        options: dict | None = None,
+        gen_timeout: float = 300.0,
     ):
         self.base_url = (base_url or _default_base_url()).rstrip("/")
         self.embed_model = embed_model or _default_embed_model()
         self.generate_model = generate_model or _default_generate_model()
+        self._options = dict(options or {})
+        self.gen_timeout = gen_timeout
+
+    def _gen_options(self) -> dict:
+        merged = {"num_ctx": _worker_num_ctx()}
+        merged.update(self._options)
+        return merged
+
+    def _embed_options(self) -> dict | None:
+        return dict(self._options) if self._options else None
 
     def embed(self, text: str, model: str | None = None) -> list[float]:
         """Generate embedding vector for text."""
         m = model or self.embed_model
+        payload: dict = {"model": m, "prompt": text}
+        opts = self._embed_options()
+        if opts is not None:
+            payload["options"] = opts
         response = httpx.post(
             f"{self.base_url}/api/embeddings",
-            json={"model": m, "prompt": text},
+            json=payload,
             timeout=30.0,
         )
         response.raise_for_status()
@@ -76,9 +92,9 @@ class OllamaClient:
                 "model": m,
                 "prompt": prompt,
                 "stream": stream,
-                "options": {"num_ctx": _worker_num_ctx()},
+                "options": self._gen_options(),
             },
-            timeout=60.0,
+            timeout=self.gen_timeout,
         )
         response.raise_for_status()
         return response.json()["response"]
@@ -86,10 +102,14 @@ class OllamaClient:
     async def aembed(self, text: str, model: str | None = None) -> list[float]:
         """Async embedding generation."""
         m = model or self.embed_model
+        payload: dict = {"model": m, "prompt": text}
+        opts = self._embed_options()
+        if opts is not None:
+            payload["options"] = opts
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{self.base_url}/api/embeddings",
-                json={"model": m, "prompt": text},
+                json=payload,
                 timeout=30.0,
             )
             response.raise_for_status()
@@ -105,9 +125,9 @@ class OllamaClient:
                     "model": m,
                     "prompt": prompt,
                     "stream": False,
-                    "options": {"num_ctx": _worker_num_ctx()},
+                    "options": self._gen_options(),
                 },
-                timeout=60.0,
+                timeout=self.gen_timeout,
             )
             response.raise_for_status()
             return response.json()["response"]
@@ -157,12 +177,15 @@ class OpenAICompatibleClient:
         base_url: str,
         model: str | None = None,
         embed_model: str | None = None,
+        options: dict | None = None,
+        gen_timeout: float = 300.0,
     ):
         self.base_url = base_url.rstrip("/")
         # For OpenAI-compatible servers, we typically use the same model for both
         # embedding and generation, unless explicitly specified
         self.embed_model = embed_model or model or "model"
         self.generate_model = model or "model"
+        self.gen_timeout = gen_timeout
 
     def embed(self, text: str, model: str | None = None) -> list[float]:
         """Generate embedding vector for text."""
@@ -194,7 +217,7 @@ class OpenAICompatibleClient:
                 "messages": [{"role": "user", "content": prompt}],
                 "stream": stream,
             },
-            timeout=60.0,
+            timeout=self.gen_timeout,
         )
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
@@ -222,7 +245,7 @@ class OpenAICompatibleClient:
                     "messages": [{"role": "user", "content": prompt}],
                     "stream": False,
                 },
-                timeout=60.0,
+                timeout=self.gen_timeout,
             )
             response.raise_for_status()
             return response.json()["choices"][0]["message"]["content"]
@@ -286,13 +309,31 @@ def make_llm_client(
     embed_model = getattr(local_llm, "embed_model", None) or (
         local_llm.get("embed_model") if isinstance(local_llm, dict) else None
     )
+    opts = getattr(local_llm, "ollama_options", None) or {}
+    gen_timeout = getattr(local_llm, "request_timeout_s", None)
+    if gen_timeout is None and isinstance(local_llm, dict):
+        gen_timeout = local_llm.get("request_timeout_s", 300.0)
+    if gen_timeout is None:
+        gen_timeout = 300.0
 
     if backend == "openai_compatible":
         if not base_url:
             raise ValueError(
                 "OpenAI-compatible backend requires base_url to be set in local_llm config"
             )
-        return OpenAICompatibleClient(base_url=base_url, model=model, embed_model=embed_model)
+        return OpenAICompatibleClient(
+            base_url=base_url,
+            model=model,
+            embed_model=embed_model,
+            options=opts,
+            gen_timeout=gen_timeout,
+        )
     else:
         # Ollama backend (default)
-        return OllamaClient(base_url=base_url, embed_model=embed_model, generate_model=model)
+        return OllamaClient(
+            base_url=base_url,
+            embed_model=embed_model,
+            generate_model=model,
+            options=opts,
+            gen_timeout=gen_timeout,
+        )

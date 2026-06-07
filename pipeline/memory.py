@@ -1,10 +1,10 @@
 """Git diff summarization using local Ollama model or deterministic fallback."""
 
-import re
 import subprocess
 from pathlib import Path
 from typing import Optional
 
+from core.memory_doc import DEFAULT_CAPS, MemoryDoc
 from server.ollama_client import OllamaClient
 
 
@@ -30,7 +30,7 @@ class MemorySummarizer:
         """Get git diff for the last commit."""
         try:
             result = subprocess.run(
-                ["git", "diff", "HEAD~1", "HEAD"],
+                ["git", "diff", "HEAD~1", "HEAD", ":(exclude).cairn"],
                 cwd=self.repo_path,
                 capture_output=True,
                 text=True,
@@ -47,7 +47,7 @@ class MemorySummarizer:
         try:
             # Staged changes
             staged = subprocess.run(
-                ["git", "diff", "--staged"],
+                ["git", "diff", "--staged", ":(exclude).cairn"],
                 cwd=self.repo_path,
                 capture_output=True,
                 text=True,
@@ -56,7 +56,7 @@ class MemorySummarizer:
 
             # Unstaged changes
             unstaged = subprocess.run(
-                ["git", "diff"],
+                ["git", "diff", ":(exclude).cairn"],
                 cwd=self.repo_path,
                 capture_output=True,
                 text=True,
@@ -68,7 +68,7 @@ class MemorySummarizer:
             return ""
 
     def _extract_files_from_diff(self, diff: str) -> list[str]:
-        """Extract changed filenames from a diff string."""
+        """Extract changed filenames from a diff string, excluding Cairn internals."""
         files = []
         for line in diff.split("\n"):
             if line.startswith("diff --git"):
@@ -81,19 +81,21 @@ class MemorySummarizer:
                 path = line.lstrip("+- /").strip()
                 if path and path != "/dev/null":
                     files.append(path)
-        return list(set(files))  # Deduplicate
+        # Safety net: filter out Cairn's own state directory
+        return [f for f in set(files) if not f.startswith(".cairn/")]
 
     def _deterministic_summary(self, diff: str) -> str:
         """Generate a deterministic summary of changes without LLM.
 
         Produces a bullet list of changed files and a change type heuristic.
+        Excludes Cairn's own .cairn/ state from summaries.
         """
         if not diff or len(diff.strip()) < 10:
             return "No significant changes."
 
         files = self._extract_files_from_diff(diff)
         if not files:
-            return "Modified codebase (diff details unavailable)."
+            return "No significant changes (only Cairn internal files changed)."
 
         # Heuristic: guess change type from file patterns and diff size
         has_tests = any("test" in f.lower() for f in files)
@@ -134,7 +136,7 @@ class MemorySummarizer:
             return self._deterministic_summary(diff)
 
     def summarize_and_record(self, diff: Optional[str] = None):
-        """Summarize a diff and append to MEMORY.md."""
+        """Summarize a diff and append to memory via MemoryDoc."""
         if diff is None:
             diff = self.get_recent_diff()
 
@@ -145,75 +147,21 @@ class MemorySummarizer:
         self.append_to_memory(summary)
 
     def append_to_memory(self, entry: str):
-        """Append a summary entry to MEMORY.md with timestamp."""
-        from datetime import datetime
+        """Append a summary entry to memory via MemoryDoc.
 
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        Entries are added to the Recent Changes section and are automatically
+        capped and compacted by MemoryDoc.
+        """
         entry = entry.replace("\n", " ").strip()
+        if not entry:
+            return
 
         Path(self.memory_file).parent.mkdir(parents=True, exist_ok=True)
 
-        with open(self.memory_file, "a") as f:
-            f.write(f"\n[{timestamp}] {entry}")
-
-        self._rotate()  # Auto-rotate: keep only last N entries
-        self._maybe_compact()
-
-    def _rotate(self):
-        """Keep only the last max_entries in memory.md to prevent unbounded growth."""
-        try:
-            with open(self.memory_file) as f:
-                content = f.read()
-        except FileNotFoundError:
-            return
-
-        # Split by timestamp markers
-        entries = re.split(r"\n(?=\[\d{4}-\d{2}-\d{2}\s)", content)
-        entries = [e.strip() for e in entries if e.strip()]
-
-        if len(entries) <= self.max_entries:
-            return
-
-        # Keep only last N
-        entries = entries[-self.max_entries :]
-        with open(self.memory_file, "w") as f:
-            f.write("\n\n".join(entries))
-
-    def _maybe_compact(self):
-        """Compact MEMORY.md if it exceeds the threshold."""
-        try:
-            with open(self.memory_file) as f:
-                lines = [line.strip() for line in f.readlines() if line.strip()]
-        except FileNotFoundError:
-            return
-
-        if len(lines) < self._compaction_threshold:
-            return
-
-        # Take first chunk of entries
-        old_lines = lines[: self._compaction_threshold]
-        recent_lines = lines[self._compaction_threshold :]
-
-        # Compaction: use LLM if enabled, else use deterministic method
-        if self.llm_enabled:
-            combined = "\n".join(old_lines)
-            prompt = f"Summarize these git diff summaries into one paragraph:\n\n{combined}"
-            try:
-                compact_summary = self.ollama.generate(prompt=prompt, model=self.model)
-            except Exception:
-                compact_summary = "Multiple changes over time."
-        else:
-            # Deterministic compaction: count entries
-            compact_summary = f"Multiple historical changes ({len(old_lines)} entries compacted)."
-
-        from datetime import datetime
-
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-        with open(self.memory_file, "w") as f:
-            f.write(f"[{timestamp}] [COMPACTED] {compact_summary.strip()}")
-            if recent_lines:
-                f.write("\n" + "\n".join(recent_lines))
+        # Load, add to Recent Changes section, and save
+        doc = MemoryDoc.load(self.memory_file, caps=DEFAULT_CAPS)
+        doc.add("change", entry)
+        doc.save(self.memory_file)
 
     def load_recent(self, last_n: int = 10) -> str:
         """Load the last N memory entries."""

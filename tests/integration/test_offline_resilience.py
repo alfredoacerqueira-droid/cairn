@@ -89,8 +89,7 @@ embeddings_enabled: false
         # Direct unit test of _get_ranker timeout behavior
         import pipeline.retrieval.reranker as reranker_module
 
-        reranker_module._ranker = None
-        reranker_module._ranker_failed = False
+        reranker_module._ranker_cache.clear()
 
         # Monkeypatch Ranker class to hang
         class HangingRanker:
@@ -113,8 +112,7 @@ embeddings_enabled: false
         """When FlashRank Ranker() raises (SSL error), _get_ranker handles it gracefully."""
         import pipeline.retrieval.reranker as reranker_module
 
-        reranker_module._ranker = None
-        reranker_module._ranker_failed = False
+        reranker_module._ranker_cache.clear()
 
         # Monkeypatch Ranker to raise SSL error
         def error_ranker(*args, **kwargs):
@@ -124,7 +122,9 @@ embeddings_enabled: false
             # Call _get_ranker and verify it returns None on error
             result = reranker_module._get_ranker(ca_bundle=None, offline=False)
             assert result is None, "Should degrade gracefully on SSL error"
-            assert reranker_module._ranker_failed, "Should set _ranker_failed flag"
+            assert (
+                reranker_module._ranker_cache.get("ms-marco-MiniLM-L-12-v2") is None
+            ), "Should cache the failure to avoid retries"
 
     def test_offline_mode_skips_reranker_construction(self, tmp_path):
         """With offline=True, reranker is never constructed (no download attempt)."""

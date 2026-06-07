@@ -1,8 +1,18 @@
 """Unit tests for config loader."""
 
+import time
 from pathlib import Path
 
-from core.config import Config, EnabledConfig, ResourceConfig, load_config, save_config
+import yaml
+
+from core.config import (
+    Config,
+    EnabledConfig,
+    ResourceConfig,
+    clear_config_cache,
+    load_config,
+    save_config,
+)
 
 
 class TestConfigLoader:
@@ -317,3 +327,187 @@ class TestConfigLoader:
         loaded = load_config(tmp_path)
         assert loaded.cache.ttl_seconds == 300
         assert loaded.cache.semantic_ttl_seconds == 1800  # default
+
+    def test_memory_config_default_scope(self):
+        """Test MemoryConfig scope defaults to 'auto'."""
+        from core.config import MemoryConfig
+
+        config = MemoryConfig()
+        assert config.scope == "auto"
+
+    def test_memory_config_custom_scope(self):
+        """Test MemoryConfig can set custom scope."""
+        from core.config import MemoryConfig
+
+        config = MemoryConfig(scope="both")
+        assert config.scope == "both"
+
+        config = MemoryConfig(scope="workspace")
+        assert config.scope == "workspace"
+
+        config = MemoryConfig(scope="repo")
+        assert config.scope == "repo"
+
+    def test_memory_config_roundtrip_scope(self, tmp_path):
+        """Test memory scope survives save/load cycle."""
+        import yaml
+
+        config_dir = tmp_path / ".cairn"
+        config_dir.mkdir(parents=True)
+        config_file = config_dir / "config.yaml"
+
+        custom_config = {
+            "memory": {
+                "trigger": "manual",
+                "max_entries": 50,
+                "scope": "workspace",
+            }
+        }
+        config_file.write_text(yaml.dump(custom_config))
+
+        loaded = load_config(tmp_path)
+        assert loaded.memory.scope == "workspace"
+
+    def test_old_memory_config_without_scope_loads_default(self, tmp_path):
+        """Test backward compat: old memory config without scope loads 'auto' default."""
+        import yaml
+
+        config_dir = tmp_path / ".cairn"
+        config_dir.mkdir(parents=True)
+        config_file = config_dir / "config.yaml"
+
+        old_config = {
+            "memory": {
+                "trigger": "manual",
+                "max_entries": 50,
+                "compaction_model": "qwen2.5-coder:1.5b",
+            }
+        }
+        config_file.write_text(yaml.dump(old_config))
+
+        loaded = load_config(tmp_path)
+        assert loaded.memory.scope == "auto"
+        assert loaded.memory.trigger == "manual"
+        assert loaded.memory.max_entries == 50
+
+    def test_config_cache_caching(self, tmp_path):
+        """Test that load_config returns the same object when file hasn't changed."""
+        # Clear cache before test
+        clear_config_cache()
+
+        config_dir = tmp_path / ".cairn"
+        config_dir.mkdir(parents=True)
+        config_file = config_dir / "config.yaml"
+        config_file.write_text(yaml.dump({"profile": "python"}))
+
+        # First load
+        config1 = load_config(tmp_path)
+        # Second load without file change should return same cached object
+        config2 = load_config(tmp_path)
+
+        # Same object from cache
+        assert config1 is config2
+        assert config1.profile == "python"
+
+    def test_config_cache_invalidate_on_file_change(self, tmp_path):
+        """Test that config cache is invalidated when file mtime changes."""
+        clear_config_cache()
+
+        config_dir = tmp_path / ".cairn"
+        config_dir.mkdir(parents=True)
+        config_file = config_dir / "config.yaml"
+        config_file.write_text(yaml.dump({"profile": "python"}))
+
+        # First load
+        config1 = load_config(tmp_path)
+        assert config1.profile == "python"
+
+        # Wait a bit to ensure mtime changes
+        time.sleep(0.01)
+
+        # Modify the file
+        config_file.write_text(yaml.dump({"profile": "code"}))
+
+        # Second load should detect mtime change and reload
+        config2 = load_config(tmp_path)
+
+        # Different objects due to file change
+        assert config1 is not config2
+        assert config1.profile == "python"
+        assert config2.profile == "code"
+
+    def test_clear_config_cache(self, tmp_path):
+        """Test that clear_config_cache actually clears the cache."""
+        clear_config_cache()
+
+        config_dir = tmp_path / ".cairn"
+        config_dir.mkdir(parents=True)
+        config_file = config_dir / "config.yaml"
+        config_file.write_text(yaml.dump({"profile": "python"}))
+
+        # Load to cache
+        config1 = load_config(tmp_path)
+        assert config1.profile == "python"
+
+        # Clear the cache for this path
+        clear_config_cache(tmp_path)
+
+        # Modify the file
+        config_file.write_text(yaml.dump({"profile": "code"}))
+
+        # Load again - should reload from disk since cache was cleared
+        config2 = load_config(tmp_path)
+        assert config1 is not config2
+        assert config2.profile == "code"
+
+    def test_save_config_invalidates_cache(self, tmp_path):
+        """Test that save_config invalidates the cache for that path."""
+        clear_config_cache()
+
+        config_dir = tmp_path / ".cairn"
+        config_dir.mkdir(parents=True)
+        config_file = config_dir / "config.yaml"
+        config_file.write_text(yaml.dump({"profile": "python"}))
+
+        # Load to cache
+        config1 = load_config(tmp_path)
+        assert config1.profile == "python"
+
+        # Modify and save (should invalidate cache)
+        modified_config = Config(profile="code")
+        save_config(modified_config, tmp_path)
+
+        # Load again - should NOT get cached old value
+        config2 = load_config(tmp_path)
+        assert config2.profile == "code"
+
+    def test_retrieval_config_new_fields(self):
+        """Test that RetrievalConfig has new magic-number fields."""
+        from core.config import RetrievalConfig
+
+        config = RetrievalConfig()
+        assert config.rrf_k == 60
+        assert config.max_merged == 24
+        assert config.per_repo_min == 3
+
+    def test_retrieval_config_new_fields_roundtrip(self, tmp_path):
+        """Test that RetrievalConfig new fields survive save/load cycle."""
+        config_dir = tmp_path / ".cairn"
+        config_dir.mkdir(parents=True)
+        config_file = config_dir / "config.yaml"
+
+        custom_config = {
+            "retrieval": {
+                "mode": "hybrid",
+                "rrf_k": 100,
+                "max_merged": 30,
+                "per_repo_min": 5,
+                "rerank_enabled": True,
+            }
+        }
+        config_file.write_text(yaml.dump(custom_config))
+
+        loaded = load_config(tmp_path)
+        assert loaded.retrieval.rrf_k == 100
+        assert loaded.retrieval.max_merged == 30
+        assert loaded.retrieval.per_repo_min == 5

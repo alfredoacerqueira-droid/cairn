@@ -24,6 +24,7 @@ dependencies = [
     "click>=8.1.0",
     "mcp>=1.0.0",
     "flashrank>=0.2.0",
+    "fastembed>=0.3",
 ]
 
 [project.optional-dependencies]
@@ -37,9 +38,11 @@ dev = [
 ]
 local = [
     "lancedb>=0.13",
-    "fastembed>=0.3",
     "tantivy>=0.22",
 ]
+# Replaces the CPU onnxruntime with onnxruntime-gpu (they can't coexist);
+# enables GPU embedding (10-50x faster cold-indexing).
+gpu = ["fastembed-gpu>=0.3"]
 
 [tool.setuptools.packages.find]
 include = ["server*", "pipeline*", "core*", "throttle*", "cli*"]
@@ -60,6 +63,7 @@ markers = [
     "corpus: mark test as requiring test corpus/fixtures",
     "ollama: mark test as requiring Ollama service",
     "eval: mark test as evaluation/benchmark test",
+    "e2e: mark test as end-to-end CLI test (slow, exercises full pipeline)",
 ]
 
 [tool.black]
