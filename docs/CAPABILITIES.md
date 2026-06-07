@@ -81,7 +81,9 @@ default), `exclude_patterns` (node_modules/.git/tests/vendor/minified/…), `sou
 `batch_size=50`, `delay_ms=500`, `max_file_kb=0` (0=no limit), `parse_timeout_s=10.0`,
 `embedding_model="nomic-embed-text"`, **`store_backend="chroma"`** (`chroma|lance`),
 **`index_location="auto"`** (`auto|native|in_project`; auto = native `~/.cache/cairn/<id>` for `/mnt/*`
-projects, else in-project `.cairn/`).
+projects, else in-project `.cairn/`), **`embed_truncate_chars=1000`** (max chars of each block's code
+sent to the embedder — full code is still stored + reranked; 0 = no truncation; lower = faster
+cold-indexing, esp. fastembed on large repos).
 
 ### stale_db
 `auto_quick_reindex=True`, `quick_reindex_threshold=1000`, `full_reindex_threshold=10000`
@@ -107,7 +109,12 @@ projects, else in-project `.cairn/`).
 `mode="hybrid"` (`hybrid|embeddings|bm25|ast`), `weights=[0.4,0.3,0.3]` (bm25/ast/embeddings),
 **`rrf_k=60`**, **`max_merged=24`**, **`per_repo_min=3`**, `rerank_enabled=True`,
 `reranker_type="cross_encoder"` (`cross_encoder|llm|none`), `rerank_min_score=0.47`,
-`min_confidence=0.82` (raw-cosine fallback gate), `offline=False`, `ca_bundle=None`
+`min_confidence=0.82` (raw-cosine fallback gate), `offline=False`, `ca_bundle=None`,
+**`reranker_model="ms-marco-MiniLM-L-12-v2"`** (FlashRank model; `ms-marco-TinyBERT-L-2-v2` is ~25×
+faster but ~1/8 lower recall on django — opt-in for speed), **`rerank_candidate_multiplier=4`** /
+**`rerank_min_candidates=40`** (rerank pool = `max(top_k×mult, min)`), **`rerank_truncate_chars=2000`**,
+**`lexical_max_files=25`** / **`lexical_max_count_per_file=50`** (bound the ripgrep leg: only parse the
+top-N hit files + cap `rg --max-count` per file — the big latency lever on large repos).
 
 ### compression
 `enabled=True`, `level="minimal"` (`none|minimal|aggressive`; honors `COMPRESSION_LEVEL` env)
@@ -153,11 +160,14 @@ drops results below `rerank_min_score` (or `min_confidence` raw cosine when rera
 ## 6. Embedding modes & store backends
 
 **3 embedding modes** (`make_embedder`): `placeholder` (dim=1, embeddings OFF — lexical+structural
-only) · `fastembed` (in-process ONNX `bge-small`, semantic search with **no Ollama**) · `ollama`
-(`local_llm.enabled` → real embeddings via the configured model). **2 store backends:** `chroma`
-(default; single SQLite-backed dir) · `lance` (optional `[local]` extra; native hybrid + versioning).
-Both isolated per repo via `functions_<project_id>` collection + provenance stamping. The collection
-**rebuilds automatically when the embedding dimension changes** (switching embed model / toggling LLM).
+only) · `fastembed` (in-process ONNX `bge-small`, 384-dim, semantic search with **no Ollama**) ·
+`ollama` (real embeddings via the configured model + a running server). **fastembed is the DEFAULT** —
+`cairn init` auto-selects `local_llm.embedder="fastembed"` when the package is importable and the
+profile enables embeddings (python/code/dotnet), so **semantic search works offline out of the box**.
+Embeddings are no longer gated on `local_llm.enabled` (the gate is now "is a real embedder available"),
+and the same embedder is used at every index/query site. **2 store backends:** `chroma` (default) ·
+`lance` (optional `[local]` extra). Per-repo isolation via `functions_<project_id>`; the collection
+**rebuilds automatically when the embedding dimension changes** (e.g. 768↔384 when switching embedders).
 
 ---
 
@@ -234,3 +244,26 @@ caps total session output at 18%/36K.
 | `orchestrate` w/ instruction | one-shot or map-reduce on the LLM | context-only (no generation) |
 | Reranking (FlashRank) | unaffected (no LLM) | unaffected |
 | Compression / caches / parsing | unaffected | unaffected |
+
+(With fastembed as the default embedder, the "Without" column now gets **real semantic search offline**
+— the weak placeholder/lexical-only path applies only if fastembed is uninstalled and no Ollama.)
+
+---
+
+## 14. Performance & readiness notes (measured on real repos)
+
+- **Token/cost reduction (the core value):** on 10 real django dev tasks, `assemble_context` used
+  ~84% fewer tokens than reading the relevant file in full, ~99% fewer than a whole-repo dump.
+- **Retrieval quality:** with embeddings (fastembed default), 10/10 gt-area-in-top-5 on django
+  (7/8 on the stricter exact-symbol metric). Without embeddings (lexical+structural only), large-repo
+  conceptual recall is weak (~2/10) — which is why fastembed is now on by default.
+- **Query latency** (`assemble`, large repo, warm): ~6–8.5s, down from ~19s. Dominated by the ripgrep
+  scan (~4s, intrinsic to searching a large tree) + cross-encoder rerank (~2s). Tunables:
+  `lexical_max_files`, `reranker_model` (TinyBERT ≈25× faster rerank), `rerank_*`. Small/medium repos
+  are much faster.
+- **Cold-index cost:** small/medium repos index in seconds–minutes. A very large repo (django, ~1M
+  tokens, ~6k blocks) takes ~14 min with fastembed on CPU (a one-time cost; `embed_truncate_chars`
+  ~halves it with no measured relevance loss). Mitigations: the **background janitor indexes
+  incrementally** (need not block first use); use a GPU or Ollama for faster embedding.
+- **Readiness:** ready for typical (small–medium) repos today. On django-scale monorepos it is correct
+  and usable, but plan for a slow one-time background index.
