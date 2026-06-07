@@ -11,6 +11,21 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+def _active_providers(model) -> list[str]:
+    """Return the ACTIVE onnxruntime providers from a constructed fastembed TextEmbedding.
+
+    Uses the real InferenceSession (model.model.model.get_providers()) rather than
+    the compiled-in list, because onnxruntime-gpu can report CUDAExecutionProvider as
+    available while silently falling back to CPU when CUDA libs are missing.
+    Returns [] on any failure (never raises).
+    """
+    try:
+        return model.model.model.get_providers()
+    except Exception:
+        return []
+
+
 # Known Ollama embedding model dimensions (hint for vector-index sizing).
 _OLLAMA_DIMS = {
     "nomic-embed-text": 768,
@@ -64,6 +79,8 @@ class FastEmbedEmbedder:
         self._device = device
         self._threads = threads
         self._model = None  # Lazy-loaded
+        self._active_providers: list[str] = []
+        self._gpu_active: bool = False
         # Hint: only updated on first __call__ if 0
         self._dim = 384 if "bge-small" in model else 0
 
@@ -86,6 +103,12 @@ class FastEmbedEmbedder:
     def name(self) -> str:
         """Human-readable name."""
         return f"fastembed:{self._model_name}"
+
+    @property
+    def gpu_active(self) -> bool:
+        """Whether the loaded model is actually running on a GPU provider."""
+        self._ensure()
+        return self._gpu_active
 
     def _ensure(self):
         """Lazy-load the fastembed model, preferring GPU if available."""
@@ -113,7 +136,18 @@ class FastEmbedEmbedder:
                 self._model = TextEmbedding(
                     model_name=self._model_name, providers=providers, threads=threads
                 )
-                logger.debug("fastembed using GPU provider %s", gpu[0])
+                self._active_providers = _active_providers(self._model)
+                self._gpu_active = any(p in self._active_providers for p in self._GPU_PROVIDERS)
+                if self._gpu_active:
+                    logger.debug("fastembed GPU active: %s", self._active_providers)
+                else:
+                    logger.warning(
+                        "fastembed requested %s but onnxruntime fell back to CPU "
+                        "(active=%s); GPU runtime libs likely missing "
+                        "(need CUDA 12.x + cuDNN 9.x). Using CPU.",
+                        gpu[0],
+                        self._active_providers,
+                    )
                 return
             except Exception as e:
                 logger.warning("fastembed GPU init failed (%s); falling back to CPU", e)
@@ -124,6 +158,8 @@ class FastEmbedEmbedder:
             )
 
         self._model = TextEmbedding(model_name=self._model_name, threads=threads)
+        self._active_providers = _active_providers(self._model)
+        self._gpu_active = False
         logger.debug("fastembed using CPU (threads=%s)", threads)
 
     def __call__(self, texts: list[str]) -> list[list[float]]:

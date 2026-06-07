@@ -12,3 +12,5 @@ dist/
 htmlcov/
 *.docx
 .opencode/
+.venv-gpu/
+scripts/gpu_bench_report.md

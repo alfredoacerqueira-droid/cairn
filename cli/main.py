@@ -902,31 +902,50 @@ def doctor():
     click.echo(f"    Recommended embed:  {rec['embed']['model']} " f"({rec['embed']['reason']})")
     click.echo(f"    Suggested num_ctx: {rec['suggested_num_ctx']}")
 
-    # fastembed GPU hint
+    # fastembed GPU availability (honest: probe ACTIVE providers, not compiled-in list)
     try:
         import onnxruntime as ort
 
         avail = set(ort.get_available_providers())
-        gpu_providers = [
+        gpu_providers_list = [
             p
             for p in ("CUDAExecutionProvider", "ROCMExecutionProvider", "CoreMLExecutionProvider")
             if p in avail
         ]
-        if gpu_providers:
-            click.echo()
-            click.echo(f"[OK] fastembed GPU acceleration available ({gpu_providers[0]}).")
-        elif resources["gpu_name"]:
-            click.echo()
-            click.echo(
-                "[i] GPU detected but fastembed runs on CPU. "
-                "For ~10-50x faster indexing: "
-                "pip install fastembed-gpu (replaces onnxruntime with onnxruntime-gpu)."
-            )
-        else:
+        if not gpu_providers_list and not resources["gpu_name"]:
             click.echo()
             click.echo(
                 "[i] fastembed embedding runs on CPU "
                 "(set local_llm.embed_threads to use more cores)."
+            )
+        elif gpu_providers_list:
+            # Actually probe: build FastEmbedEmbedder(device="cuda") and read .gpu_active
+            click.echo()
+            try:
+                from pipeline.store.embedders import FastEmbedEmbedder
+
+                probe = FastEmbedEmbedder(model=cfg.local_llm.fastembed_model, device="cuda")
+                probe._ensure()
+                if probe.gpu_active:
+                    active = [p for p in probe._active_providers if p in gpu_providers_list]
+                    first = active[0] if active else gpu_providers_list[0]
+                    click.echo(f"[OK] fastembed GPU acceleration ACTIVE ({first}).")
+                else:
+                    click.echo(
+                        "[!] fastembed GPU provider present but NOT loadable "
+                        "(fell back to CPU). "
+                        "Install the matching CUDA 12.x + cuDNN 9.x runtime libs and ensure "
+                        "they're on LD_LIBRARY_PATH; on WSL2 these are usually missing. "
+                        "Embedding currently runs on CPU."
+                    )
+            except Exception:
+                click.echo("[i] fastembed GPU probe failed — embedding runs on CPU.")
+        else:
+            click.echo()
+            click.echo(
+                "[i] GPU detected but fastembed runs on CPU. "
+                "For faster indexing: pip install fastembed-gpu (replaces onnxruntime "
+                "with onnxruntime-gpu)."
             )
     except Exception:
         pass

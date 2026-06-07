@@ -228,6 +228,107 @@ class TestFastEmbedEmbedder:
         assert embedder._device == "cpu"
         assert embedder._threads == 8
 
+    def test_gpu_requested_fell_back_to_cpu_active_providers(self, monkeypatch, caplog):
+        """GPU requested but model reports CPU-only -> gpu_active=False, warning logged."""
+        recorded_kwargs = {}
+
+        class FakeTE:
+            def __init__(self, model_name=None, providers=None, threads=None):
+                recorded_kwargs["providers"] = providers
+                recorded_kwargs["threads"] = threads
+
+            def embed(self, texts):
+                return [[0.0] * 384 for _ in texts]
+
+        monkeypatch.setattr("fastembed.TextEmbedding", FakeTE)
+        monkeypatch.setattr(
+            "onnxruntime.get_available_providers",
+            lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
+        # Simulate silent fallback: model was built but onnxruntime fell back to CPU
+        monkeypatch.setattr(
+            "pipeline.store.embedders._active_providers",
+            lambda model: ["CPUExecutionProvider"],
+        )
+
+        import logging
+
+        caplog.set_level(logging.WARNING)
+
+        embedder = FastEmbedEmbedder(device="cuda")
+        embedder._ensure()
+
+        assert embedder._model is not None
+        assert embedder.gpu_active is False
+        assert embedder._active_providers == ["CPUExecutionProvider"]
+        assert "fell back to CPU" in caplog.text
+        # Embedder still works
+        result = embedder(["test"])
+        assert len(result) == 1
+        assert len(result[0]) == 384
+
+    def test_gpu_requested_really_active(self, monkeypatch):
+        """GPU requested and model reports CUDA -> gpu_active=True, no warning."""
+        recorded_kwargs = {}
+
+        class FakeTE:
+            def __init__(self, model_name=None, providers=None, threads=None):
+                recorded_kwargs["providers"] = providers
+                recorded_kwargs["threads"] = threads
+
+            def embed(self, texts):
+                return [[0.0] * 384 for _ in texts]
+
+        monkeypatch.setattr("fastembed.TextEmbedding", FakeTE)
+        monkeypatch.setattr(
+            "onnxruntime.get_available_providers",
+            lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
+        monkeypatch.setattr(
+            "pipeline.store.embedders._active_providers",
+            lambda model: ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
+
+        embedder = FastEmbedEmbedder(device="cuda")
+        embedder._ensure()
+
+        assert embedder._model is not None
+        assert embedder.gpu_active is True
+        assert "CUDAExecutionProvider" in embedder._active_providers
+
+    def test_cpu_device_no_gpu_active_no_warning(self, monkeypatch, caplog):
+        """CPU device -> gpu_active=False, no GPU warning logged."""
+        recorded_kwargs = {}
+
+        class FakeTE:
+            def __init__(self, model_name=None, providers=None, threads=None):
+                recorded_kwargs["providers"] = providers
+                recorded_kwargs["threads"] = threads
+
+            def embed(self, texts):
+                return [[0.0] * 384 for _ in texts]
+
+        monkeypatch.setattr("fastembed.TextEmbedding", FakeTE)
+        monkeypatch.setattr(
+            "onnxruntime.get_available_providers",
+            lambda: ["CPUExecutionProvider"],
+        )
+        monkeypatch.setattr(
+            "pipeline.store.embedders._active_providers",
+            lambda model: ["CPUExecutionProvider"],
+        )
+
+        import logging
+
+        caplog.set_level(logging.WARNING)
+
+        embedder = FastEmbedEmbedder(device="cpu")
+        embedder._ensure()
+
+        assert embedder._model is not None
+        assert embedder.gpu_active is False
+        assert "CUDA" not in caplog.text and "fell back" not in caplog.text
+
 
 class TestOllamaEmbedder:
     """Tests for OllamaEmbedder."""
