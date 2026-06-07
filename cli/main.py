@@ -1632,7 +1632,8 @@ def reindex(mode: str):
     click.echo(f"Re-indexing in {mode} mode...")
 
     from core.freshness import DBFreshness
-    from core.repo import RepoManager, collect_source_files
+    from core.manifest import IndexManifest, sha256_of_file
+    from core.repo import RepoManager, collect_source_files, project_id
     from pipeline.ast_parser import ASTParser
     from pipeline.indexer import VectorIndexer
 
@@ -1652,6 +1653,8 @@ def reindex(mode: str):
         cfg=cfg,
     )
 
+    pid = project_id(project_path)
+
     if mode == "full":
         indexer.clear()
 
@@ -1661,6 +1664,23 @@ def reindex(mode: str):
         cfg.indexing.exclude_patterns,
         getattr(cfg.indexing, "source_roots", ["."]),
     )
+
+    manifest = None
+    changed_count = 0
+    skipped_count = 0
+    removed_count = 0
+    if mode == "quick":
+        manifest = IndexManifest.load(repo, pid)
+        filtered_relpaths = {
+            str(f.resolve().relative_to(project_path.resolve())) for f in filtered_files
+        }
+        for relpath in list(manifest.files.keys()):
+            if relpath not in filtered_relpaths:
+                indexer.remove_file(str(project_path / relpath))
+                manifest.remove_entry(relpath)
+                removed_count += 1
+    else:
+        manifest = IndexManifest(repo.get_manifest_path(), pid)
 
     total = 0
     repo_map: dict[str, dict] = {}
@@ -1672,11 +1692,30 @@ def reindex(mode: str):
     ) as bar:
         for filepath in bar:
             try:
+                relpath = str(filepath.relative_to(project_path))
+                fhash = sha256_of_file(filepath)
+
+                if mode == "quick":
+                    if manifest.has_same_hash(relpath, fhash):
+                        skipped_count += 1
+                        continue
+                    indexer.remove_file(str(filepath))
+
                 ast = parser.parse_file(filepath)
                 indexer.index_ast(ast)
                 total += len(ast.functions)
                 for cls in ast.classes:
                     total += len(cls.methods)
+
+                if mode in ("quick", "full"):
+                    if manifest is None:
+                        manifest = IndexManifest(repo.get_manifest_path(), pid)
+                    blocks = len(ast.functions) + sum(len(c.methods) for c in ast.classes)
+                    if mode == "quick":
+                        manifest.set_entry(relpath, fhash, blocks)
+                        changed_count += 1
+                    else:
+                        manifest.set_entry(relpath, fhash, blocks)
 
                 if len(repo_map) < cfg.indexing.batch_size:
                     repo_map[str(filepath)] = ast.to_dict()
@@ -1690,6 +1729,9 @@ def reindex(mode: str):
         if fp.exists():
             repo_map[str(fp)] = parser.parse_file(fp).to_dict()
     repo.save_repo_map(repo_map)
+
+    if manifest is not None:
+        manifest.save()
 
     try:
         import time as _time
@@ -1705,7 +1747,13 @@ def reindex(mode: str):
     except Exception:
         pass
 
-    click.echo(f"Indexed {total} functions from {len(filtered_files)} files")
+    if mode == "quick":
+        click.echo(
+            f"Indexed {total} functions from {len(filtered_files)} files "
+            f"({changed_count} changed, {skipped_count} unchanged-skipped, {removed_count} removed)"
+        )
+    else:
+        click.echo(f"Indexed {total} functions from {len(filtered_files)} files")
 
 
 @main.group()

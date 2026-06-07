@@ -568,6 +568,9 @@ class RepoManager:
     def get_repo_map_path(self) -> Path:
         return self.data_dir / "repo_map.json"
 
+    def get_manifest_path(self) -> Path:
+        return self.data_dir / "index_manifest.json"
+
     def get_memory_path(self) -> Path:
         return self.data_dir / "memory.md"
 

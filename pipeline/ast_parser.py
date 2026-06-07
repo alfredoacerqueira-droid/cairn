@@ -1534,7 +1534,7 @@ class ASTParser:
         return indent_block
 
     def diff_update(self, filepath: str | Path, old_ast: FileAST) -> FileAST:
-        """Incremental update - re-parse only if file changed."""
+        """Full re-parse of the file (AST-diffing is not implemented). For genuine incremental behaviour see the indexer's content-hash file skipping in cairn reindex --mode quick and IndexManifest."""
         filepath = Path(filepath)
         if not filepath.exists():
             return FileAST(str(filepath))
