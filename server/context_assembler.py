@@ -173,7 +173,10 @@ class ContextAssembler:
                 reranker = LLMReranker(ollama_client=self.ollama)
             elif rtype != "none":
                 reranker = Reranker(
-                    ca_bundle=cfg.retrieval.ca_bundle, offline=cfg.retrieval.offline
+                    model_name=cfg.retrieval.reranker_model,
+                    truncate_chars=cfg.retrieval.rerank_truncate_chars,
+                    ca_bundle=cfg.retrieval.ca_bundle,
+                    offline=cfg.retrieval.offline,
                 )
 
         # Lexical leg: ripgrep over the live working tree (fresh, exact-match),
@@ -222,6 +225,8 @@ class ContextAssembler:
             structural=structural,
             profile_legs=profile.legs,
             rrf_k=cfg.retrieval.rrf_k,
+            rerank_candidate_multiplier=cfg.retrieval.rerank_candidate_multiplier,
+            rerank_min_candidates=cfg.retrieval.rerank_min_candidates,
         )
         self._retriever_commit = commit
         return self._retriever

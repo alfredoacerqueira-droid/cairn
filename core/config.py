@@ -222,6 +222,20 @@ class RetrievalConfig(BaseModel):
     # Passed to flashrank via os.environ before model load.
     ca_bundle: str | None = None
 
+    # --- Reranker tunables ---
+    # Which FlashRank cross-encoder model to use. Default L-12-v2 (~2.8s/query
+    # for ~26 candidates on CPU). Swap to "ms-marco-MiniLM-L-6-v2" for ~1.5-2×
+    # speedup at a small quality cost. Other FlashRank-compatible models also
+    # work (e.g. "ms-marco-MiniLM-L-4-v2", "ce-msmarco-MiniLM-L6-v2").
+    reranker_model: str = "ms-marco-MiniLM-L-12-v2"
+    # How many fusion candidates to feed the reranker: max(top_k * multiplier, min).
+    # Raising these increases recall but costs more cross-encoder latency.
+    rerank_candidate_multiplier: int = 4
+    rerank_min_candidates: int = 40
+    # Maximum characters per candidate snippet sent to the cross-encoder.
+    # Lower = faster reranking; higher = more context for the model to score.
+    rerank_truncate_chars: int = 2000
+
 
 class CompressionConfig(BaseModel):
     # Enable token compression on assembled context (retrieval path).

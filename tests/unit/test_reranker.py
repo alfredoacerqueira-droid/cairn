@@ -189,3 +189,79 @@ class TestReranker:
         assert result[0]["similarity"] == 0.7
         assert result[0]["custom_field"] == "preserved"
         assert result[0]["rerank_score"] == 0.8
+
+    def test_model_name_plumbs_through(self):
+        """Reranker(model_name=...) plumbs through to _get_ranker."""
+        # Test with a different model name
+        reranker_l6 = Reranker(model_name="ms-marco-MiniLM-L-6-v2")
+        assert reranker_l6.model_name == "ms-marco-MiniLM-L-6-v2"
+
+        mock_ranker = MagicMock()
+        mock_ranker.rerank.return_value = [{"id": 0, "score": 0.5}]
+        candidates = [{"id": "func1", "text": "code", "similarity": 0.5}]
+
+        with patch(
+            "pipeline.retrieval.reranker._get_ranker", return_value=mock_ranker
+        ) as mock_get:
+            reranker_l6.rerank("query", candidates)
+            mock_get.assert_called_once()
+            _, kwargs = mock_get.call_args
+            assert kwargs["model_name"] == "ms-marco-MiniLM-L-6-v2"
+
+        # Default model name is L-12
+        reranker_default = Reranker()
+        assert reranker_default.model_name == "ms-marco-MiniLM-L-12-v2"
+
+    def test_truncate_chars_configurable(self):
+        """Reranker(truncate_chars=...) honors custom truncation limit."""
+        reranker = Reranker(truncate_chars=500)
+
+        mock_ranker = MagicMock()
+        mock_ranker.rerank.return_value = [{"id": 0, "score": 0.5}]
+
+        long_code = "def foo():\n" + "    x = 1\n" * 100  # ~1300 chars
+
+        with patch("pipeline.retrieval.reranker._get_ranker", return_value=mock_ranker):
+            reranker.rerank("query", [{"id": "long_func", "text": long_code}])
+
+        # Check that text was truncated to 500 chars + "..."
+        call_args = mock_ranker.rerank.call_args
+        if call_args and call_args[0]:
+            passages = call_args[0][0].passages
+        else:
+            passages = call_args[1].get("passages", [])
+        assert len(passages[0]["text"]) <= 503  # 500 + "..."
+
+        # Also test that the default truncate_chars is 2000
+        reranker_default = Reranker()
+        assert reranker_default.truncate_chars == 2000
+
+    def test_singleton_cache_per_model(self):
+        """Two different model names don't collide in the singleton cache."""
+        with patch("flashrank.Ranker") as mock_ranker_cls:
+            mock_l12 = MagicMock()
+            mock_l6 = MagicMock()
+            mock_ranker_cls.side_effect = [mock_l12, mock_l6]
+
+            # First call with L-12
+            from pipeline.retrieval.reranker import _get_ranker, _ranker_cache
+
+            _ranker_cache.clear()
+            result1 = _get_ranker(model_name="ms-marco-MiniLM-L-12-v2")
+            assert result1 is mock_l12
+            assert "ms-marco-MiniLM-L-12-v2" in _ranker_cache
+            assert _ranker_cache["ms-marco-MiniLM-L-12-v2"] is mock_l12
+
+            # Second call with L-6 should load a new instance
+            result2 = _get_ranker(model_name="ms-marco-MiniLM-L-6-v2")
+            assert result2 is mock_l6
+            assert "ms-marco-MiniLM-L-6-v2" in _ranker_cache
+            assert _ranker_cache["ms-marco-MiniLM-L-6-v2"] is mock_l6
+
+            # The L-12 entry is still intact
+            assert _ranker_cache["ms-marco-MiniLM-L-12-v2"] is mock_l12
+
+            # Calling L-12 again returns the cached instance (no new Ranker call)
+            result3 = _get_ranker(model_name="ms-marco-MiniLM-L-12-v2")
+            assert result3 is mock_l12
+            assert mock_ranker_cls.call_count == 2  # Only two constructor calls total
