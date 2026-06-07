@@ -237,31 +237,90 @@ class ContextAssembler:
 
         return bm25_items, ast_items
 
-    def _passes_confidence_guard(self, functions: list[dict]) -> bool:
-        """True if the top result is confident enough to inject/return.
+    def _passes_confidence_guard(self, functions: list[dict], query: str = "") -> bool:
+        """True if the result set is confident enough to inject/return.
 
         Shared by assemble_context AND semantic_search so EVERY path (CLI search,
-        MCP search_code, proxy) honors the same relevance gate — not just the
-        assemble path. When rerank is active, gates on the cross-encoder absolute
-        score; otherwise on raw embedding cosine. (The normalized 'similarity' is
-        min-max scaled so the top result is always ~1.0 — useless as a gate.)
-        Threshold 0 disables the guard.
-        """
-        cfg = load_config(self.project_path)
-        if cfg.retrieval.rerank_enabled:
-            # Prefer the PROFILE's rerank threshold (iac=0.15 for terse HCL,
-            # code=0.47 for prose-y code) over the global config value, so the
-            # gate matches the cross-encoder score distribution of the repo type.
-            profile = get_profile(cfg.profile)
-            threshold = getattr(profile, "rerank_min_score", cfg.retrieval.rerank_min_score)
-            top_score = functions[0].get("rerank_score", 0.0) if functions else 0.0
-        else:
-            threshold = cfg.retrieval.min_confidence
-            top_score = functions[0].get("raw_cosine", 0.0) if functions else 0.0
+        MCP search_code, proxy) honors the same relevance gate.
 
+        The guard distinguishes two cases:
+
+        1. Lexical/structural-only retrieval (the embeddings/vector leg did NOT
+           contribute): these legs are SELECTIVE — they only return functions
+           whose query terms or structure actually match. A non-empty result set
+           is itself the confidence signal → PASS. Off-topic queries naturally
+           fail-close because the selective legs return empty.
+
+           However, the structural leg can produce token-level false positives
+           (e.g. \"function\" in \"unindexed_function\" matching a terraform
+           ``aws_lambda_function`` block).  When *query* is provided we require
+           that at least one query term (3+ chars) appears in the top result's
+           code text — this is a cheap, leg-consistent gate that lets conceptual
+           queries through while blocking single-token false matches.
+
+        2. Embeddings/vector retrieval (the vector leg contributed): vector
+           search always returns top-k even for off-topic queries, so we require
+           a minimum raw embedding cosine (cfg.retrieval.min_confidence).
+
+        The FlashRank cross-encoder is a prose-relevance model and produces
+        near-zero absolute scores for CODE + CONCEPTUAL queries even when the
+        retrieval is correct. It is used to REORDER candidates (upstream) but
+        MUST NOT GATE — its absolute score provides ~no off-topic protection
+        while causing large recall loss on an agent's normal conceptual queries.
+        """
+        if not functions:
+            return False
+
+        cfg = load_config(self.project_path)
+
+        # raw_cosine > 0.0 signals that the embeddings/vector leg produced at
+        # least one result (even if RRF-fused lower).  Zero means the result
+        # set came from the selective lexical / structural legs alone.
+        embeddings_contributed = any(r.get("raw_cosine", 0.0) > 0.0 for r in functions)
+
+        if not embeddings_contributed:
+            # Selective legs already filtered to real matches, but the
+            # structural leg can false-match on a single generic token
+            # (e.g. "function" in "unindexed_function" matching an
+            # aws_lambda_function block).  Require that at least one
+            # *meaningful* query term (3+ chars, not a common code
+            # stop-token) appears in the top result's code text.
+            if query:
+                code = (functions[0].get("code") or "").lower()
+                query_terms = set(re.findall(r"[a-z0-9]{3,}", query.lower()))
+                # Tokens that are so common in code that the structural
+                # leg matching on them alone is not a confidence signal.
+                _stop_tokens = {
+                    "function",
+                    "resource",
+                    "service",
+                    "handler",
+                    "class",
+                    "method",
+                    "object",
+                    "module",
+                    "type",
+                    "data",
+                    "name",
+                    "value",
+                    "file",
+                    "return",
+                    "import",
+                    "config",
+                    "error",
+                    "result",
+                }
+                meaningful = query_terms - _stop_tokens
+                if meaningful and not any(t in code for t in meaningful):
+                    return False
+            return True
+
+        # Embeddings contributed: require a minimum raw embedding cosine.
+        threshold = cfg.retrieval.min_confidence
         if threshold <= 0:
             return True
-        return bool(functions) and top_score >= threshold
+        top_raw_cosine = max(r.get("raw_cosine", 0.0) for r in functions)
+        return top_raw_cosine >= threshold
 
     def _name_matches_query(self, query: str, func_name: str) -> bool:
         """True if the query matches a function/class name via token identity.
@@ -281,9 +340,7 @@ class ContextAssembler:
             for part in parts:
                 if not part:
                     continue
-                camel = re.split(
-                    r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", part
-                )
+                camel = re.split(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", part)
                 tokens.update(t.lower() for t in camel if t)
             return tokens
 
@@ -307,9 +364,7 @@ class ContextAssembler:
 
         return False
 
-    def _rescue_name_matches(
-        self, query: str, results: list[dict]
-    ) -> list[dict]:
+    def _rescue_name_matches(self, query: str, results: list[dict]) -> list[dict]:
         """Promote results whose symbol name matches the query to the front.
 
         When the confidence guard rejects all results but one or more carry
@@ -401,7 +456,7 @@ class ContextAssembler:
         # off-topic queries (not just the assemble path). Cache stores the raw
         # results; the guard is applied on return.
         if apply_guard:
-            if results and not self._passes_confidence_guard(results):
+            if results and not self._passes_confidence_guard(results, query=query):
                 rescued = self._rescue_name_matches(query, results)
                 if rescued:
                     logger.debug(
@@ -624,7 +679,7 @@ class ContextAssembler:
 
         functions = self.semantic_search(user_prompt)
 
-        if not self._passes_confidence_guard(functions):
+        if not self._passes_confidence_guard(functions, query=user_prompt):
             rescued = self._rescue_name_matches(user_prompt, functions)
             if rescued:
                 logger.debug(

@@ -173,7 +173,7 @@ class TestStructuralRetriever:
         retriever = StructuralRetriever()
         retriever.index(TERRAFORM_BLOCKS)
 
-        results = retriever.search("resource", top_k=3)
+        results = retriever.search("cluster", top_k=3)
         assert len(results) > 0
         for r in results:
             assert isinstance(r, dict)
@@ -202,7 +202,7 @@ class TestStructuralRetriever:
         retriever.index(TERRAFORM_BLOCKS)
 
         for k in [1, 2, 3, 10]:
-            results = retriever.search("resource", top_k=k)
+            results = retriever.search("cluster", top_k=k)
             assert len(results) <= k
 
     def test_no_match_returns_empty(self):
