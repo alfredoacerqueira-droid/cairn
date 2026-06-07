@@ -30,7 +30,7 @@ class MemorySummarizer:
         """Get git diff for the last commit."""
         try:
             result = subprocess.run(
-                ["git", "diff", "HEAD~1", "HEAD"],
+                ["git", "diff", "HEAD~1", "HEAD", ":(exclude).cairn"],
                 cwd=self.repo_path,
                 capture_output=True,
                 text=True,
@@ -47,7 +47,7 @@ class MemorySummarizer:
         try:
             # Staged changes
             staged = subprocess.run(
-                ["git", "diff", "--staged"],
+                ["git", "diff", "--staged", ":(exclude).cairn"],
                 cwd=self.repo_path,
                 capture_output=True,
                 text=True,
@@ -56,7 +56,7 @@ class MemorySummarizer:
 
             # Unstaged changes
             unstaged = subprocess.run(
-                ["git", "diff"],
+                ["git", "diff", ":(exclude).cairn"],
                 cwd=self.repo_path,
                 capture_output=True,
                 text=True,
@@ -68,7 +68,7 @@ class MemorySummarizer:
             return ""
 
     def _extract_files_from_diff(self, diff: str) -> list[str]:
-        """Extract changed filenames from a diff string."""
+        """Extract changed filenames from a diff string, excluding Cairn internals."""
         files = []
         for line in diff.split("\n"):
             if line.startswith("diff --git"):
@@ -81,19 +81,21 @@ class MemorySummarizer:
                 path = line.lstrip("+- /").strip()
                 if path and path != "/dev/null":
                     files.append(path)
-        return list(set(files))  # Deduplicate
+        # Safety net: filter out Cairn's own state directory
+        return [f for f in set(files) if not f.startswith(".cairn/")]
 
     def _deterministic_summary(self, diff: str) -> str:
         """Generate a deterministic summary of changes without LLM.
 
         Produces a bullet list of changed files and a change type heuristic.
+        Excludes Cairn's own .cairn/ state from summaries.
         """
         if not diff or len(diff.strip()) < 10:
             return "No significant changes."
 
         files = self._extract_files_from_diff(diff)
         if not files:
-            return "Modified codebase (diff details unavailable)."
+            return "No significant changes (only Cairn internal files changed)."
 
         # Heuristic: guess change type from file patterns and diff size
         has_tests = any("test" in f.lower() for f in files)

@@ -27,6 +27,7 @@ def debug_option(f):
     Works alongside the root group's --debug option: both ``cairn --debug search q``
     and ``cairn search q --debug`` will enable debug logging.
     """
+
     def _debug_callback(ctx, param, value):
         if value:
             configure_logging(debug=True)
@@ -279,6 +280,7 @@ def init(no_index: bool, yes: bool, force: bool, offline: bool):
     # For mixed repos (multiple language types), expand source_roots to ["."] to ensure
     # all source directories are indexed (not just the "best" one)
     from pipeline.ast_parser import EXTENSION_MAP
+
     detected_extensions = set(ext for ext in entire_repo_census if ext in EXTENSION_MAP)
     is_mixed_repo = len(detected_extensions) > 1
     if is_mixed_repo and detected_roots != ["."]:
@@ -562,7 +564,8 @@ memory.md
         repo = RepoManager(project_path)
         parser = ASTParser()
         indexer = VectorIndexer(
-            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg),
+            chroma_path=repo.get_chroma_path(),
+            embeddings_enabled=_get_embeddings_enabled(cfg),
             project_root=project_path,
         )
         freshness = DBFreshness(
@@ -741,7 +744,8 @@ def status():
 
     try:
         indexer = VectorIndexer(
-            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg),
+            chroma_path=repo.get_chroma_path(),
+            embeddings_enabled=_get_embeddings_enabled(cfg),
             project_root=project_path,
         )
         count = indexer.count()
@@ -750,9 +754,7 @@ def status():
         # ISSUE 2 FIX: Warn if current index location is empty but alternate has data
         if count == 0:
             # Check if alternate location has data
-            alt_location = (
-                "native" if index_location == "in_project" else "in_project"
-            )
+            alt_location = "native" if index_location == "in_project" else "in_project"
             alt_base = repo.index_base_dir(alt_location)
             alt_chroma = alt_base / "chroma"
             if alt_chroma.exists() and any(alt_chroma.iterdir()):
@@ -848,8 +850,7 @@ def doctor():
     click.echo()
     click.echo("[i] System Resources:")
     click.echo(
-        f"    RAM: {_res('ram_total_gb')} GB total, "
-        f"{_res('ram_available_gb')} GB available"
+        f"    RAM: {_res('ram_total_gb')} GB total, " f"{_res('ram_available_gb')} GB available"
     )
     click.echo(f"    CPU: {_res('cpu_count')} cores")
     if resources["gpu_name"]:
@@ -861,14 +862,8 @@ def doctor():
     else:
         click.echo("    GPU: no GPU detected (CPU-only)")
     click.echo(f"    Budget: {rec['budget_gb']:.1f} GB")
-    click.echo(
-        f"    Recommended worker: {rec['worker']['model']} "
-        f"({rec['worker']['reason']})"
-    )
-    click.echo(
-        f"    Recommended embed:  {rec['embed']['model']} "
-        f"({rec['embed']['reason']})"
-    )
+    click.echo(f"    Recommended worker: {rec['worker']['model']} " f"({rec['worker']['reason']})")
+    click.echo(f"    Recommended embed:  {rec['embed']['model']} " f"({rec['embed']['reason']})")
     click.echo(f"    Suggested num_ctx: {rec['suggested_num_ctx']}")
 
     # Local LLM load test
@@ -897,15 +892,10 @@ def doctor():
             click.echo(f"    [✓] local model {model_name} loads")
         except FuturesTimeoutError:
             model_name = cfg.local_llm.model or "(default)"
-            click.echo(
-                f"    [!] local model {model_name} "
-                "FAILED to load: timed out after 30s"
-            )
+            click.echo(f"    [!] local model {model_name} " "FAILED to load: timed out after 30s")
         except Exception as e:
             model_name = cfg.local_llm.model or "(default)"
-            click.echo(
-                f"    [!] local model {model_name} FAILED to load: {e}"
-            )
+            click.echo(f"    [!] local model {model_name} FAILED to load: {e}")
     else:
         click.echo("    [i] local LLM disabled (indexing/search work without it)")
 
@@ -1077,7 +1067,8 @@ def doctor():
         from pipeline.indexer import VectorIndexer
 
         indexer = VectorIndexer(
-            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg),
+            chroma_path=repo.get_chroma_path(),
+            embeddings_enabled=_get_embeddings_enabled(cfg),
             project_root=project_path,
         )
         collection_name = indexer.collection.name if indexer.collection else "unknown"
@@ -1266,7 +1257,8 @@ def _start_all_impl(
         info = freshness.check_freshness()
         repo = RepoManager(Path.cwd())
         idx = VectorIndexer(
-            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg),
+            chroma_path=repo.get_chroma_path(),
+            embeddings_enabled=_get_embeddings_enabled(cfg),
             project_root=Path.cwd(),
         )
 
@@ -1318,7 +1310,8 @@ def _start_all_impl(
         repo = RepoManager(project_path)
         parser = ASTParser()
         indexer = VectorIndexer(
-            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg),
+            chroma_path=repo.get_chroma_path(),
+            embeddings_enabled=_get_embeddings_enabled(cfg),
             project_root=project_path,
         )
 
@@ -1414,7 +1407,8 @@ def _run_quick_reindex(cfg, freshness):
     repo = RepoManager(Path.cwd())
     parser = ASTParser()
     indexer = VectorIndexer(
-        chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg),
+        chroma_path=repo.get_chroma_path(),
+        embeddings_enabled=_get_embeddings_enabled(cfg),
         project_root=Path.cwd(),
     )
     total = 0
@@ -1450,7 +1444,8 @@ def _print_status(cfg):
         from pipeline.indexer import VectorIndexer
 
         idx = VectorIndexer(
-            chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg),
+            chroma_path=repo.get_chroma_path(),
+            embeddings_enabled=_get_embeddings_enabled(cfg),
             project_root=Path.cwd(),
         )
         count = idx.count()
@@ -1561,7 +1556,8 @@ def reindex(mode: str):
 
     parser = ASTParser()
     indexer = VectorIndexer(
-        chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg),
+        chroma_path=repo.get_chroma_path(),
+        embeddings_enabled=_get_embeddings_enabled(cfg),
         project_root=project_path,
     )
 
@@ -1646,7 +1642,8 @@ def janitor_start(debounce: float | None):
     repo = RepoManager(project_path)
     parser = ASTParser()
     indexer = VectorIndexer(
-        chroma_path=repo.get_chroma_path(), embeddings_enabled=_get_embeddings_enabled(cfg),
+        chroma_path=repo.get_chroma_path(),
+        embeddings_enabled=_get_embeddings_enabled(cfg),
         project_root=project_path,
     )
 
@@ -1781,7 +1778,13 @@ def memory_update(commits: int):
             import subprocess
 
             result = subprocess.run(
-                ["git", "diff", f"HEAD~{i+1}", f"HEAD~{i}" if i > 0 else "HEAD"],
+                [
+                    "git",
+                    "diff",
+                    f"HEAD~{i+1}",
+                    f"HEAD~{i}" if i > 0 else "HEAD",
+                    ":(exclude).cairn",
+                ],
                 cwd=project_path,
                 capture_output=True,
                 text=True,
@@ -1944,8 +1947,7 @@ def suggest_local(query: str):
         return resources[key]
 
     click.echo(
-        f"  RAM: {_res('ram_total_gb')} GB total, "
-        f"{_res('ram_available_gb')} GB available"
+        f"  RAM: {_res('ram_total_gb')} GB total, " f"{_res('ram_available_gb')} GB available"
     )
     click.echo(f"  CPU: {_res('cpu_count')} cores")
     if resources["gpu_name"]:
@@ -1961,18 +1963,9 @@ def suggest_local(query: str):
     installed = list_installed_ollama_models()
     rec = recommend_local_models(resources, installed)
     click.echo("== Local Model Recommendations ==")
-    click.echo(
-        f"  Budget: {rec['budget_gb']:.1f} GB "
-        "(available RAM + VRAM - 2 GB headroom)"
-    )
-    click.echo(
-        f"  Worker: {rec['worker']['model']} "
-        f"— {rec['worker']['reason']}"
-    )
-    click.echo(
-        f"  Embed:  {rec['embed']['model']} "
-        f"— {rec['embed']['reason']}"
-    )
+    click.echo(f"  Budget: {rec['budget_gb']:.1f} GB " "(available RAM + VRAM - 2 GB headroom)")
+    click.echo(f"  Worker: {rec['worker']['model']} " f"— {rec['worker']['reason']}")
+    click.echo(f"  Embed:  {rec['embed']['model']} " f"— {rec['embed']['reason']}")
     click.echo(f"  Suggested num_ctx: {rec['suggested_num_ctx']}")
     if installed:
         names = ", ".join(m["name"] for m in installed)
@@ -2178,7 +2171,6 @@ def _render_dashboard():
             click.echo()
     except Exception:
         pass
-
 
     # Janitor stats
     jan = summary["janitor"]
