@@ -84,6 +84,150 @@ class TestFastEmbedEmbedder:
         except ImportError as e:
             assert "fastembed" in str(e)
 
+    def test_device_cpu_builds_and_embeds(self):
+        """device='cpu' builds and embeds, returns dim-384 vector."""
+        embedder = FastEmbedEmbedder(device="cpu")
+        try:
+            result = embedder(["test"])
+            assert len(result) == 1
+            assert len(result[0]) == 384
+        except ImportError as e:
+            assert "fastembed" in str(e)
+
+    def test_device_auto_cuda_providers(self, monkeypatch):
+        """device='auto' with CUDA available -> passes GPU providers."""
+        recorded_kwargs = {}
+
+        class FakeTE:
+            def __init__(self, model_name=None, providers=None, threads=None):
+                recorded_kwargs["providers"] = providers
+                recorded_kwargs["threads"] = threads
+
+            def embed(self, texts):
+                return [[0.0] * 384 for _ in texts]
+
+        monkeypatch.setattr("fastembed.TextEmbedding", FakeTE)
+        monkeypatch.setattr(
+            "onnxruntime.get_available_providers",
+            lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
+
+        embedder = FastEmbedEmbedder(device="auto")
+        embedder._ensure()
+
+        assert recorded_kwargs["providers"] == ["CUDAExecutionProvider", "CPUExecutionProvider"]
+
+    def test_gpu_init_fails_falls_back_to_cpu(self, monkeypatch):
+        """GPU provider init raises -> falls back to CPU, no exception."""
+
+        class FakeTE:
+            def __init__(self, model_name=None, providers=None, threads=None):
+                if providers and any(p in str(providers) for p in ["CUDA", "ROCM", "CoreML"]):
+                    raise RuntimeError("GPU not available")
+                self._providers = providers
+                self._threads = threads
+
+            def embed(self, texts):
+                return [[0.0] * 384 for _ in texts]
+
+        monkeypatch.setattr("fastembed.TextEmbedding", FakeTE)
+        monkeypatch.setattr(
+            "onnxruntime.get_available_providers",
+            lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
+
+        embedder = FastEmbedEmbedder(device="auto")
+        # Should not raise
+        embedder._ensure()
+        assert embedder._model is not None
+        # Should have fallen back to CPU (no GPU providers in the constructed FakeTE)
+        assert embedder._model._providers is None or "CUDAExecutionProvider" not in str(
+            embedder._model._providers
+        )
+
+    def test_device_cuda_no_provider_falls_back(self, monkeypatch, caplog):
+        """device='cuda' but no CUDA provider -> falls back to CPU, logs warning."""
+        recorded_kwargs = {}
+
+        class FakeTE:
+            def __init__(self, model_name=None, providers=None, threads=None):
+                recorded_kwargs["providers"] = providers
+                recorded_kwargs["threads"] = threads
+
+            def embed(self, texts):
+                return [[0.0] * 384 for _ in texts]
+
+        monkeypatch.setattr("fastembed.TextEmbedding", FakeTE)
+        monkeypatch.setattr(
+            "onnxruntime.get_available_providers",
+            lambda: ["CPUExecutionProvider"],
+        )
+
+        import logging
+
+        caplog.set_level(logging.WARNING)
+
+        embedder = FastEmbedEmbedder(device="cuda")
+        embedder._ensure()
+
+        assert embedder._model is not None
+        assert recorded_kwargs["providers"] is None  # CPU construction, no providers
+        assert "embed_device=cuda" in caplog.text
+
+    def test_threads_passed_to_cpu_path(self, monkeypatch):
+        """threads=4 -> TextEmbedding receives threads=4 on CPU path."""
+        recorded_threads = []
+
+        class FakeTE:
+            def __init__(self, model_name=None, providers=None, threads=None):
+                recorded_threads.append(threads)
+
+            def embed(self, texts):
+                return [[0.0] * 384 for _ in texts]
+
+        monkeypatch.setattr("fastembed.TextEmbedding", FakeTE)
+        monkeypatch.setattr(
+            "onnxruntime.get_available_providers",
+            lambda: ["CPUExecutionProvider"],
+        )
+
+        embedder = FastEmbedEmbedder(threads=4)
+        embedder._ensure()
+        assert recorded_threads[0] == 4
+
+    def test_threads_zero_passes_none(self, monkeypatch):
+        """threads=0 -> TextEmbedding receives threads=None (fastembed default)."""
+        recorded_threads = []
+
+        class FakeTE:
+            def __init__(self, model_name=None, providers=None, threads=None):
+                recorded_threads.append(threads)
+
+            def embed(self, texts):
+                return [[0.0] * 384 for _ in texts]
+
+        monkeypatch.setattr("fastembed.TextEmbedding", FakeTE)
+        monkeypatch.setattr(
+            "onnxruntime.get_available_providers",
+            lambda: ["CPUExecutionProvider"],
+        )
+
+        embedder = FastEmbedEmbedder(threads=0)
+        embedder._ensure()
+        assert recorded_threads[0] is None
+
+    def test_make_embedder_passes_device_and_threads(self):
+        """make_embedder for fastembed passes device and threads from config."""
+        cfg = Config()
+        cfg.local_llm.embedder = "fastembed"
+        cfg.local_llm.embed_device = "cpu"
+        cfg.local_llm.embed_threads = 8
+
+        embedder = make_embedder(cfg)
+        assert isinstance(embedder, FastEmbedEmbedder)
+        assert embedder._device == "cpu"
+        assert embedder._threads == 8
+
 
 class TestOllamaEmbedder:
     """Tests for OllamaEmbedder."""

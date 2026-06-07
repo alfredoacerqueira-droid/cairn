@@ -902,6 +902,35 @@ def doctor():
     click.echo(f"    Recommended embed:  {rec['embed']['model']} " f"({rec['embed']['reason']})")
     click.echo(f"    Suggested num_ctx: {rec['suggested_num_ctx']}")
 
+    # fastembed GPU hint
+    try:
+        import onnxruntime as ort
+
+        avail = set(ort.get_available_providers())
+        gpu_providers = [
+            p
+            for p in ("CUDAExecutionProvider", "ROCMExecutionProvider", "CoreMLExecutionProvider")
+            if p in avail
+        ]
+        if gpu_providers:
+            click.echo()
+            click.echo(f"[OK] fastembed GPU acceleration available ({gpu_providers[0]}).")
+        elif resources["gpu_name"]:
+            click.echo()
+            click.echo(
+                "[i] GPU detected but fastembed runs on CPU. "
+                "For ~10-50x faster indexing: "
+                "pip install fastembed-gpu (replaces onnxruntime with onnxruntime-gpu)."
+            )
+        else:
+            click.echo()
+            click.echo(
+                "[i] fastembed embedding runs on CPU "
+                "(set local_llm.embed_threads to use more cores)."
+            )
+    except Exception:
+        pass
+
     # Local LLM load test
     if cfg.local_llm.enabled:
         click.echo()

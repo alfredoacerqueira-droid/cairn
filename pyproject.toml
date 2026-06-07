@@ -40,6 +40,9 @@ local = [
     "lancedb>=0.13",
     "tantivy>=0.22",
 ]
+# Replaces the CPU onnxruntime with onnxruntime-gpu (they can't coexist);
+# enables GPU embedding (10-50x faster cold-indexing).
+gpu = ["fastembed-gpu>=0.3"]
 
 [tool.setuptools.packages.find]
 include = ["server*", "pipeline*", "core*", "throttle*", "cli*"]

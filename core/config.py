@@ -279,6 +279,12 @@ class LocalLLMConfig(BaseModel):
     one_shot_threshold: float = 0.75
     # Embedder type: "ollama" | "fastembed" | "none"
     embedder: str = "ollama"
+    # auto|cpu|cuda — fastembed execution device; auto uses GPU if an onnxruntime
+    # GPU provider is installed, else CPU.
+    embed_device: str = "auto"
+    # CPU-only embedding parallelism: ONNX intra-op threads for fastembed.
+    # 0 = use all cores; N pins to N.
+    embed_threads: int = 0
     # In-process ONNX embedder for the no-LLM mode.
     fastembed_model: str = "BAAI/bge-small-en-v1.5"
     # Parallel local-LLM map calls (1-2 on 6GB VRAM).
